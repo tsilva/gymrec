@@ -37,3 +37,9 @@ include = ["main.py"]
 # PyPI 0.9.9 arm64 wheel is mislabeled (contains x86_64 binary).
 # Use local ARM64 wheel built from source with Clang on Apple Silicon.
 stable-retro = { path = "wheels/stable_retro-0.9.9-cp312-cp312-macosx_26_0_arm64.whl", marker = "sys_platform == 'darwin'" }
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]

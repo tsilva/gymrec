@@ -16,6 +16,8 @@
 
 ## 🚀 Features
 
+[![CI](https://github.com/tsilva/gymrec/actions/workflows/release.yml/badge.svg)](https://github.com/tsilva/gymrec/actions/workflows/release.yml)
+
 - **🎯 Multi-platform support** — Works with Atari (ALE-py), Stable-Retro, and VizDoom environments
 - **💾 Dataset-first design** — Captures frames and actions directly as Hugging Face datasets
 - **🎮 Automatic key bindings** — Platform-specific controls preconfigured for each environment type
