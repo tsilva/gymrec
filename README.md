@@ -51,7 +51,7 @@ uv run python main.py record Airstriker-Genesis --fps 60
 
 Press **Space** to start recording. Use **ESC** to stop and exit.
 
-### 🤖 Automated collection (random agent)
+### 🤖 Automated collection (built-in agents)
 
 ```bash
 # Collect 100 episodes headlessly at max speed
@@ -60,11 +60,16 @@ uv run gymrec record SuperMarioBros-Nes --agent random --headless --episodes 100
 # Same but with display (for monitoring)
 uv run gymrec record SuperMarioBros-Nes --agent random --episodes 10
 
+# Deterministic Breakout tracker for data collection
+uv run gymrec record BreakoutNoFrameskip-v4 --agent breakout --headless --episodes 50
+
 # Collect 100 episodes across 5 parallel worker processes
 uv run gymrec record BreakoutNoFrameskip-v4 --agent random --headless --episodes 100 --workers 5
 ```
 
 `--headless` skips rendering for maximum collection speed. `--episodes` defaults to 1 if omitted. `--workers` spawns multiple parallel processes to distribute episode collection — requires `--agent` (not human mode).
+
+The built-in `breakout` agent uses ALE RAM state plus a reward-aware intercept controller. It stays stable for long catches, then adds small contact-angle variation when rewards stall so it can keep breaking bricks instead of falling into deterministic loops.
 
 ### 🔄 Replay a dataset
 

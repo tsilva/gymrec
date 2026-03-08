@@ -43,6 +43,7 @@ from dotenv import load_dotenv
 load_dotenv(override=True)  # Load environment variables from .env file
 
 import gymnasium as gym
+import numpy as np
 
 _initialized = False
 
@@ -751,9 +752,19 @@ class AgentInputSource(InputSource):
         self.policy = policy
         self.headless = headless
 
+    def reset(self):
+        """Reset any episode-local policy state."""
+        if hasattr(self.policy, "reset"):
+            self.policy.reset()
+
     def get_action(self, observation):
         """Get action from policy."""
         return self.policy(observation)
+
+    def observe_step(self, reward, terminated, truncated, info):
+        """Forward step results to the policy when it needs feedback."""
+        if hasattr(self.policy, "observe_step"):
+            self.policy.observe_step(reward, terminated, truncated, info)
 
     def handle_events(self) -> bool:
         """Minimal event handling - just check for ESC if not headless."""
@@ -775,8 +786,17 @@ class AgentInputSource(InputSource):
 class BasePolicy(ABC):
     """Abstract base class for agent policies."""
 
-    def __init__(self, action_space):
+    def __init__(self, action_space, env=None):
         self.action_space = action_space
+        self.env = env
+
+    def reset(self):
+        """Reset any episode-local policy state."""
+        pass
+
+    def observe_step(self, reward, terminated, truncated, info):
+        """Receive the result of the previously chosen action."""
+        pass
 
     @abstractmethod
     def __call__(self, observation):
@@ -848,11 +868,15 @@ class MarioRightJumpPolicy(BasePolicy):
 
 
 class BreakoutCatcherPolicy(BasePolicy):
-    """Deterministic policy that tracks and catches the ball in Breakout.
+    """Breakout policy that tracks the ball exactly and escapes reward stalls.
 
-    Uses improved computer vision to detect ball and paddle positions with
-    better filtering to distinguish ball from bricks. Tracks ball x-position
-    continuously and keeps paddle centered on the ball at all times.
+    On ALE Breakout environments this reads paddle and ball state directly from
+    emulator RAM, which avoids the false detections and missed catches that come
+    from RGB-only heuristics. The controller predicts the descending intercept at
+    the paddle line, including wall reflections, then steers the paddle toward
+    that landing point with a small deadzone to avoid oscillation. When rewards
+    stall for too long, it injects a controlled amount of contact-angle
+    variation to break deterministic loops that stop clearing bricks.
 
     BreakoutNoFrameskip-v4 action space (Discrete):
     - 0: NOOP
@@ -861,8 +885,8 @@ class BreakoutCatcherPolicy(BasePolicy):
     - 3: LEFT
     """
 
-    def __init__(self, action_space):
-        super().__init__(action_space)
+    def __init__(self, action_space, env=None):
+        super().__init__(action_space, env=env)
         # ALE Breakout action indices (Discrete(4)):
         # 0: NOOP, 1: FIRE, 2: RIGHT, 3: LEFT
         self.NOOP = 0
@@ -870,200 +894,189 @@ class BreakoutCatcherPolicy(BasePolicy):
         self.RIGHT = 2
         self.LEFT = 3
 
-        self._step_counter = 0
-        self._prev_ball_pos = None  # (x, y) tuple
-        self._ball_velocity = (0, 0)  # (vx, vy) for prediction
-        self._frames_without_ball = 0
-        self._paddle_width = 16  # ALE Breakout paddle width in pixels
+        self._prev_ball_pos = None
+        self._rng = np.random.default_rng()
 
-        # Detection thresholds
-        # Ball: bright pixels (RGB >= 200) - ALE uses value 200 for bright objects
-        self.BALL_THRESHOLD = 200
-        # Ball size in pixels (approximately 4 pixels in ALE)
-        self.BALL_SIZE_MIN = 2
-        self.BALL_SIZE_MAX = 12
-        # Paddle: gray in ALE (RGB all around 142)
-        self.PADDLE_MIN = 135
-        self.PADDLE_MAX = 150
+        # Breakout RAM addresses (ALE).
+        self._paddle_x_addr = 72
+        self._ball_x_addr = 99
+        self._ball_y_addr = 101
 
-        # Warning threshold
-        self._warned_no_ball = False
+        # Tuned against local ALE runs to prioritize zero-loss tracking over
+        # aggressive paddle movement that introduces oscillation near contact.
+        self._base_target_offset = -5
+        self._deadzone = 4
+        self._contact_y = 177
+        self._left_wall = 57
+        self._right_wall = 200
+        self._contact_window = 18
+
+        # Reward-aware loop breaking: only explore when the game has clearly
+        # stalled, and only by varying the paddle/ball contact point.
+        self._stall_steps = 0
+        self._stall_threshold = 1200
+        self._descent_offset = self._base_target_offset
+        self._descent_offset_committed = False
+        self._reward_since_last_contact = False
+
+        # RGB fallback for non-ALE environments or direct unit-style invocation.
+        self._sprite_color = np.array([200, 72, 72], dtype=np.uint8)
+        self._fallback_ball_y_min = 93
+        self._fallback_ball_y_max = 189
+        self._fallback_paddle_y_min = 189
+        self._fallback_paddle_y_max = 205
+        self._fallback_contact_y = 183
+        self._fallback_left_wall = 8
+        self._fallback_right_wall = 151
+
+    def reset(self):
+        self._prev_ball_pos = None
+        self._stall_steps = 0
+        self._descent_offset = self._base_target_offset
+        self._descent_offset_committed = False
+        self._reward_since_last_contact = False
+
+    def observe_step(self, reward, terminated, truncated, info):
+        if reward > 0:
+            self._stall_steps = 0
+            self._reward_since_last_contact = True
+        else:
+            self._stall_steps += 1
+
+        if terminated or truncated:
+            self.reset()
 
     def __call__(self, observation):
-        """Return action to catch the ball based on improved CV."""
-        import numpy as np
+        """Return an action that keeps the paddle under the live ball."""
+        state = self._read_breakout_state(observation)
 
-        self._step_counter += 1
-
-        # Observation is RGB array (210, 160, 3) for Breakout
-        obs = np.array(observation)
-
-        # Find ball with improved detection
-        ball_pos = self._find_ball(obs)
-
-        # ALWAYS print ball X position (or -1 if not found)
-        if ball_pos is None:
-            ball_x, ball_y = -1, -1
-            print(f"[BALL] x={ball_x:3d}, y={ball_y:3d} [NOT DETECTED]")
-            self._frames_without_ball += 1
-            # No ball found - fire to launch
-            return self.FIRE
-        else:
-            ball_x, ball_y = ball_pos
-            print(f"[BALL] x={ball_x:3d}, y={ball_y:3d}")
-            self._frames_without_ball = 0
-
-            # Calculate velocity for prediction
-            if self._prev_ball_pos is not None:
-                vx = ball_pos[0] - self._prev_ball_pos[0]
-                vy = ball_pos[1] - self._prev_ball_pos[1]
-                self._ball_velocity = (vx, vy)
-
-            self._prev_ball_pos = ball_pos
-
-        # Fire every 50 steps to handle game states
-        if self._step_counter % 50 == 0:
+        if state["ball_x"] is None or state["ball_y"] is None:
+            self._prev_ball_pos = None
+            self._descent_offset = self._base_target_offset
+            self._descent_offset_committed = False
             return self.FIRE
 
-        # Find paddle: bottom area of screen
-        paddle_center, paddle_left, paddle_right = self._find_paddle(obs)
-
-        # Print paddle detection
-        if paddle_center is None:
-            print(f"[PADDLE] NOT DETECTED")
-            # Can't find paddle, just fire and hope for the best
-            return self.FIRE
-        else:
-            print(
-                f"[PADDLE] center={paddle_center:3d}, left={paddle_left:3d}, right={paddle_right:3d}"
-            )
-
-        # Always track ball's current x position directly
-        # No deadzone - paddle center should always match ball x exactly
-
-        if ball_x < paddle_center:
-            return self.LEFT
-        elif ball_x > paddle_center:
-            return self.RIGHT
-        else:
-            # Paddle is centered - occasionally fire to handle game states
-            if self._step_counter % 30 == 0:
-                return self.FIRE
-            return self.NOOP
-
-    def _find_ball(self, obs):
-        """Find ball position by detecting non-black pixels in the ball-only region.
-
-        Ball-only bounding box for ALE Breakout (exclusive on both ends):
-        x_min = 8, y_min = 94, x_max = 151, y_max = 188
-
-        Returns:
-            tuple: (x, y) position of ball center, or None if not found
-        """
-        import numpy as np
-
-        # Ball-only bounding box (exclusive on both ends)
-        x_min, y_min = 8, 94
-        x_max, y_max = 151, 188
-
-        # Extract the ball region
-        ball_region = obs[y_min:y_max, x_min:x_max, :]
-
-        # Find non-black pixels (ball is any non-zero pixel in this region)
-        # Sum across RGB channels - if any channel is non-zero, it's not black
-        pixel_sum = np.sum(ball_region, axis=2)
-        non_black_mask = pixel_sum > 0
-
-        if not np.any(non_black_mask):
-            return None
-
-        # Get coordinates of non-black pixels
-        local_rows, local_cols = np.where(non_black_mask)
-
-        # Convert to global coordinates
-        rows = local_rows + y_min
-        cols = local_cols + x_min
-
-        # Group by row to find ball vs noise
-        unique_rows, counts = np.unique(rows, return_counts=True)
-
-        # Find rows with small counts (ball) vs large counts (bricks/artifacts)
-        ball_candidates = []
-        for row_idx, row in enumerate(unique_rows):
-            count = counts[row_idx]
-            if count > self.BALL_SIZE_MAX:  # Too wide, skip
-                continue
-            if count < self.BALL_SIZE_MIN:  # Too small, noise
-                continue
-
-            # Get pixels in this row
-            row_mask = rows == row
-            row_cols = cols[row_mask]
-            center_x = int(np.mean(row_cols))
-            ball_candidates.append((center_x, int(row), count))
-
-        if not ball_candidates:
-            return None
-
-        # Prefer the candidate closest to previous ball position if available
+        target_x = state["ball_x"]
+        descending = False
         if self._prev_ball_pos is not None:
-            prev_x, prev_y = self._prev_ball_pos
-            # Find closest candidate
-            best = min(
-                ball_candidates, key=lambda c: abs(c[0] - prev_x) + abs(c[1] - prev_y)
-            )
+            dx = state["ball_x"] - self._prev_ball_pos[0]
+            dy = state["ball_y"] - self._prev_ball_pos[1]
+            descending = dy > 0
+
+            if descending and state["ball_y"] >= state["contact_y"] - self._contact_window:
+                if not self._descent_offset_committed:
+                    self._descent_offset = self._choose_contact_offset()
+                    self._descent_offset_committed = True
+            elif dy < 0:
+                self._descent_offset = self._base_target_offset
+                self._descent_offset_committed = False
+                self._reward_since_last_contact = False
+
+            if dy > 0 and state["ball_y"] < state["contact_y"] and dx != 0:
+                steps_to_contact = (state["contact_y"] - state["ball_y"]) / dy
+                target_x = self._reflect_x(
+                    round(state["ball_x"] + (dx * steps_to_contact)),
+                    state["left_wall"],
+                    state["right_wall"],
+                )
         else:
-            # Prefer lower ball (closer to paddle) if multiple candidates
-            best = max(ball_candidates, key=lambda c: c[1])
+            self._descent_offset = self._base_target_offset
 
-        ball_x, ball_y = best[0], best[1]
-        return (ball_x, ball_y)
+        self._prev_ball_pos = (state["ball_x"], state["ball_y"])
+        target_x += self._descent_offset
 
-    def _find_paddle(self, obs):
-        """Find paddle position with improved detection.
+        if state["paddle_x"] < target_x - self._deadzone:
+            return self.RIGHT
+        if state["paddle_x"] > target_x + self._deadzone:
+            return self.LEFT
+        return self.NOOP
 
-        Returns:
-            tuple: (center_x, left_x, right_x) or (None, None, None) if not found
-        """
-        import numpy as np
+    def _choose_contact_offset(self):
+        """Pick a safe contact offset, exploring only when reward has stalled."""
+        if self._stall_steps < self._stall_threshold:
+            return self._base_target_offset
 
-        # Paddle is in bottom ~15% of screen (rows ~180-210 in ALE Breakout)
-        h, w = obs.shape[:2]
-        bottom_region = obs[int(h * 0.78) :, :, :]
+        # Escalate the bounce variation as the stall gets longer.
+        if self._stall_steps < self._stall_threshold * 2:
+            candidates = [-9, -7, -5, -3, 0, 3]
+            probabilities = [0.14, 0.22, 0.28, 0.18, 0.12, 0.06]
+        elif self._stall_steps < self._stall_threshold * 4:
+            candidates = [-11, -8, -5, -2, 2, 5, 8]
+            probabilities = [0.10, 0.16, 0.22, 0.16, 0.14, 0.12, 0.10]
+        else:
+            candidates = [-12, -9, -6, -3, 0, 3, 6, 9]
+            probabilities = [0.09, 0.12, 0.15, 0.16, 0.16, 0.12, 0.10, 0.10]
 
-        # Find paddle (gray pixels in ALE, all channels similar value 130-160)
-        r = bottom_region[:, :, 0].astype(int)
-        g = bottom_region[:, :, 1].astype(int)
-        b = bottom_region[:, :, 2].astype(int)
+        # If the last descent still produced no reward, bias slightly away from
+        # the previous contact point to avoid repeating the same bounce.
+        if not self._reward_since_last_contact:
+            candidates = [c for c in candidates if c != self._descent_offset] or candidates
+            probabilities = None
 
-        # Paddle is gray: all channels roughly equal
-        gray_mask = (np.abs(r - g) < 15) & (np.abs(g - b) < 15)
-        paddle_mask = gray_mask & (r >= self.PADDLE_MIN) & (r <= self.PADDLE_MAX)
+        return int(self._rng.choice(candidates, p=probabilities))
 
-        if not np.any(paddle_mask):
-            return None, None, None
+    def _read_breakout_state(self, observation):
+        ram_state = self._read_ram_state()
+        if ram_state is not None:
+            return ram_state
+        return self._read_rgb_state(observation)
 
-        # Find all paddle pixels
-        rows, cols = np.where(paddle_mask)
+    def _read_ram_state(self):
+        ale = getattr(getattr(self.env, "unwrapped", None), "ale", None)
+        if ale is None or not hasattr(ale, "getRAM"):
+            return None
 
-        if len(cols) == 0:
-            return None, None, None
+        ram = ale.getRAM()
+        return {
+            "ball_x": int(ram[self._ball_x_addr]) or None,
+            "ball_y": int(ram[self._ball_y_addr]) or None,
+            "paddle_x": int(ram[self._paddle_x_addr]),
+            "contact_y": self._contact_y,
+            "left_wall": self._left_wall,
+            "right_wall": self._right_wall,
+        }
 
-        # Calculate paddle boundaries
-        left_x = int(np.min(cols))
-        right_x = int(np.max(cols))
-        center_x = int((left_x + right_x) / 2)
+    def _read_rgb_state(self, observation):
+        obs = np.asarray(observation)
 
-        # Validate paddle width (should be around 16 pixels in ALE)
-        paddle_width = right_x - left_x
-        if paddle_width < 4 or paddle_width > 32:
-            # Unreasonable width, might be noise or multiple objects
-            # Fall back to just using the mean
-            center_x = int(np.mean(cols))
-            left_x = center_x - self._paddle_width // 2
-            right_x = center_x + self._paddle_width // 2
+        paddle_region = obs[
+            self._fallback_paddle_y_min : self._fallback_paddle_y_max, :, :
+        ]
+        paddle_mask = np.all(paddle_region == self._sprite_color, axis=2)
+        _, paddle_cols = np.where(paddle_mask)
+        paddle_x = float(np.mean(paddle_cols)) if len(paddle_cols) else 80.0
 
-        return center_x, left_x, right_x
+        ball_region = obs[self._fallback_ball_y_min : self._fallback_ball_y_max, :, :]
+        ball_mask = np.all(ball_region == self._sprite_color, axis=2)
+        ball_rows, ball_cols = np.where(ball_mask)
+        ball_x = None
+        ball_y = None
+        if len(ball_cols):
+            unique_rows = sorted(np.unique(ball_rows + self._fallback_ball_y_min), reverse=True)
+            for row in unique_rows:
+                row_cols = ball_cols[(ball_rows + self._fallback_ball_y_min) == row]
+                if 1 <= len(row_cols) <= 6:
+                    ball_x = float(np.mean(row_cols))
+                    ball_y = float(row)
+                    break
+
+        return {
+            "ball_x": ball_x,
+            "ball_y": ball_y,
+            "paddle_x": paddle_x,
+            "contact_y": self._fallback_contact_y,
+            "left_wall": self._fallback_left_wall,
+            "right_wall": self._fallback_right_wall,
+        }
+
+    @staticmethod
+    def _reflect_x(x, left_wall, right_wall):
+        while x < left_wall or x > right_wall:
+            if x > right_wall:
+                x = right_wall - (x - right_wall)
+            elif x < left_wall:
+                x = left_wall + (left_wall - x)
+        return x
 
 
 class DatasetRecorderWrapper(gym.Wrapper):
@@ -1115,6 +1128,8 @@ class DatasetRecorderWrapper(gym.Wrapper):
         self._episode_count = 0
         self._cumulative_reward = 0.0
         self._overlay_visible = True
+        self._playback_frame_index = None
+        self._playback_total = None
         self._recorded_dataset = None
         self._env_metadata = None
         self._max_episodes = None  # None means unlimited
@@ -1500,13 +1515,26 @@ class DatasetRecorderWrapper(gym.Wrapper):
         self.screen.blit(text_alpha, (bg_x + padding, bg_y + padding))
 
     def _render_episode_overlay(self):
-        """Render a persistent HUD badge in the top-left corner during recording."""
-        if not self.recording or self._episode_count < 1 or self.screen is None:
+        """Render a persistent HUD badge in the top-left corner."""
+        if self.screen is None:
             return
 
-        parts = [f"EP {self._episode_count}", f"R {self._cumulative_reward:.0f}"]
+        parts = []
+        if self.recording and self._episode_count >= 1:
+            parts.extend([f"EP {self._episode_count}", f"R {self._cumulative_reward:.0f}"])
+
+        if (
+            self._playback_frame_index is not None
+            and self._playback_total is not None
+            and self._playback_total > 0
+        ):
+            parts.append(f"F {self._playback_frame_index}/{self._playback_total}")
+
         if self._fps is not None:
             parts.append(f"{self._fps} FPS")
+        if not parts:
+            return
+
         font = pygame.font.Font(None, 24)
         text = font.render("  ".join(parts), True, (255, 255, 255))
         text_rect = text.get_rect()
@@ -1718,6 +1746,8 @@ class DatasetRecorderWrapper(gym.Wrapper):
             self.input_source = HumanInputSource(
                 self.env, self.key_lock, self.current_keys
             )
+        elif hasattr(self.input_source, "reset"):
+            self.input_source.reset()
 
         # For human input, show the start screen and keymappings
         if isinstance(self.input_source, HumanInputSource):
@@ -1733,15 +1763,23 @@ class DatasetRecorderWrapper(gym.Wrapper):
         while True:
             frame_start = time.monotonic()
 
-            # Handle events through input source
-            if not self.input_source.handle_events():
-                break
+            # Use the wrapper event loop whenever a window is present so
+            # shared controls like ESC, +/- FPS, and TAB overlay toggles work
+            # consistently in both gameplay and playback.
+            if self.headless:
+                if not self.input_source.handle_events():
+                    break
+            else:
+                if not self._input_loop():
+                    break
 
             # Get action from input source
             action = self.input_source.get_action(obs)
 
             self._record_frame(self._current_episode_uuid, seed, step, obs, action)
             obs, reward, terminated, truncated, info = self.env.step(action)
+            if hasattr(self.input_source, "observe_step"):
+                self.input_source.observe_step(reward, terminated, truncated, info)
             self._cumulative_reward += float(reward)
             if self.recording:
                 self.rewards.append(float(reward))
@@ -1795,6 +1833,8 @@ class DatasetRecorderWrapper(gym.Wrapper):
                 self._current_episode_seed = int(time.time())
                 seed = self._current_episode_seed
                 obs, _ = self.env.reset(seed=seed)
+                if hasattr(self.input_source, "reset"):
+                    self.input_source.reset()
                 self._episode_count += 1
                 self._cumulative_reward = 0.0
                 step = 0
@@ -1873,6 +1913,8 @@ class DatasetRecorderWrapper(gym.Wrapper):
         if fps is None:
             fps = get_default_fps(self.env)
         self._fps = fps
+        self._playback_frame_index = 0
+        self._playback_total = total
         obs, _ = self.env.reset()
         self._ensure_screen(obs)
         self._render_frame(obs)
@@ -1891,65 +1933,71 @@ class DatasetRecorderWrapper(gym.Wrapper):
             console=console,
         ) as progress:
             ptask = progress.add_task("Replaying", total=total)
-            for item in actions:
-                frame_start = time.monotonic()
-                if not self._input_loop():
-                    break
+            try:
+                for frame_number, item in enumerate(actions, start=1):
+                    frame_start = time.monotonic()
+                    if not self._input_loop():
+                        break
 
-                if verify:
-                    (
-                        action,
-                        recorded_image,
-                        recorded_reward,
-                        recorded_terminated,
-                        recorded_truncated,
-                    ) = item
-                else:
-                    action = item
+                    self._playback_frame_index = frame_number
 
-                action = self._convert_action(action)
-                obs, reward, terminated, truncated, _ = self.env.step(action)
-                self._render_frame(obs)
-
-                if verify:
-                    obs_image = self._extract_obs_image(obs)
-                    if obs_image.dtype != np.uint8:
-                        obs_image = obs_image.astype(np.uint8)
-                    recorded_array = np.array(recorded_image, dtype=np.uint8)
-
-                    if obs_image.shape == recorded_array.shape:
-                        mse = float(
-                            np.mean(
-                                (
-                                    obs_image.astype(np.float32)
-                                    - recorded_array.astype(np.float32)
-                                )
-                                ** 2
-                            )
-                        )
+                    if verify:
+                        (
+                            action,
+                            recorded_image,
+                            recorded_reward,
+                            recorded_terminated,
+                            recorded_truncated,
+                        ) = item
                     else:
-                        console.print(
-                            f"  [yellow]Warning:[/] shape mismatch at frame {len(verify_metrics)}: "
-                            f"obs={obs_image.shape} vs recorded={recorded_array.shape}, skipping comparison"
-                        )
-                        mse = None
+                        action = item
 
-                    if float(reward) != float(recorded_reward):
-                        reward_mismatches += 1
-                    if bool(terminated) != bool(recorded_terminated) or bool(
-                        truncated
-                    ) != bool(recorded_truncated):
-                        terminal_mismatches += 1
+                    action = self._convert_action(action)
+                    obs, reward, terminated, truncated, _ = self.env.step(action)
+                    self._render_frame(obs)
 
-                    verify_metrics.append(mse)
+                    if verify:
+                        obs_image = self._extract_obs_image(obs)
+                        if obs_image.dtype != np.uint8:
+                            obs_image = obs_image.astype(np.uint8)
+                        recorded_array = np.array(recorded_image, dtype=np.uint8)
 
-                elapsed = time.monotonic() - frame_start
-                remaining = (1.0 / self._fps) - elapsed
-                if remaining > 0:
-                    await asyncio.sleep(remaining)
-                else:
-                    await asyncio.sleep(0)
-                progress.advance(ptask)
+                        if obs_image.shape == recorded_array.shape:
+                            mse = float(
+                                np.mean(
+                                    (
+                                        obs_image.astype(np.float32)
+                                        - recorded_array.astype(np.float32)
+                                    )
+                                    ** 2
+                                )
+                            )
+                        else:
+                            console.print(
+                                f"  [yellow]Warning:[/] shape mismatch at frame {len(verify_metrics)}: "
+                                f"obs={obs_image.shape} vs recorded={recorded_array.shape}, skipping comparison"
+                            )
+                            mse = None
+
+                        if float(reward) != float(recorded_reward):
+                            reward_mismatches += 1
+                        if bool(terminated) != bool(recorded_terminated) or bool(
+                            truncated
+                        ) != bool(recorded_truncated):
+                            terminal_mismatches += 1
+
+                        verify_metrics.append(mse)
+
+                    elapsed = time.monotonic() - frame_start
+                    remaining = (1.0 / self._fps) - elapsed
+                    if remaining > 0:
+                        await asyncio.sleep(remaining)
+                    else:
+                        await asyncio.sleep(0)
+                    progress.advance(ptask)
+            finally:
+                self._playback_frame_index = None
+                self._playback_total = None
 
         if verify and verify_metrics:
             valid_mses = [m for m in verify_metrics if m is not None]
@@ -3589,7 +3637,7 @@ def _worker_collect_episodes(
         elif agent_type == "mario":
             policy = MarioRightJumpPolicy(env.action_space)
         elif agent_type == "breakout":
-            policy = BreakoutCatcherPolicy(env.action_space)
+            policy = BreakoutCatcherPolicy(env.action_space, env=env)
         else:
             raise ValueError(f"Unknown agent type: {agent_type}")
 
@@ -3858,7 +3906,10 @@ async def main():
         type=str,
         default="human",
         choices=["human", "random", "mario", "breakout"],
-        help="Input source: human (keyboard), random policy, or mario policy (default: human)",
+        help=(
+            "Input source: human, random, mario, or deterministic breakout "
+            "policy (default: human)"
+        ),
     )
     parser_record.add_argument(
         "--headless",
@@ -4085,7 +4136,7 @@ async def main():
                 elif args.agent == "mario":
                     policy = MarioRightJumpPolicy(env.action_space)
                 elif args.agent == "breakout":
-                    policy = BreakoutCatcherPolicy(env.action_space)
+                    policy = BreakoutCatcherPolicy(env.action_space, env=env)
                 input_source = AgentInputSource(policy, headless=args.headless)
 
                 recorder = DatasetRecorderWrapper(
