@@ -874,9 +874,10 @@ class BreakoutCatcherPolicy(BasePolicy):
     emulator RAM, which avoids the false detections and missed catches that come
     from RGB-only heuristics. The controller predicts the descending intercept at
     the paddle line, including wall reflections, then steers the paddle toward
-    that landing point with a small deadzone to avoid oscillation. When rewards
-    stall for too long, it injects a controlled amount of contact-angle
-    variation to break deterministic loops that stop clearing bricks.
+    that landing point with a small deadzone to avoid oscillation. Every
+    descending contact picks a small random paddle/ball offset, then widens that
+    variation if rewards stall long enough to break deterministic loops that
+    stop clearing bricks.
 
     BreakoutNoFrameskip-v4 action space (Discrete):
     - 0: NOOP
@@ -911,8 +912,8 @@ class BreakoutCatcherPolicy(BasePolicy):
         self._right_wall = 200
         self._contact_window = 18
 
-        # Reward-aware loop breaking: only explore when the game has clearly
-        # stalled, and only by varying the paddle/ball contact point.
+        # Reward-aware loop breaking: always vary the paddle/ball contact point
+        # a little, then widen the range if the game has clearly stalled.
         self._stall_steps = 0
         self._stall_threshold = 1200
         self._descent_offset = self._base_target_offset
@@ -992,12 +993,11 @@ class BreakoutCatcherPolicy(BasePolicy):
         return self.NOOP
 
     def _choose_contact_offset(self):
-        """Pick a safe contact offset, exploring only when reward has stalled."""
+        """Pick a safe contact offset, with wider variation after stalls."""
         if self._stall_steps < self._stall_threshold:
-            return self._base_target_offset
-
-        # Escalate the bounce variation as the stall gets longer.
-        if self._stall_steps < self._stall_threshold * 2:
+            candidates = [-7, -5, -3, 0]
+            probabilities = [0.24, 0.46, 0.22, 0.08]
+        elif self._stall_steps < self._stall_threshold * 2:
             candidates = [-9, -7, -5, -3, 0, 3]
             probabilities = [0.14, 0.22, 0.28, 0.18, 0.12, 0.06]
         elif self._stall_steps < self._stall_threshold * 4:

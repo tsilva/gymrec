@@ -69,7 +69,7 @@ uv run gymrec record BreakoutNoFrameskip-v4 --agent random --headless --episodes
 
 `--headless` skips rendering for maximum collection speed. `--episodes` defaults to 1 if omitted. `--workers` spawns multiple parallel processes to distribute episode collection — requires `--agent` (not human mode).
 
-The built-in `breakout` agent uses ALE RAM state plus a reward-aware intercept controller. It stays stable for long catches, then adds small contact-angle variation when rewards stall so it can keep breaking bricks instead of falling into deterministic loops.
+The built-in `breakout` agent uses ALE RAM state plus a reward-aware intercept controller. It randomizes the paddle/ball contact point on every descent, then widens that variation when rewards stall so it can keep breaking bricks instead of falling into deterministic loops.
 
 ### 🔄 Replay a dataset
 
