@@ -22,6 +22,7 @@
 - **💾 Dataset-first design** — Captures frames and actions directly as Hugging Face datasets
 - **🎮 Automatic key bindings** — Platform-specific controls preconfigured for each environment type
 - **🔄 Playback verification** — Replay recordings to confirm environment determinism
+- **🎞️ Video export** — Render recorded episodes to MP4 with episode-number overlays
 - **☁️ Hub integration** — Push datasets directly to Hugging Face Hub with auto-generated dataset cards
 
 ## ⚡ Quick Start
@@ -79,6 +80,22 @@ uv run python main.py playback BreakoutNoFrameskip-v4
 
 Replays the recorded actions from your Hugging Face Hub dataset.
 
+### 🎞️ Export dataset episodes to video
+
+```bash
+# Export all recorded episodes
+uv run python main.py video BreakoutNoFrameskip-v4
+
+# Export episodes 3 through 7 (1-based, inclusive)
+uv run python main.py video BreakoutNoFrameskip-v4 --range 3-7
+
+# Export the first or last N episodes
+uv run python main.py video BreakoutNoFrameskip-v4 --first 5
+uv run python main.py video BreakoutNoFrameskip-v4 --last 5
+```
+
+Exports an MP4 using `ffmpeg` and burns the dataset episode number into each frame. The command loads the local dataset first, then falls back to Hugging Face Hub if needed.
+
 ### 📋 List available environments
 
 ```bash
@@ -107,6 +124,7 @@ Shows all available Atari, Stable-Retro, and VizDoom environments.
 
 - 🐍 Python 3.12+
 - ⚡ [uv](https://docs.astral.sh/uv/getting-started/installation/) (for dependency management)
+- 🎬 `ffmpeg` (for `video` exports)
 - 🤗 Hugging Face account and token (for dataset uploads)
 
 ### 🍎 macOS Apple Silicon Note

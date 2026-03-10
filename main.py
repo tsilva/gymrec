@@ -11,6 +11,7 @@ import argparse
 import tomllib
 import uuid
 import multiprocessing
+import subprocess
 from abc import ABC, abstractmethod
 
 from rich.console import Console
@@ -2313,6 +2314,334 @@ def load_local_dataset(env_id):
     return load_from_disk(path)
 
 
+def _get_default_fps_for_env_id(env_id, metadata=None):
+    """Infer a sensible FPS without instantiating the environment."""
+    if metadata and metadata.get("fps") is not None:
+        try:
+            return max(int(round(float(metadata["fps"]))), 1)
+        except (TypeError, ValueError):
+            pass
+
+    retro_platforms = {
+        "Nes",
+        "GameBoy",
+        "Snes",
+        "GbAdvance",
+        "GbColor",
+        "Genesis",
+        "PCEngine",
+        "Saturn",
+        "32x",
+        "Sms",
+        "GameGear",
+        "SCD",
+    }
+
+    if (
+        any(env_id.endswith(f"-{plat}") for plat in retro_platforms)
+        or "Atari2600" in env_id
+    ):
+        return CONFIG["fps_defaults"]["retro"]
+    if "Vizdoom" in env_id or "vizdoom" in env_id:
+        return CONFIG["fps_defaults"]["vizdoom"]
+    return CONFIG["fps_defaults"]["atari"]
+
+
+def _normalize_episode_id(eid):
+    """Normalize episode identifiers to a stable string key."""
+    if isinstance(eid, bytes):
+        try:
+            return uuid.UUID(bytes=eid).hex
+        except ValueError:
+            return eid.hex()
+    if isinstance(eid, uuid.UUID):
+        return eid.hex
+    return str(eid)
+
+
+def _ordered_episode_rows(dataset):
+    """Return episode keys in encounter order and the row indices for each episode."""
+    episode_keys = []
+    row_indices_by_episode = {}
+
+    for row_index, eid in enumerate(dataset["episode_id"]):
+        key = _normalize_episode_id(eid)
+        if key not in row_indices_by_episode:
+            row_indices_by_episode[key] = []
+            episode_keys.append(key)
+        row_indices_by_episode[key].append(row_index)
+
+    return episode_keys, row_indices_by_episode
+
+
+def _parse_episode_range(value, total_episodes):
+    """Parse a 1-based inclusive episode range like '3-7' or '3:7'."""
+    text = str(value).strip()
+    for separator in ("..", "-", ":"):
+        if separator in text:
+            parts = text.split(separator, 1)
+            break
+    else:
+        raise ValueError(
+            "Episode range must look like START-END, START:END, or START..END"
+        )
+
+    try:
+        start = int(parts[0].strip())
+        end = int(parts[1].strip())
+    except (TypeError, ValueError):
+        raise ValueError(
+            "Episode range must look like START-END, START:END, or START..END"
+        ) from None
+
+    if start < 1 or end < 1:
+        raise ValueError("Episode numbers are 1-based and must be >= 1")
+    if start > end:
+        raise ValueError("Episode range start must be <= end")
+    if end > total_episodes:
+        raise ValueError(
+            f"Episode range {start}-{end} exceeds dataset size ({total_episodes} episodes)"
+        )
+
+    return start, end
+
+
+def _select_episode_numbers(total_episodes, episode_range=None, first=None, last=None):
+    """Select 1-based episode numbers from a dataset."""
+    if total_episodes <= 0:
+        return []
+
+    selectors = [episode_range is not None, first is not None, last is not None]
+    if sum(selectors) > 1:
+        raise ValueError("Use only one of --range, --first, or --last")
+
+    if episode_range is not None:
+        start, end = _parse_episode_range(episode_range, total_episodes)
+        return list(range(start, end + 1))
+
+    if first is not None:
+        if first < 1:
+            raise ValueError("--first must be >= 1")
+        return list(range(1, min(first, total_episodes) + 1))
+
+    if last is not None:
+        if last < 1:
+            raise ValueError("--last must be >= 1")
+        start = max(1, total_episodes - last + 1)
+        return list(range(start, total_episodes + 1))
+
+    return list(range(1, total_episodes + 1))
+
+
+def _get_row_observation(row):
+    """Return the observation image from a dataset row."""
+    observation = row.get("observations", row.get("observation"))
+    if observation is None:
+        raise ValueError("Dataset row is missing observations")
+    return observation
+
+
+def _frame_to_rgb_array(frame):
+    """Normalize a dataset frame to an HxWx3 uint8 RGB array."""
+    frame_array = np.array(frame, dtype=np.uint8)
+
+    if frame_array.ndim == 2:
+        frame_array = np.repeat(frame_array[:, :, None], 3, axis=2)
+    elif frame_array.ndim == 3 and frame_array.shape[2] == 1:
+        frame_array = np.repeat(frame_array, 3, axis=2)
+    elif frame_array.ndim == 3 and frame_array.shape[2] >= 3:
+        frame_array = frame_array[:, :, :3]
+    else:
+        raise ValueError(f"Unsupported frame shape: {frame_array.shape}")
+
+    return np.ascontiguousarray(frame_array)
+
+
+def _overlay_episode_number(frame_array, episode_number):
+    """Draw an episode label in the top-left corner of a frame."""
+    from PIL import ImageDraw, ImageFont
+
+    image = PILImage.fromarray(frame_array)
+    draw = ImageDraw.Draw(image)
+    font_size = max(14, image.height // 18)
+    try:
+        font = ImageFont.truetype("DejaVuSans.ttf", font_size)
+    except Exception:
+        font = ImageFont.load_default()
+
+    label = f"Episode {episode_number}"
+    left, top, right, bottom = draw.textbbox((0, 0), label, font=font)
+    padding = max(6, image.height // 54)
+    box_left = padding
+    box_top = padding
+    box_right = box_left + (right - left) + padding * 2
+    box_bottom = box_top + (bottom - top) + padding * 2
+
+    draw.rectangle((box_left, box_top, box_right, box_bottom), fill=(0, 0, 0))
+    draw.text(
+        (box_left + padding, box_top + padding - top),
+        label,
+        fill=(255, 255, 255),
+        font=font,
+    )
+    return np.asarray(image, dtype=np.uint8)
+
+
+def _default_video_output_path(env_id, selected_episode_numbers):
+    """Build a deterministic default output path for a video export."""
+    encoded_env_id = _encode_env_id_for_hf(env_id)
+    if not selected_episode_numbers:
+        suffix = "episodes"
+    elif len(selected_episode_numbers) == 1:
+        suffix = f"episode_{selected_episode_numbers[0]}"
+    elif len(selected_episode_numbers) > 1 and selected_episode_numbers == list(
+        range(selected_episode_numbers[0], selected_episode_numbers[-1] + 1)
+    ):
+        suffix = (
+            f"episodes_{selected_episode_numbers[0]}_{selected_episode_numbers[-1]}"
+        )
+    else:
+        suffix = f"episodes_{len(selected_episode_numbers)}"
+
+    return os.path.abspath(f"{encoded_env_id}_{suffix}.mp4")
+
+
+def export_dataset_video(
+    env_id,
+    dataset,
+    output_path=None,
+    fps=None,
+    episode_range=None,
+    first=None,
+    last=None,
+):
+    """Render selected dataset episodes to an MP4 video with episode overlay labels."""
+    ffmpeg_path = shutil.which("ffmpeg")
+    if ffmpeg_path is None:
+        console.print(f"[{STYLE_FAIL}]ffmpeg is required to export videos.[/]")
+        return False
+    if fps is None or int(fps) < 1:
+        console.print(f"[{STYLE_FAIL}]FPS must be a positive integer.[/]")
+        return False
+
+    episode_keys, row_indices_by_episode = _ordered_episode_rows(dataset)
+    total_episodes = len(episode_keys)
+    if total_episodes == 0:
+        console.print(f"[{STYLE_FAIL}]Dataset has no episodes.[/]")
+        return False
+
+    try:
+        selected_episode_numbers = _select_episode_numbers(
+            total_episodes, episode_range=episode_range, first=first, last=last
+        )
+    except ValueError as e:
+        console.print(f"[{STYLE_FAIL}]{e}[/]")
+        return False
+
+    selected_episodes = [
+        (episode_number, row_indices_by_episode[episode_keys[episode_number - 1]])
+        for episode_number in selected_episode_numbers
+    ]
+    total_frames = sum(len(row_indices) for _, row_indices in selected_episodes)
+    if total_frames == 0:
+        console.print(f"[{STYLE_FAIL}]No frames found for selected episodes.[/]")
+        return False
+
+    first_frame = _frame_to_rgb_array(
+        _get_row_observation(dataset[selected_episodes[0][1][0]])
+    )
+    height, width = first_frame.shape[:2]
+
+    if output_path is None:
+        output_path = _default_video_output_path(env_id, selected_episode_numbers)
+    output_path = os.path.abspath(os.path.expanduser(output_path))
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+
+    ffmpeg_cmd = [
+        ffmpeg_path,
+        "-y",
+        "-loglevel",
+        "error",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "rgb24",
+        "-s",
+        f"{width}x{height}",
+        "-r",
+        str(fps),
+        "-i",
+        "-",
+        "-an",
+        "-vcodec",
+        "libx264",
+        "-vf",
+        "pad=ceil(iw/2)*2:ceil(ih/2)*2",
+        "-pix_fmt",
+        "yuv420p",
+        output_path,
+    ]
+
+    console.print(
+        f"[{STYLE_INFO}]Exporting {len(selected_episode_numbers)} episode(s) "
+        f"({total_frames} frames) to [{STYLE_PATH}]{output_path}[/] "
+        f"at {fps} FPS[/]"
+    )
+
+    process = subprocess.Popen(
+        ffmpeg_cmd,
+        stdin=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+    try:
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("{task.description}"),
+            BarColumn(),
+            MofNCompleteColumn(),
+            TimeElapsedColumn(),
+            TimeRemainingColumn(),
+            console=console,
+            transient=False,
+        ) as progress:
+            task_id = progress.add_task("[bold]Encoding[/]", total=total_frames)
+            for episode_number, row_indices in selected_episodes:
+                for row_index in row_indices:
+                    row = dataset[row_index]
+                    frame = _frame_to_rgb_array(_get_row_observation(row))
+                    if frame.shape[:2] != (height, width):
+                        raise ValueError(
+                            "All exported frames must have the same dimensions; "
+                            f"expected {(height, width)}, got {frame.shape[:2]}"
+                        )
+                    frame = _overlay_episode_number(frame, episode_number)
+                    process.stdin.write(frame.tobytes())
+                    progress.advance(task_id)
+
+        process.stdin.close()
+        ffmpeg_stderr = process.stderr.read().decode("utf-8", errors="replace").strip()
+        return_code = process.wait()
+        if return_code != 0:
+            raise RuntimeError(
+                ffmpeg_stderr or f"ffmpeg exited with status {return_code}"
+            )
+    except Exception as e:
+        if process.stdin is not None and not process.stdin.closed:
+            process.stdin.close()
+        process.wait()
+        console.print(f"[{STYLE_FAIL}]Video export failed: {e}[/]")
+        return False
+    finally:
+        if process.stderr is not None:
+            process.stderr.close()
+
+    console.print(
+        f"[{STYLE_SUCCESS}]Video exported: [{STYLE_PATH}]{output_path}[/][/]"
+    )
+    return True
+
+
 def upload_local_dataset(env_id, max_retries=5, base_wait=1.0):
     """Upload new episodes to HF Hub using append-only shard uploads.
 
@@ -3958,6 +4287,45 @@ async def main():
         help="Verify determinism by comparing replayed frames against recorded frames (pixel MSE)",
     )
 
+    parser_video = subparsers.add_parser(
+        "video", help="Render recorded dataset episodes to a video file"
+    )
+    parser_video.add_argument(
+        "env_id",
+        type=str,
+        nargs="?",
+        default=None,
+        help="Gymnasium environment id (e.g. BreakoutNoFrameskip-v4)",
+    )
+    parser_video.add_argument(
+        "--fps", type=int, default=None, help="Frames per second for exported video"
+    )
+    parser_video.add_argument(
+        "--output",
+        type=str,
+        default=None,
+        help="Output video path (default: ./<env_id>_episodes_...mp4)",
+    )
+    parser_video.add_argument(
+        "--range",
+        dest="episode_range",
+        type=str,
+        default=None,
+        help="1-based inclusive episode range, e.g. 3-7 or 3:7",
+    )
+    parser_video.add_argument(
+        "--first",
+        type=int,
+        default=None,
+        help="Export the first N episodes",
+    )
+    parser_video.add_argument(
+        "--last",
+        type=int,
+        default=None,
+        help="Export the last N episodes",
+    )
+
     parser_upload = subparsers.add_parser(
         "upload", help="Upload local dataset to Hugging Face Hub"
     )
@@ -4037,8 +4405,10 @@ async def main():
 
     if env_id is None:
         # For playback, only show environments with available recordings
-        is_playback = args.command == "playback"
-        env_id = select_environment_interactive(available_recordings_only=is_playback)
+        is_recording_command = args.command in ("playback", "video")
+        env_id = select_environment_interactive(
+            available_recordings_only=is_recording_command
+        )
 
     if args.command == "upload":
         upload_local_dataset(env_id)
@@ -4051,8 +4421,14 @@ async def main():
     if hasattr(args, "scale") and args.scale is not None:
         CONFIG["display"]["scale_factor"] = args.scale
 
-    env = create_env(env_id)
-    fps = args.fps if args.fps is not None else get_default_fps(env)
+    env = None
+    fps = args.fps
+    if args.command in ("record", "playback"):
+        env = create_env(env_id)
+        if fps is None:
+            fps = get_default_fps(env)
+    elif args.command == "video" and fps is None:
+        fps = _get_default_fps_for_env_id(env_id, metadata=load_local_metadata(env_id))
 
     if args.command == "record":
         recorder = None
@@ -4272,6 +4648,48 @@ async def main():
                 if _is_step_row(row)
             )
             await recorder.replay(actions, fps=fps, total=total)
+    elif args.command == "video":
+        loaded_dataset = load_local_dataset(env_id)
+        if loaded_dataset is not None:
+            console.print(
+                f"[{STYLE_INFO}]Loading local dataset for video export "
+                f"({len(loaded_dataset)} frames)[/]"
+            )
+        else:
+            console.print(
+                "[dim]No local dataset found, downloading from Hugging Face Hub...[/]"
+            )
+            try:
+                hf_repo_id = env_id_to_hf_repo_id(env_id)
+                api = HfApi()
+                api.dataset_info(hf_repo_id)
+                loaded_dataset = load_dataset(hf_repo_id, split="train")
+                console.print(
+                    f"[{STYLE_INFO}]Loaded dataset from Hugging Face Hub "
+                    f"({len(loaded_dataset)} frames)[/]"
+                )
+            except Exception:
+                loaded_dataset = None
+
+        if loaded_dataset is None:
+            console.print(f"[{STYLE_FAIL}]No dataset found for {env_id}.[/]")
+            console.print(
+                f"  Local path: [{STYLE_PATH}]{get_local_dataset_path(env_id)}[/]"
+            )
+            console.print(
+                f"  Record a session first: [{STYLE_CMD}]uv run python main.py record {env_id}[/]"
+            )
+            return
+
+        export_dataset_video(
+            env_id,
+            loaded_dataset,
+            output_path=args.output,
+            fps=fps,
+            episode_range=args.episode_range,
+            first=args.first,
+            last=args.last,
+        )
 
 
 def cli():
