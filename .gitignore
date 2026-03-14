@@ -123,6 +123,5 @@ target/
 var/
 venv.bak/
 wheels/*
-!wheels/stable_retro-*.whl
 
 !wheels

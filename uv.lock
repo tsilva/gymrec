@@ -302,8 +302,8 @@ dependencies = [
     { name = "rich" },
     { name = "scipy" },
     { name = "simple-term-menu" },
-    { name = "stable-retro", version = "0.9.9", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'darwin'" },
-    { name = "stable-retro", version = "0.9.9", source = { path = "wheels/stable_retro-0.9.9-cp312-cp312-macosx_26_0_arm64.whl" }, marker = "sys_platform == 'darwin'" },
+    { name = "stable-retro", marker = "platform_machine != 'arm64' or sys_platform != 'darwin'" },
+    { name = "stable-retro-apple-silicon", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'" },
     { name = "vizdoom" },
 ]
 
@@ -326,8 +326,8 @@ requires-dist = [
     { name = "rich" },
     { name = "scipy", specifier = ">=1.17.0" },
     { name = "simple-term-menu" },
-    { name = "stable-retro", marker = "sys_platform != 'darwin'" },
-    { name = "stable-retro", marker = "sys_platform == 'darwin'", path = "wheels/stable_retro-0.9.9-cp312-cp312-macosx_26_0_arm64.whl" },
+    { name = "stable-retro", marker = "platform_machine != 'arm64' or sys_platform != 'darwin'" },
+    { name = "stable-retro-apple-silicon", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'", specifier = "==0.9.9.post1" },
     { name = "vizdoom" },
 ]
 provides-extras = ["minari"]
@@ -753,42 +753,28 @@ wheels = [
 name = "stable-retro"
 version = "0.9.9"
 source = { registry = "https://pypi.org/simple" }
-resolution-markers = [
-    "sys_platform == 'win32'",
-    "sys_platform == 'emscripten'",
-    "sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-]
 dependencies = [
-    { name = "farama-notifications", marker = "sys_platform != 'darwin'" },
-    { name = "gymnasium", marker = "sys_platform != 'darwin'" },
-    { name = "pyglet", marker = "sys_platform != 'darwin'" },
+    { name = "farama-notifications" },
+    { name = "gymnasium" },
+    { name = "pyglet" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/4e/48/3c51a5c222b92f53e59932ce8d52a97d58f4287e558bce0d731e008b1a8b/stable_retro-0.9.9.tar.gz", hash = "sha256:a068422e9c8d98659b3239fe0243446b22ace2234da2e432a80f4d3bf393deb7", size = 152887293, upload-time = "2026-02-15T16:46:46.032Z" }
 wheels = [
+    { url = "https://files.pythonhosted.org/packages/26/af/2f3d141134f68dcdb11060a0d7ef6ea86956a9b7d31f61dff7ab52fda77b/stable_retro-0.9.9-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:4bcd1de9adb95250ae49b30ed5eb2c755dd73e8c2f11efc32889c52fa9d6c7aa", size = 88106661, upload-time = "2026-02-15T16:46:19.365Z" },
     { url = "https://files.pythonhosted.org/packages/4d/d0/22e239ade84abe501f2b566b77ba2886d4411fa8ee9297aa16569f0b91cc/stable_retro-0.9.9-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:f7cda69730d96bedfd74867f2ecc66d89655f7c3e4f7f4ad90ef08cffb96fef1", size = 121544185, upload-time = "2026-02-15T16:46:23.726Z" },
 ]
 
 [[package]]
-name = "stable-retro"
-version = "0.9.9"
-source = { path = "wheels/stable_retro-0.9.9-cp312-cp312-macosx_26_0_arm64.whl" }
-resolution-markers = [
-    "sys_platform == 'darwin'",
-]
+name = "stable-retro-apple-silicon"
+version = "0.9.9.post1"
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "farama-notifications", marker = "sys_platform == 'darwin'" },
     { name = "gymnasium", marker = "sys_platform == 'darwin'" },
     { name = "pyglet", marker = "sys_platform == 'darwin'" },
 ]
 wheels = [
-    { filename = "stable_retro-0.9.9-cp312-cp312-macosx_26_0_arm64.whl", hash = "sha256:1c822a800fbcd37cd8e26badc55ed122541fcce15e07b42439647fcfdeb742b6" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "farama-notifications", specifier = ">=0.0.1" },
-    { name = "gymnasium", specifier = ">=0.27.1" },
-    { name = "pyglet", specifier = "==1.*,>=1.3.2" },
+    { url = "https://files.pythonhosted.org/packages/6f/9b/d52f67286f1ef359ac4ee25187450e75751ced725a122d79d5f880d9944e/stable_retro_apple_silicon-0.9.9.post1-cp312-cp312-macosx_14_0_arm64.whl", hash = "sha256:fb143b9c5461e16e932878022fd68f00e2b4e34200443a84d248cf2cba0d4e3f", size = 101857292, upload-time = "2026-03-14T23:16:08.294Z" },
 ]
 
 [[package]]

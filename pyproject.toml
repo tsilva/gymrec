@@ -20,7 +20,8 @@ dependencies = [
     "rich",
     "huggingface-hub",
     "simple-term-menu",
-    "stable-retro",
+    "stable-retro; sys_platform != 'darwin' or platform_machine != 'arm64'",
+    "stable-retro-apple-silicon==0.9.9.post1; sys_platform == 'darwin' and platform_machine == 'arm64'",
     "scipy>=1.17.0",
 ]
 
@@ -32,11 +33,6 @@ minari = ["minari>=0.5.0"]
 
 [tool.hatch.build.targets.wheel]
 include = ["main.py"]
-
-[tool.uv.sources]
-# PyPI 0.9.9 arm64 wheel is mislabeled (contains x86_64 binary).
-# Use local ARM64 wheel built from source with Clang on Apple Silicon.
-stable-retro = { path = "wheels/stable_retro-0.9.9-cp312-cp312-macosx_26_0_arm64.whl", marker = "sys_platform == 'darwin'" }
 
 [tool.ruff]
 line-length = 100
