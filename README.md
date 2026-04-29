@@ -1,147 +1,78 @@
 <div align="center">
-  <img src="logo.png" alt="gymrec" width="512"/>
-
-  # gymrec
-
-  [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-  [![Python 3.12+](https://img.shields.io/badge/Python-3.12+-blue.svg)](https://www.python.org/)
-  [![Hugging Face](https://img.shields.io/badge/HuggingFace-Datasets-yellow.svg)](https://huggingface.co/docs/datasets)
+  <img src="https://raw.githubusercontent.com/tsilva/gymrec/main/logo.png" alt="gymrec" width="512"/>
 
   **🎮 Record and replay gameplay from Gymnasium environments as Hugging Face datasets 📊**
-
-  [Features](#features) · [Quick Start](#quick-start) · [Usage](#usage) · [Supported Environments](#supported-environments)
 </div>
 
----
+gymrec is a Python CLI for collecting gameplay from Gymnasium environments and saving it as replayable Hugging Face datasets. It supports human keyboard capture, built-in agent policies, local dataset storage, Hub uploads, playback verification, and MP4 exports.
 
-## 🚀 Features
+It works across Atari through ALE-py, Stable-Retro console environments, and VizDoom. Recordings store observations, actions, rewards, episode metadata, collector provenance, and the gymrec version used to collect the run.
 
-[![CI](https://github.com/tsilva/gymrec/actions/workflows/release.yml/badge.svg)](https://github.com/tsilva/gymrec/actions/workflows/release.yml)
-
-- **🎯 Multi-platform support** — Works with Atari (ALE-py), Stable-Retro, and VizDoom environments
-- **💾 Dataset-first design** — Captures frames and actions directly as Hugging Face datasets
-- **🎮 Automatic key bindings** — Platform-specific controls preconfigured for each environment type
-- **🔄 Playback verification** — Replay recordings to confirm environment determinism
-- **🎞️ Video export** — Render recorded episodes to MP4 with episode-number overlays
-- **☁️ Hub integration** — Push datasets directly to Hugging Face Hub with auto-generated dataset cards
-
-## ⚡ Quick Start
+## Install
 
 ```bash
-# Clone the repository
 git clone https://github.com/tsilva/gymrec.git
 cd gymrec
-
-# Install dependencies
 uv sync
-
-# Configure Hugging Face token
 cp .env.example .env
-# Edit .env and add your HF_TOKEN
 ```
 
-## 📖 Usage
-
-### 🎬 Record gameplay
+Add your Hugging Face token to `.env` when you want to upload datasets:
 
 ```bash
-uv run python main.py record BreakoutNoFrameskip-v4
-uv run python main.py record VizdoomBasic-v0 --fps 35
-uv run python main.py record Airstriker-Genesis --fps 60
+HF_TOKEN=your-api-token
 ```
 
-Press **Space** to start recording. Use **ESC** to stop and exit.
+Run the CLI from the repo root with `uv run gymrec ...` or `uv run python main.py ...`.
 
-### 🤖 Automated collection (built-in agents)
+## Commands
 
 ```bash
-# Collect 100 episodes headlessly at max speed
+uv run gymrec login                                      # authenticate with Hugging Face Hub
+uv run gymrec list_environments                         # list Atari, Stable-Retro, and VizDoom envs
+
+uv run gymrec record BreakoutNoFrameskip-v4             # record human gameplay
+uv run gymrec record BreakoutNoFrameskip-v4 --dry-run   # save locally without upload prompt
 uv run gymrec record SuperMarioBros-Nes --agent random --headless --episodes 100
-
-# Same but with display (for monitoring)
-uv run gymrec record SuperMarioBros-Nes --agent random --episodes 10
-
-# Deterministic Breakout tracker for data collection
 uv run gymrec record BreakoutNoFrameskip-v4 --agent breakout --headless --episodes 50
-
-# Collect 100 episodes across 5 parallel worker processes
 uv run gymrec record BreakoutNoFrameskip-v4 --agent random --headless --episodes 100 --workers 5
+
+uv run gymrec upload BreakoutNoFrameskip-v4             # upload new local episodes to Hub
+uv run gymrec playback BreakoutNoFrameskip-v4           # replay recorded actions
+uv run gymrec playback BreakoutNoFrameskip-v4 --verify  # compare replay frames against recorded frames
+
+uv run gymrec video BreakoutNoFrameskip-v4              # export all episodes to MP4
+uv run gymrec video BreakoutNoFrameskip-v4 --range 3-7  # export a 1-based episode range
+uv run gymrec video BreakoutNoFrameskip-v4 --first 5
+uv run gymrec video BreakoutNoFrameskip-v4 --last 5
+
+uv run gymrec import_roms ./roms                        # import Stable-Retro ROMs
+uv run gymrec minari-export BreakoutNoFrameskip-v4      # export local data to Minari format
 ```
 
-`--headless` skips rendering for maximum collection speed. `--episodes` defaults to 1 if omitted. `--workers` spawns multiple parallel processes to distribute episode collection — requires `--agent` (not human mode).
+## Usage
 
-The built-in `breakout` agent uses ALE RAM state plus a reward-aware intercept controller. It randomizes the paddle/ball contact point on every descent, then widens that variation when rewards stall so it can keep breaking bricks instead of falling into deterministic loops.
+Human recording opens a pygame window. Press `Space` to start recording, use the environment-specific controls printed in the terminal, press `Tab` to toggle the overlay, use `+`/`-` to adjust FPS, and press `Esc` to stop.
 
-### 🔄 Replay a dataset
+Agent recording supports `human`, `random`, `mario`, and `breakout`. `--headless` is for agent mode only and requires `--episodes`; `--workers` runs parallel headless collection and cannot exceed the requested episode count.
 
-```bash
-uv run python main.py playback BreakoutNoFrameskip-v4
-```
+Playback uses the local dataset first, then falls back to the Hugging Face Hub dataset repo. Video export requires `ffmpeg` and writes MP4 files from local data or downloaded Hub data.
 
-Replays the recorded actions from your Hugging Face Hub dataset.
+## Notes
 
-### 🎞️ Export dataset episodes to video
+- Requires Python `>=3.12,<3.13` and `uv`.
+- Hugging Face uploads use dataset repos named `{username}/gymrec__{encoded_env_id}` by default.
+- Local datasets are stored under `~/.gymrec/datasets` by default.
+- `config.toml` controls display scale, FPS defaults, local storage, dataset metadata, and overlay defaults.
+- `keymappings.toml` controls Atari, VizDoom, and Stable-Retro keyboard bindings.
+- On Apple Silicon, `uv sync` installs the committed native Stable-Retro wheel through the project configuration.
+- `ffmpeg` must be available on `PATH` for `video` exports.
+- `minari-export` requires Minari; install it with `uv sync --extra minari` or `uv pip install 'minari>=0.5.0'`.
 
-```bash
-# Export all recorded episodes
-uv run python main.py video BreakoutNoFrameskip-v4
+## Architecture
 
-# Export episodes 3 through 7 (1-based, inclusive)
-uv run python main.py video BreakoutNoFrameskip-v4 --range 3-7
+![gymrec architecture diagram](./architecture.png)
 
-# Export the first or last N episodes
-uv run python main.py video BreakoutNoFrameskip-v4 --first 5
-uv run python main.py video BreakoutNoFrameskip-v4 --last 5
-```
+## License
 
-Exports an MP4 using `ffmpeg` and burns the dataset episode number into each frame. The command loads the local dataset first, then falls back to Hugging Face Hub if needed.
-
-### 📋 List available environments
-
-```bash
-uv run python main.py list_environments
-```
-
-Shows all available Atari, Stable-Retro, and VizDoom environments.
-
-## 🎯 Supported Environments
-
-| Platform | Examples | Default FPS |
-|----------|----------|-------------|
-| 🕹️ Atari (ALE-py) | `BreakoutNoFrameskip-v4`, `PongNoFrameskip-v4` | 90 |
-| 🔫 VizDoom | `VizdoomBasic-v0`, `VizdoomCorridor-v0` | 45 |
-| 🎲 Stable-Retro | `Airstriker-Genesis`, `SuperMarioBros-Nes` | 90 |
-
-### 🎮 Controls
-
-| Platform | Controls |
-|----------|----------|
-| 🕹️ Atari | Arrow keys for movement |
-| 🔫 VizDoom | Arrows (move/turn), Ctrl (attack), Space (use), 1-7 (weapons) |
-| 🎲 Stable-Retro | Arrows, Z/X (A/B buttons), Tab/Enter (Select/Start) |
-
-## 📋 Requirements
-
-- 🐍 Python 3.12+
-- ⚡ [uv](https://docs.astral.sh/uv/getting-started/installation/) (for dependency management)
-- 🎬 `ffmpeg` (for `video` exports)
-- 🤗 Hugging Face account and token (for dataset uploads)
-
-### 🍎 macOS Apple Silicon Note
-
-On Apple Silicon, `uv sync` installs `stable-retro-apple-silicon==0.9.9.post1` automatically. Other platforms continue to use `stable-retro`.
-
-## 🔧 How It Works
-
-1. **🎬 Recording** — The `DatasetRecorderWrapper` captures each frame as a JPEG and logs the corresponding action
-2. **💾 Storage** — Frames and actions are assembled into a Hugging Face Dataset with columns: `episode_id`, `timestamp`, `image`, `step`, `action`
-3. **☁️ Upload** — Datasets are pushed to Hub with naming convention `{username}/GymnasiumRecording__{env_id}`
-4. **🔄 Playback** — Recorded actions are fed back to the environment to verify deterministic replay
-
-## 🤝 Contributing
-
-Contributions are welcome! Please feel free to submit issues and pull requests.
-
-## 📄 License
-
-This project is licensed under the [MIT License](LICENSE).
+[MIT](LICENSE)
