@@ -19,7 +19,7 @@ jobs:
           python-version: "3.12"
       - uses: astral-sh/setup-uv@v7
         with:
-          cache: true
+          enable-cache: true
       - run: uv sync
       - run: uv run --with ruff ruff check .
       - run: |
@@ -45,12 +45,30 @@ jobs:
           fetch-depth: 0
       - name: Check version
         id: check-version
-        uses: tsilva/.github/.github/actions/check-version@main
+        shell: bash
+        run: |
+          VERSION=$(python - <<'PY'
+          import tomllib
+
+          with open("pyproject.toml", "rb") as f:
+              config = tomllib.load(f)
+
+          print(config["project"]["version"])
+          PY
+          )
+          TAG="v${VERSION}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          if git rev-parse "refs/tags/${TAG}" >/dev/null 2>&1; then
+            echo "tag_exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag_exists=false" >> "$GITHUB_OUTPUT"
+          fi
       - name: Setup uv
         if: steps.check-version.outputs.tag_exists == 'false'
         uses: astral-sh/setup-uv@v7
         with:
-          cache: true
+          enable-cache: true
       - name: Build package
         if: steps.check-version.outputs.tag_exists == 'false'
         run: uv build
