@@ -1,32 +1,35 @@
-import os
-import sys
-import time
-import json
-import shutil
-import queue
-import threading
-import asyncio
-import tempfile
 import argparse
+import asyncio
+import json
+import multiprocessing
+import os
+import queue
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+import time
 import tomllib
 import uuid
-import multiprocessing
-import subprocess
 from abc import ABC, abstractmethod
 
+import gymnasium as gym
+import numpy as np
+from dotenv import load_dotenv
 from rich.console import Console
-from rich.table import Table
 from rich.panel import Panel
-from rich.prompt import Confirm, Prompt
 from rich.progress import (
-    Progress,
     BarColumn,
-    TextColumn,
-    TimeRemainingColumn,
-    TimeElapsedColumn,
     MofNCompleteColumn,
+    Progress,
     SpinnerColumn,
+    TextColumn,
+    TimeElapsedColumn,
+    TimeRemainingColumn,
 )
+from rich.prompt import Confirm, Prompt
+from rich.table import Table
 
 console = Console()
 
@@ -39,12 +42,7 @@ STYLE_SUCCESS = "bold green"
 STYLE_FAIL = "bold red"
 STYLE_INFO = "cyan"
 
-from dotenv import load_dotenv
-
 load_dotenv(override=True)  # Load environment variables from .env file
-
-import gymnasium as gym
-import numpy as np
 
 _initialized = False
 
@@ -312,9 +310,7 @@ def _load_keymappings(pygame):
     }
 
     # Try loading config file
-    config_path = os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), "keymappings.toml"
-    )
+    config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "keymappings.toml")
     if not os.path.exists(config_path):
         return default_start_key, default_atari, default_vizdoom, default_retro
 
@@ -381,9 +377,7 @@ def _load_config():
     import copy
 
     config = copy.deepcopy(DEFAULT_CONFIG)
-    config_path = os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), "config.toml"
-    )
+    config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.toml")
     if not os.path.exists(config_path):
         return config
     with open(config_path, "rb") as f:
@@ -413,33 +407,31 @@ def _lazy_init():
         CommitOperationAdd, \
         hf_hub_download
     global Dataset, HFImage, Value, load_dataset, load_from_disk, load_dataset_builder
-    global \
-        START_KEY, \
-        ATARI_KEY_BINDINGS, \
-        VIZDOOM_KEY_BINDINGS, \
-        STABLE_RETRO_KEY_BINDINGS
+    global START_KEY, ATARI_KEY_BINDINGS, VIZDOOM_KEY_BINDINGS, STABLE_RETRO_KEY_BINDINGS
 
     import numpy as np
     import pygame
-    from PIL import Image as PILImage
+    from datasets import (
+        Dataset,
+        Value,
+        load_dataset,
+        load_dataset_builder,
+        load_from_disk,
+    )
+    from datasets import (
+        Image as HFImage,
+    )
     from huggingface_hub import (
-        whoami,
+        CommitOperationAdd,
         DatasetCard,
         DatasetCardData,
         HfApi,
-        login,
         get_token,
-        CommitOperationAdd,
         hf_hub_download,
+        login,
+        whoami,
     )
-    from datasets import (
-        Dataset,
-        Image as HFImage,
-        Value,
-        load_dataset,
-        load_from_disk,
-        load_dataset_builder,
-    )
+    from PIL import Image as PILImage
 
     START_KEY, ATARI_KEY_BINDINGS, VIZDOOM_KEY_BINDINGS, STABLE_RETRO_KEY_BINDINGS = (
         _load_keymappings(pygame)
@@ -459,9 +451,7 @@ def ensure_hf_login(force=False) -> bool:
         try:
             info = whoami(token=token)
             username = info.get("name", "unknown")
-            console.print(
-                f"[{STYLE_SUCCESS}]Already logged in as [{STYLE_ENV}]{username}[/][/]"
-            )
+            console.print(f"[{STYLE_SUCCESS}]Already logged in as [{STYLE_ENV}]{username}[/][/]")
             if not Confirm.ask("Re-login with a different token?", default=False):
                 return True
         except Exception:
@@ -485,9 +475,7 @@ def ensure_hf_login(force=False) -> bool:
             login(token=token_input.strip())
             info = whoami()
             username = info.get("name", "unknown")
-            console.print(
-                f"[{STYLE_SUCCESS}]Logged in as [{STYLE_ENV}]{username}[/][/]"
-            )
+            console.print(f"[{STYLE_SUCCESS}]Logged in as [{STYLE_ENV}]{username}[/][/]")
             return True
         except Exception as e:
             remaining = 3 - attempt
@@ -1040,9 +1028,7 @@ class BreakoutCatcherPolicy(BasePolicy):
     def _read_rgb_state(self, observation):
         obs = np.asarray(observation)
 
-        paddle_region = obs[
-            self._fallback_paddle_y_min : self._fallback_paddle_y_max, :, :
-        ]
+        paddle_region = obs[self._fallback_paddle_y_min : self._fallback_paddle_y_max, :, :]
         paddle_mask = np.all(paddle_region == self._sprite_color, axis=2)
         _, paddle_cols = np.where(paddle_mask)
         paddle_x = float(np.mean(paddle_cols)) if len(paddle_cols) else 80.0
@@ -1152,9 +1138,7 @@ class DatasetRecorderWrapper(gym.Wrapper):
             self.screen = pygame.display.set_mode(
                 (self.frame_shape[1] * scale, self.frame_shape[0] * scale)
             )
-            pygame.display.set_caption(
-                getattr(self.env, "_env_id", "Gymnasium Recorder")
-            )
+            pygame.display.set_caption(getattr(self.env, "_env_id", "Gymnasium Recorder"))
 
     def _save_frame_image(self, frame):
         """Save a frame as lossless WebP and return the file path."""
@@ -1175,10 +1159,7 @@ class DatasetRecorderWrapper(gym.Wrapper):
         if isinstance(action, np.ndarray):
             return action.tolist()
         elif isinstance(action, dict):
-            return {
-                k: (v.tolist() if isinstance(v, np.ndarray) else v)
-                for k, v in action.items()
-            }
+            return {k: (v.tolist() if isinstance(v, np.ndarray) else v) for k, v in action.items()}
         else:
             return [int(action)]
 
@@ -1568,12 +1549,8 @@ class DatasetRecorderWrapper(gym.Wrapper):
                 table.add_row(pygame.key.name(key), action_name, idx_str)
             ml_idx = self._vizdoom_buttons.get("MOVE_LEFT")
             mr_idx = self._vizdoom_buttons.get("MOVE_RIGHT")
-            table.add_row(
-                "alt+left", "MOVE_LEFT", f"btn {ml_idx}" if ml_idx is not None else ""
-            )
-            table.add_row(
-                "alt+right", "MOVE_RIGHT", f"btn {mr_idx}" if mr_idx is not None else ""
-            )
+            table.add_row("alt+left", "MOVE_LEFT", f"btn {ml_idx}" if ml_idx is not None else "")
+            table.add_row("alt+right", "MOVE_RIGHT", f"btn {mr_idx}" if mr_idx is not None else "")
         elif hasattr(self.env, "_stable_retro") and self.env._stable_retro:
             platform = getattr(self.env.unwrapped, "system", None)
             env_type = f"Stable-Retro ({platform})"
@@ -1586,9 +1563,7 @@ class DatasetRecorderWrapper(gym.Wrapper):
             group_action = []
             group_special = []
             for key, idx in mapping.items():
-                label = (
-                    buttons[idx] if buttons and idx < len(buttons) else f"button {idx}"
-                )
+                label = buttons[idx] if buttons and idx < len(buttons) else f"button {idx}"
                 row = (pygame.key.name(key), label, f"idx {idx}")
                 if key in dpad_keys:
                     group_dpad.append(row)
@@ -1744,9 +1719,7 @@ class DatasetRecorderWrapper(gym.Wrapper):
         # Setup input source
         if self.input_source is None:
             # Default to human input
-            self.input_source = HumanInputSource(
-                self.env, self.key_lock, self.current_keys
-            )
+            self.input_source = HumanInputSource(self.env, self.key_lock, self.current_keys)
         elif hasattr(self.input_source, "reset"):
             self.input_source.reset()
 
@@ -1824,10 +1797,7 @@ class DatasetRecorderWrapper(gym.Wrapper):
                     self._progress_callback(self._episode_count, step)
 
                 # Check if we've reached the max episode count
-                if (
-                    self._max_episodes is not None
-                    and self._episode_count >= self._max_episodes
-                ):
+                if self._max_episodes is not None and self._episode_count >= self._max_episodes:
                     break
 
                 self._current_episode_uuid = uuid.uuid4()
@@ -1849,8 +1819,6 @@ class DatasetRecorderWrapper(gym.Wrapper):
             self._record_terminal_observation(self._current_episode_uuid, obs)
 
         if self.recording and self.frames:
-            import pyarrow as pa
-
             data = {
                 "episode_id": self.episode_ids,
                 "seed": self.seeds,
@@ -1865,9 +1833,7 @@ class DatasetRecorderWrapper(gym.Wrapper):
                 "gymrec_version": [self._gymrec_version] * len(self.frames),
             }
             self._recorded_dataset = Dataset.from_dict(data)
-            self._recorded_dataset = self._recorded_dataset.cast_column(
-                "observations", HFImage()
-            )
+            self._recorded_dataset = self._recorded_dataset.cast_column("observations", HFImage())
             # Cast episode_id and session_id to binary for efficient UUID storage
             self._recorded_dataset = self._recorded_dataset.cast_column(
                 "episode_id", Value("binary")
@@ -1887,10 +1853,7 @@ class DatasetRecorderWrapper(gym.Wrapper):
     def _convert_action(self, action):
         """Convert stored action back to the environment's expected format."""
         if isinstance(action, list):
-            if (
-                isinstance(self.env.action_space, gym.spaces.Discrete)
-                and len(action) == 1
-            ):
+            if isinstance(self.env.action_space, gym.spaces.Discrete) and len(action) == 1:
                 return action[0]
             else:
                 return np.array(action, dtype=np.int32)
@@ -1982,9 +1945,9 @@ class DatasetRecorderWrapper(gym.Wrapper):
 
                         if float(reward) != float(recorded_reward):
                             reward_mismatches += 1
-                        if bool(terminated) != bool(recorded_terminated) or bool(
-                            truncated
-                        ) != bool(recorded_truncated):
+                        if bool(terminated) != bool(recorded_terminated) or bool(truncated) != bool(
+                            recorded_truncated
+                        ):
                             terminal_mismatches += 1
 
                         verify_metrics.append(mse)
@@ -2024,11 +1987,7 @@ class DatasetRecorderWrapper(gym.Wrapper):
                     f"Terminal state mismatches: [{STYLE_INFO}]{terminal_mismatches}/{n_total}[/] frames"
                 )
 
-                passed = (
-                    exceeded == 0
-                    and reward_mismatches == 0
-                    and terminal_mismatches == 0
-                )
+                passed = exceeded == 0 and reward_mismatches == 0 and terminal_mismatches == 0
                 if passed:
                     lines.append(
                         f"Result: [{STYLE_SUCCESS}]PASS[/] (all frames below threshold {mse_threshold})"
@@ -2037,18 +1996,12 @@ class DatasetRecorderWrapper(gym.Wrapper):
                 else:
                     reasons = []
                     if exceeded > 0:
-                        reasons.append(
-                            f"{exceeded} frames exceeded MSE threshold {mse_threshold}"
-                        )
+                        reasons.append(f"{exceeded} frames exceeded MSE threshold {mse_threshold}")
                     if reward_mismatches > 0:
                         reasons.append(f"{reward_mismatches} reward mismatches")
                     if terminal_mismatches > 0:
-                        reasons.append(
-                            f"{terminal_mismatches} terminal state mismatches"
-                        )
-                    lines.append(
-                        f"Result: [{STYLE_FAIL}]FAIL[/] ({', '.join(reasons)})"
-                    )
+                        reasons.append(f"{terminal_mismatches} terminal state mismatches")
+                    lines.append(f"Result: [{STYLE_FAIL}]FAIL[/] ({', '.join(reasons)})")
                     border_style = "red"
             else:
                 lines.append("[yellow]No valid frame comparisons (all skipped).[/]")
@@ -2106,9 +2059,7 @@ def _decode_hf_repo_name(repo_name):
 
 def env_id_to_hf_repo_id(env_id):
     user_info = whoami()
-    username = (
-        user_info.get("name") or user_info.get("user") or user_info.get("username")
-    )
+    username = user_info.get("name") or user_info.get("user") or user_info.get("username")
     encoded_env_id = _encode_env_id_for_hf(env_id)
     hf_repo_id = f"{username}/{CONFIG['dataset']['repo_prefix']}{encoded_env_id}"
     return hf_repo_id
@@ -2143,7 +2094,6 @@ def _get_available_envs_from_local():
         return []
 
     available = []
-    prefix = CONFIG["dataset"]["repo_prefix"]
     for entry in os.listdir(local_dir):
         entry_path = os.path.join(local_dir, entry)
         if os.path.isdir(entry_path):
@@ -2163,9 +2113,7 @@ def _get_available_envs_from_hf():
     """Get list of env_ids that have HF Hub recordings."""
     try:
         user_info = whoami()
-        username = (
-            user_info.get("name") or user_info.get("user") or user_info.get("username")
-        )
+        username = user_info.get("name") or user_info.get("user") or user_info.get("username")
     except Exception:
         return []
 
@@ -2190,17 +2138,13 @@ def _get_available_envs_from_hf():
 def _get_metadata_path(env_id):
     """Return the path to the metadata JSON file for a given environment."""
     encoded_env_id = _encode_env_id_for_hf(env_id)
-    return os.path.join(
-        CONFIG["storage"]["local_dir"], f"{encoded_env_id}_metadata.json"
-    )
+    return os.path.join(CONFIG["storage"]["local_dir"], f"{encoded_env_id}_metadata.json")
 
 
 def _get_uploaded_episodes_path(env_id):
     """Return the path to the uploaded episodes tracking file for a given environment."""
     encoded_env_id = _encode_env_id_for_hf(env_id)
-    return os.path.join(
-        CONFIG["storage"]["local_dir"], f"{encoded_env_id}_uploaded.json"
-    )
+    return os.path.join(CONFIG["storage"]["local_dir"], f"{encoded_env_id}_uploaded.json")
 
 
 def _load_uploaded_episode_ids(env_id):
@@ -2237,9 +2181,7 @@ def save_dataset_locally(dataset, env_id, metadata=None):
             existing_dataset = existing_dataset.add_column(
                 "session_id", [_SENTINEL_BYTES] * n_existing
             )
-            existing_dataset = existing_dataset.cast_column(
-                "session_id", Value("binary")
-            )
+            existing_dataset = existing_dataset.cast_column("session_id", Value("binary"))
         if "collector" not in existing_dataset.column_names:
             existing_dataset = existing_dataset.add_column(
                 "collector", [_SENTINEL_STR] * n_existing
@@ -2272,13 +2214,9 @@ def save_dataset_locally(dataset, env_id, metadata=None):
         if "recordings" not in existing_metadata:
             existing_metadata["recordings"] = []
         # Extract provenance info from dataset columns if available
-        _collectors = (
-            set(dataset["collector"]) if "collector" in dataset.column_names else set()
-        )
+        _collectors = set(dataset["collector"]) if "collector" in dataset.column_names else set()
         _versions = (
-            set(dataset["gymrec_version"])
-            if "gymrec_version" in dataset.column_names
-            else set()
+            set(dataset["gymrec_version"]) if "gymrec_version" in dataset.column_names else set()
         )
         recording_entry = {
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -2337,10 +2275,7 @@ def _get_default_fps_for_env_id(env_id, metadata=None):
         "SCD",
     }
 
-    if (
-        any(env_id.endswith(f"-{plat}") for plat in retro_platforms)
-        or "Atari2600" in env_id
-    ):
+    if any(env_id.endswith(f"-{plat}") for plat in retro_platforms) or "Atari2600" in env_id:
         return CONFIG["fps_defaults"]["retro"]
     if "Vizdoom" in env_id or "vizdoom" in env_id:
         return CONFIG["fps_defaults"]["vizdoom"]
@@ -2382,9 +2317,7 @@ def _parse_episode_range(value, total_episodes):
             parts = text.split(separator, 1)
             break
     else:
-        raise ValueError(
-            "Episode range must look like START-END, START:END, or START..END"
-        )
+        raise ValueError("Episode range must look like START-END, START:END, or START..END")
 
     try:
         start = int(parts[0].strip())
@@ -2497,9 +2430,7 @@ def _default_video_output_path(env_id, selected_episode_numbers):
     elif len(selected_episode_numbers) > 1 and selected_episode_numbers == list(
         range(selected_episode_numbers[0], selected_episode_numbers[-1] + 1)
     ):
-        suffix = (
-            f"episodes_{selected_episode_numbers[0]}_{selected_episode_numbers[-1]}"
-        )
+        suffix = f"episodes_{selected_episode_numbers[0]}_{selected_episode_numbers[-1]}"
     else:
         suffix = f"episodes_{len(selected_episode_numbers)}"
 
@@ -2547,9 +2478,7 @@ def export_dataset_video(
         console.print(f"[{STYLE_FAIL}]No frames found for selected episodes.[/]")
         return False
 
-    first_frame = _frame_to_rgb_array(
-        _get_row_observation(dataset[selected_episodes[0][1][0]])
-    )
+    first_frame = _frame_to_rgb_array(_get_row_observation(dataset[selected_episodes[0][1][0]]))
     height, width = first_frame.shape[:2]
 
     if output_path is None:
@@ -2623,9 +2552,7 @@ def export_dataset_video(
         ffmpeg_stderr = process.stderr.read().decode("utf-8", errors="replace").strip()
         return_code = process.wait()
         if return_code != 0:
-            raise RuntimeError(
-                ffmpeg_stderr or f"ffmpeg exited with status {return_code}"
-            )
+            raise RuntimeError(ffmpeg_stderr or f"ffmpeg exited with status {return_code}")
     except Exception as e:
         if process.stdin is not None and not process.stdin.closed:
             process.stdin.close()
@@ -2636,9 +2563,7 @@ def export_dataset_video(
         if process.stderr is not None:
             process.stderr.close()
 
-    console.print(
-        f"[{STYLE_SUCCESS}]Video exported: [{STYLE_PATH}]{output_path}[/][/]"
-    )
+    console.print(f"[{STYLE_SUCCESS}]Video exported: [{STYLE_PATH}]{output_path}[/][/]")
     return True
 
 
@@ -2661,9 +2586,7 @@ def upload_local_dataset(env_id, max_retries=5, base_wait=1.0):
     local_dataset = load_local_dataset(env_id)
     if local_dataset is None:
         console.print(f"[{STYLE_FAIL}]No local dataset found for {env_id}[/]")
-        console.print(
-            f"  Expected at: [{STYLE_PATH}]{get_local_dataset_path(env_id)}[/]"
-        )
+        console.print(f"  Expected at: [{STYLE_PATH}]{get_local_dataset_path(env_id)}[/]")
         return False
 
     # Filter to episodes not yet uploaded
@@ -2767,9 +2690,7 @@ def upload_local_dataset(env_id, max_retries=5, base_wait=1.0):
                 api.preupload_lfs_files(
                     repo_id=hf_repo_id,
                     repo_type="dataset",
-                    additions=[
-                        op for op in operations if isinstance(op, CommitOperationAdd)
-                    ],
+                    additions=[op for op in operations if isinstance(op, CommitOperationAdd)],
                 )
                 api.create_commit(
                     repo_id=hf_repo_id,
@@ -2805,9 +2726,7 @@ def upload_local_dataset(env_id, max_retries=5, base_wait=1.0):
                     time.sleep(wait_time)
                     continue
                 else:
-                    console.print(
-                        f"[{STYLE_FAIL}]Max retries ({max_retries}) exceeded.[/]"
-                    )
+                    console.print(f"[{STYLE_FAIL}]Max retries ({max_retries}) exceeded.[/]")
                     console.print(
                         f"[{STYLE_INFO}]Another client may be uploading. Try again later.[/]"
                     )
@@ -2832,9 +2751,7 @@ def minari_export(env_id, dataset_name=None, author=None):
     dataset = load_local_dataset(env_id)
     if dataset is None:
         console.print(f"[{STYLE_FAIL}]No local dataset found for {env_id}[/]")
-        console.print(
-            f"  Expected at: [{STYLE_PATH}]{get_local_dataset_path(env_id)}[/]"
-        )
+        console.print(f"  Expected at: [{STYLE_PATH}]{get_local_dataset_path(env_id)}[/]")
         return False
 
     # Group rows by episode
@@ -2860,9 +2777,7 @@ def minari_export(env_id, dataset_name=None, author=None):
         observation_space = env.observation_space
         env.close()
     except Exception:
-        console.print(
-            f"[yellow]Could not create env for space metadata; inferring from data.[/]"
-        )
+        console.print("[yellow]Could not create env for space metadata; inferring from data.[/]")
 
     # Build EpisodeBuffers
     buffers = []
@@ -2945,7 +2860,7 @@ def minari_export(env_id, dataset_name=None, author=None):
         f"Total steps: [{STYLE_INFO}]{total_steps}[/]",
         f"Dataset ID: [{STYLE_ENV}]{dataset_name}[/]",
         "",
-        f"Load with:",
+        "Load with:",
         f"  [{STYLE_CMD}]import minari[/]",
         f"  [{STYLE_CMD}]ds = minari.load_dataset('{dataset_name}')[/]",
     ]
@@ -3042,12 +2957,8 @@ def _capture_env_metadata(env):
         unwrapped = getattr(env, "unwrapped", None)
         if unwrapped is not None:
             metadata["vizdoom_scenario"] = getattr(unwrapped, "scenario", None)
-            metadata["vizdoom_num_binary_buttons"] = getattr(
-                unwrapped, "num_binary_buttons", None
-            )
-            metadata["vizdoom_num_delta_buttons"] = getattr(
-                unwrapped, "num_delta_buttons", None
-            )
+            metadata["vizdoom_num_binary_buttons"] = getattr(unwrapped, "num_binary_buttons", None)
+            metadata["vizdoom_num_delta_buttons"] = getattr(unwrapped, "num_delta_buttons", None)
 
     return metadata
 
@@ -3083,13 +2994,9 @@ def generate_dataset_card(dataset, env_id, repo_id, metadata=None):
     curator = user_info.get("name") or user_info.get("user") or "unknown"
 
     # Extract provenance info from dataset columns
-    collectors = (
-        sorted(set(dataset["collector"])) if "collector" in dataset.column_names else []
-    )
+    collectors = sorted(set(dataset["collector"])) if "collector" in dataset.column_names else []
     gymrec_versions = (
-        sorted(set(dataset["gymrec_version"]))
-        if "gymrec_version" in dataset.column_names
-        else []
+        sorted(set(dataset["gymrec_version"])) if "gymrec_version" in dataset.column_names else []
     )
 
     # Build dynamic intro based on collectors
@@ -3117,7 +3024,7 @@ def generate_dataset_card(dataset, env_id, repo_id, metadata=None):
         f"# {env_id} Gameplay Dataset",
         "",
         intro,
-        f"captured using [gymrec](https://github.com/tsilva/gymrec).",
+        "captured using [gymrec](https://github.com/tsilva/gymrec).",
         "",
         "## Dataset Summary",
         "",
@@ -3153,20 +3060,14 @@ def generate_dataset_card(dataset, env_id, repo_id, metadata=None):
         if "sticky_actions" in metadata:
             content_lines.append(f"| Sticky Actions | {metadata['sticky_actions']} |")
         if "max_episode_steps" in metadata:
-            content_lines.append(
-                f"| Max Episode Steps | {metadata['max_episode_steps']} |"
-            )
+            content_lines.append(f"| Max Episode Steps | {metadata['max_episode_steps']} |")
 
         # Observation space
         if "observation_shape" in metadata:
             shape = metadata["observation_shape"]
-            content_lines.append(
-                f"| Observation Shape | {' × '.join(str(s) for s in shape)} |"
-            )
+            content_lines.append(f"| Observation Shape | {' × '.join(str(s) for s in shape)} |")
         if "observation_dtype" in metadata:
-            content_lines.append(
-                f"| Observation Dtype | {metadata['observation_dtype']} |"
-            )
+            content_lines.append(f"| Observation Dtype | {metadata['observation_dtype']} |")
 
         # Action space
         if "action_space_type" in metadata:
@@ -3201,9 +3102,7 @@ def generate_dataset_card(dataset, env_id, repo_id, metadata=None):
                     f"| Binary Buttons | {metadata['vizdoom_num_binary_buttons']} |"
                 )
             if "vizdoom_num_delta_buttons" in metadata:
-                content_lines.append(
-                    f"| Delta Buttons | {metadata['vizdoom_num_delta_buttons']} |"
-                )
+                content_lines.append(f"| Delta Buttons | {metadata['vizdoom_num_delta_buttons']} |")
 
         content_lines.append("")
 
@@ -3251,9 +3150,7 @@ def generate_dataset_card(dataset, env_id, repo_id, metadata=None):
     )
 
 
-def _build_dataset_card_content(
-    env_id, repo_id, api, new_frames, new_episodes, repo_exists
-):
+def _build_dataset_card_content(env_id, repo_id, api, new_frames, new_episodes, repo_exists):
     """Build dataset card content string for an append-only upload.
 
     If the repo exists, downloads the current README and parses existing frame/episode
@@ -3274,12 +3171,8 @@ def _build_dataset_card_content(
             )
             with open(readme_path) as f:
                 readme_content = f.read()
-            frames_match = re.search(
-                r"\|\s*Total frames\s*\|\s*([\d,]+)\s*\|", readme_content
-            )
-            episodes_match = re.search(
-                r"\|\s*Episodes\s*\|\s*([\d,]+)\s*\|", readme_content
-            )
+            frames_match = re.search(r"\|\s*Total frames\s*\|\s*([\d,]+)\s*\|", readme_content)
+            episodes_match = re.search(r"\|\s*Episodes\s*\|\s*([\d,]+)\s*\|", readme_content)
             if frames_match:
                 total_frames += int(frames_match.group(1).replace(",", ""))
             if episodes_match:
@@ -3329,7 +3222,7 @@ def _build_dataset_card_content(
         f"# {env_id} Gameplay Dataset",
         "",
         intro,
-        f"captured using [gymrec](https://github.com/tsilva/gymrec).",
+        "captured using [gymrec](https://github.com/tsilva/gymrec).",
         "",
         "## Dataset Summary",
         "",
@@ -3362,18 +3255,12 @@ def _build_dataset_card_content(
         if "sticky_actions" in metadata:
             content_lines.append(f"| Sticky Actions | {metadata['sticky_actions']} |")
         if "max_episode_steps" in metadata:
-            content_lines.append(
-                f"| Max Episode Steps | {metadata['max_episode_steps']} |"
-            )
+            content_lines.append(f"| Max Episode Steps | {metadata['max_episode_steps']} |")
         if "observation_shape" in metadata:
             shape = metadata["observation_shape"]
-            content_lines.append(
-                f"| Observation Shape | {' × '.join(str(s) for s in shape)} |"
-            )
+            content_lines.append(f"| Observation Shape | {' × '.join(str(s) for s in shape)} |")
         if "observation_dtype" in metadata:
-            content_lines.append(
-                f"| Observation Dtype | {metadata['observation_dtype']} |"
-            )
+            content_lines.append(f"| Observation Dtype | {metadata['observation_dtype']} |")
         if "action_space_type" in metadata:
             content_lines.append(f"| Action Space | {metadata['action_space_type']} |")
         if "n_actions" in metadata:
@@ -3401,9 +3288,7 @@ def _build_dataset_card_content(
                     f"| Binary Buttons | {metadata['vizdoom_num_binary_buttons']} |"
                 )
             if "vizdoom_num_delta_buttons" in metadata:
-                content_lines.append(
-                    f"| Delta Buttons | {metadata['vizdoom_num_delta_buttons']} |"
-                )
+                content_lines.append(f"| Delta Buttons | {metadata['vizdoom_num_delta_buttons']} |")
         content_lines.append("")
 
     content_lines.extend(
@@ -3451,7 +3336,7 @@ def _create_env__stableretro(env_id):
         env = retro.make(env_id, render_mode="rgb_array")
     except FileNotFoundError:
         console.print(f"\n[{STYLE_FAIL}]Error: ROM not found for '{env_id}'.[/]")
-        console.print(f"\nStable-retro requires ROM files to be imported separately.")
+        console.print("\nStable-retro requires ROM files to be imported separately.")
         console.print(
             f"Import ROMs with:  [{STYLE_CMD}]python -m stable_retro.import /path/to/your/roms/[/]"
         )
@@ -3464,7 +3349,7 @@ def _create_env__stableretro(env_id):
 
 
 def _create_env__vizdoom(env_id):
-    from vizdoom import gymnasium_wrapper
+    import vizdoom.gymnasium_wrapper  # noqa: F401
 
     env = gym.make(env_id, render_mode="rgb_array", max_buttons_pressed=0)
     env._vizdoom = True
@@ -3570,10 +3455,7 @@ def get_default_fps(env):
             "SCD",
         }
 
-        if (
-            any(env_id.endswith(f"-{plat}") for plat in retro_platforms)
-            or "Atari2600" in env_id
-        ):
+        if any(env_id.endswith(f"-{plat}") for plat in retro_platforms) or "Atari2600" in env_id:
             base_fps = CONFIG["fps_defaults"]["retro"]
         elif "Vizdoom" in env_id or "vizdoom" in env_id:
             base_fps = CONFIG["fps_defaults"]["vizdoom"]
@@ -3627,14 +3509,9 @@ def _get_stableretro_envs(imported_only: bool = False) -> list[str]:
 
 def _get_vizdoom_envs() -> list[str]:
     try:
-        import vizdoom
-        import vizdoom.gymnasium_wrapper
+        import vizdoom.gymnasium_wrapper  # noqa: F401
 
-        return sorted(
-            env_id
-            for env_id in gym.envs.registry.keys()
-            if env_id.startswith("Vizdoom")
-        )
+        return sorted(env_id for env_id in gym.envs.registry.keys() if env_id.startswith("Vizdoom"))
     except Exception:
         return []
 
@@ -3686,12 +3563,8 @@ def select_environment_interactive(available_recordings_only: bool = False) -> s
 
         # Group by platform
         atari_envs = [e for e in all_recorded_envs if _get_env_platform(e) == "Atari"]
-        retro_envs = [
-            e for e in all_recorded_envs if _get_env_platform(e) == "Stable-Retro"
-        ]
-        vizdoom_envs = [
-            e for e in all_recorded_envs if _get_env_platform(e) == "VizDoom"
-        ]
+        retro_envs = [e for e in all_recorded_envs if _get_env_platform(e) == "Stable-Retro"]
+        vizdoom_envs = [e for e in all_recorded_envs if _get_env_platform(e) == "VizDoom"]
 
         entries = []
         env_id_map = []
@@ -3857,8 +3730,8 @@ def list_environments():
 
 def _import_roms(path: str):
     """Import ROMs into stable-retro from a directory or file."""
-    import io
     import zipfile
+
     import stable_retro.data
 
     if not os.path.exists(path):
@@ -4023,7 +3896,8 @@ def _worker_collect_episodes(
 
 def _parallel_record(env_id, num_workers, total_episodes, max_steps, agent_type, fps):
     """Run parallel episode collection across multiple worker processes."""
-    from datasets import concatenate_datasets, load_from_disk as _load_from_disk
+    from datasets import concatenate_datasets
+    from datasets import load_from_disk as _load_from_disk
 
     episode_counts = _distribute_episodes(total_episodes, num_workers)
     # Filter out workers with 0 episodes
@@ -4092,11 +3966,7 @@ def _parallel_record(env_id, num_workers, total_episodes, max_steps, agent_type,
             while completed_workers < actual_workers:
                 # Check for dead workers
                 for worker_id, p in processes:
-                    if (
-                        not p.is_alive()
-                        and p.exitcode != 0
-                        and worker_id not in worker_paths
-                    ):
+                    if not p.is_alive() and p.exitcode != 0 and worker_id not in worker_paths:
                         console.print(
                             f"[{STYLE_FAIL}]Worker {worker_id} crashed (exit code {p.exitcode})[/]"
                         )
@@ -4186,9 +4056,7 @@ def _parallel_record(env_id, num_workers, total_episodes, max_steps, agent_type,
         p.join(timeout=10)
 
     # Collect valid datasets
-    valid_paths = [
-        p for p in worker_paths.values() if p is not None and os.path.exists(p)
-    ]
+    valid_paths = [p for p in worker_paths.values() if p is not None and os.path.exists(p)]
     if not valid_paths:
         shutil.rmtree(output_dir, ignore_errors=True)
         console.print(f"[{STYLE_FAIL}]No data collected from any worker.[/]")
@@ -4198,9 +4066,7 @@ def _parallel_record(env_id, num_workers, total_episodes, max_steps, agent_type,
     merged = concatenate_datasets(datasets) if len(datasets) > 1 else datasets[0]
 
     # Use metadata from first successful worker
-    merged_metadata = (
-        next(iter(worker_metadata.values()), None) if worker_metadata else None
-    )
+    merged_metadata = next(iter(worker_metadata.values()), None) if worker_metadata else None
 
     shutil.rmtree(output_dir, ignore_errors=True)
     return merged, merged_metadata
@@ -4236,8 +4102,7 @@ async def main():
         default="human",
         choices=["human", "random", "mario", "breakout"],
         help=(
-            "Input source: human, random, mario, or deterministic breakout "
-            "policy (default: human)"
+            "Input source: human, random, mario, or deterministic breakout policy (default: human)"
         ),
     )
     parser_record.add_argument(
@@ -4326,9 +4191,7 @@ async def main():
         help="Export the last N episodes",
     )
 
-    parser_upload = subparsers.add_parser(
-        "upload", help="Upload local dataset to Hugging Face Hub"
-    )
+    parser_upload = subparsers.add_parser("upload", help="Upload local dataset to Hugging Face Hub")
     parser_upload.add_argument(
         "env_id",
         type=str,
@@ -4406,9 +4269,7 @@ async def main():
     if env_id is None:
         # For playback, only show environments with available recordings
         is_recording_command = args.command in ("playback", "video")
-        env_id = select_environment_interactive(
-            available_recordings_only=is_recording_command
-        )
+        env_id = select_environment_interactive(available_recordings_only=is_recording_command)
 
     if args.command == "upload":
         upload_local_dataset(env_id)
@@ -4451,9 +4312,7 @@ async def main():
         else:
             # Agent mode
             if args.agent not in ("random", "mario", "breakout"):
-                console.print(
-                    f"[{STYLE_FAIL}]Error: Unknown agent type '{args.agent}'[/]"
-                )
+                console.print(f"[{STYLE_FAIL}]Error: Unknown agent type '{args.agent}'[/]")
                 return
 
             # Validate --workers usage
@@ -4559,13 +4418,9 @@ async def main():
             return
 
         if recorder is not None:
-            save_dataset_locally(
-                recorded_dataset, env_id, metadata=recorder._env_metadata
-            )
+            save_dataset_locally(recorded_dataset, env_id, metadata=recorder._env_metadata)
             recorder.close()  # cleanup temp files after dataset is saved
-        console.print(
-            f"To play back: [{STYLE_CMD}]uv run python main.py playback {env_id}[/]"
-        )
+        console.print(f"To play back: [{STYLE_CMD}]uv run python main.py playback {env_id}[/]")
 
         if not args.dry_run:
             try:
@@ -4601,9 +4456,7 @@ async def main():
                 loaded_dataset = None
             if loaded_dataset is None:
                 console.print(f"[{STYLE_FAIL}]No dataset found for {env_id}.[/]")
-                console.print(
-                    f"  Local path: [{STYLE_PATH}]{get_local_dataset_path(env_id)}[/]"
-                )
+                console.print(f"  Local path: [{STYLE_PATH}]{get_local_dataset_path(env_id)}[/]")
                 console.print(
                     f"  Record a session first: [{STYLE_CMD}]uv run python main.py record {env_id}[/]"
                 )
@@ -4616,9 +4469,7 @@ async def main():
                     total = None
             except Exception:
                 total = None
-            console.print(
-                f"[{STYLE_INFO}]Playing back streaming from Hugging Face Hub[/]"
-            )
+            console.print(f"[{STYLE_INFO}]Playing back streaming from Hugging Face Hub[/]")
         recorder = DatasetRecorderWrapper(env)
 
         def _is_step_row(row):
@@ -4643,9 +4494,7 @@ async def main():
             await recorder.replay(recorded_data, fps=fps, total=total, verify=True)
         else:
             actions = (
-                row.get("actions", row.get("action"))
-                for row in loaded_dataset
-                if _is_step_row(row)
+                row.get("actions", row.get("action")) for row in loaded_dataset if _is_step_row(row)
             )
             await recorder.replay(actions, fps=fps, total=total)
     elif args.command == "video":
@@ -4656,9 +4505,7 @@ async def main():
                 f"({len(loaded_dataset)} frames)[/]"
             )
         else:
-            console.print(
-                "[dim]No local dataset found, downloading from Hugging Face Hub...[/]"
-            )
+            console.print("[dim]No local dataset found, downloading from Hugging Face Hub...[/]")
             try:
                 hf_repo_id = env_id_to_hf_repo_id(env_id)
                 api = HfApi()
@@ -4673,9 +4520,7 @@ async def main():
 
         if loaded_dataset is None:
             console.print(f"[{STYLE_FAIL}]No dataset found for {env_id}.[/]")
-            console.print(
-                f"  Local path: [{STYLE_PATH}]{get_local_dataset_path(env_id)}[/]"
-            )
+            console.print(f"  Local path: [{STYLE_PATH}]{get_local_dataset_path(env_id)}[/]")
             console.print(
                 f"  Record a session first: [{STYLE_CMD}]uv run python main.py record {env_id}[/]"
             )
