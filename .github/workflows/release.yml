@@ -5,6 +5,13 @@ on:
     paths:
       - pyproject.toml
       - .github/workflows/release.yml
+  workflow_dispatch:
+    inputs:
+      publish_existing:
+        description: "Publish the current version even when the GitHub tag already exists"
+        required: false
+        type: boolean
+        default: false
 concurrency:
   group: release
   cancel-in-progress: false
@@ -65,12 +72,12 @@ jobs:
             echo "tag_exists=false" >> "$GITHUB_OUTPUT"
           fi
       - name: Setup uv
-        if: steps.check-version.outputs.tag_exists == 'false'
+        if: steps.check-version.outputs.tag_exists == 'false' || inputs.publish_existing
         uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
       - name: Build package
-        if: steps.check-version.outputs.tag_exists == 'false'
+        if: steps.check-version.outputs.tag_exists == 'false' || inputs.publish_existing
         run: uv build
       - name: Create GitHub release
         if: steps.check-version.outputs.tag_exists == 'false'
@@ -78,5 +85,5 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: Publish to PyPI
-        if: steps.check-version.outputs.tag_exists == 'false'
+        if: steps.check-version.outputs.tag_exists == 'false' || inputs.publish_existing
         uses: pypa/gh-action-pypi-publish@release/v1
