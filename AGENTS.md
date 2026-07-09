@@ -64,13 +64,13 @@ All code is in `main.py`. The project prioritizes simplicity over modularization
 
 ### Key Components
 
-**InputSource Abstraction** (main.py:459-749)
+**InputSource Abstraction**
 - `InputSource`: Abstract base class for input sources
 - `HumanInputSource`: Keyboard input via pygame
 - `AgentInputSource`: Policy-based input for automated data collection
 - `BasePolicy` / `RandomPolicy`: Policy interface with random sampling implementation
 
-**DatasetRecorderWrapper** (main.py:751-)
+**DatasetRecorderWrapper**
 - Gymnasium wrapper that handles recording and playback
 - Accepts `InputSource` for flexible input (human or agent)
 - Supports headless mode for fast automated data collection
@@ -81,29 +81,29 @@ All code is in `main.py`. The project prioritizes simplicity over modularization
   - VizDoom: MultiBinary actions (or Dict with binary/continuous)
   - Stable-Retro: MultiBinary actions, platform-specific mappings
 
-**Environment Creation** (main.py:2653)
+**Environment Creation**
 - `create_env()` detects environment type by pattern matching env_id
 - Adds `_env_id`, `_vizdoom`, or `_stable_retro` attributes to distinguish backends
 - Each backend has different initialization requirements and action spaces
 
 **Action Mapping System**
 - Platform-specific key bindings: `ATARI_KEY_BINDINGS`, `VIZDOOM_KEY_BINDINGS`, `STABLE_RETRO_KEY_BINDINGS`
-- VizDoom requires button index mapping (main.py:304-340)
+- VizDoom requires button index mapping
 - Stable-Retro has per-console mappings (Nes, Snes, Genesis, etc.)
-- Action conversion for dataset storage (main.py:277-286): normalizes numpy/dict/int to serializable format
+- Action conversion for dataset storage normalizes numpy/dict/int to serializable format
 
 **Dataset Management**
-- Naming convention: `{username}/GymnasiumRecording__{env_id_underscored}`
+- Naming convention: `{username}/gymrec__{encoded_env_id}`, where env IDs use the reversible `_slash_`, `_dash_`, and `_underscore_` encoding.
 - Concatenates new recordings with existing datasets on Hub
 - Auto-generates dataset cards with episode/frame statistics
 - Fields: `episode_id`, `seed`, `observations`, `actions`, `rewards`, `terminations`, `truncations`, `infos`, `session_id`, `collector`, `gymrec_version`
 - **Provenance columns** (added per-row, constant per session):
   - `session_id` (`binary(16)`): UUID grouping all episodes from one `gymrec record` run
-  - `collector` (`string`): Who collected the data (`"human"`, `"random"`, or future agent names)
+  - `collector` (`string`): Who collected the data (`"human"`, `"random"`, `"mario"`, `"breakout"`, or future agent names)
   - `gymrec_version` (`string`): Version string like `"0.1.0+abc1234"` from `_get_gymrec_version()`
 - Backward-compatible concatenation: old datasets missing provenance columns get sentinel values (`"unknown"` / `b'\x00'*16`)
 
-**FPS Handling** (main.py:2713)
+**FPS Handling**
 - Attempts to read from environment metadata first
 - Falls back to defaults: Atari=90fps, VizDoom=45fps, Retro=90fps (see config.toml)
 - Pattern matches env_id when metadata unavailable
@@ -117,8 +117,8 @@ The wrapper must handle three distinct action space types:
 3. **Dict** (Some VizDoom configs): `{"binary": ..., "continuous": ...}`
 
 Action conversion happens in two places:
-- Recording: Convert env actions to serializable format (main.py:277-286)
-- Playback: Convert stored actions back to env format (main.py:561-580)
+- Recording: Convert env actions to serializable format
+- Playback: Convert stored actions back to env format
 
 ### Environment Detection
 Use the `_vizdoom` and `_stable_retro` attributes added by `create_env()` to branch behavior:
@@ -147,7 +147,7 @@ if isinstance(frame, dict):
 - Platform-specific game controls (arrow keys, Z/X buttons, etc.)
 
 ### Agent Mode
-- `--agent {human,random}`: Choose input source (default: human)
+- `--agent {human,random,mario,breakout}`: Choose input source (default: human)
 - `--headless`: Run without display (agent mode only, runs at max speed)
 - `--episodes N`: Collect N episodes then stop
   - Human mode: defaults to unlimited (run until ESC)

@@ -21,7 +21,6 @@ dependencies = [
     "huggingface-hub",
     "simple-term-menu",
     "stable-retro-turbo==1.0.1.post9",
-    "scipy>=1.17.0",
 ]
 
 [project.scripts]

@@ -15,7 +15,6 @@ import uuid
 from abc import ABC, abstractmethod
 
 import gymnasium as gym
-import numpy as np
 from dotenv import load_dotenv
 from rich.console import Console
 from rich.panel import Panel
@@ -386,11 +385,6 @@ class InputSource(ABC):
         """Return action for the current observation."""
         pass
 
-    @abstractmethod
-    def handle_events(self) -> bool:
-        """Process any pending events. Returns False to quit."""
-        pass
-
 
 class HumanInputSource(InputSource):
     """Human input via pygame keyboard events."""
@@ -599,21 +593,6 @@ class HumanInputSource(InputSource):
                 return self._get_stable_retro_action()
             return self._get_atari_action()
 
-    def handle_events(self) -> bool:
-        """Handle pygame input events."""
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                return False
-            elif event.type == pygame.KEYDOWN:
-                if event.key == pygame.K_ESCAPE:
-                    return False
-                with self.key_lock:
-                    self.current_keys.add(event.key)
-            elif event.type == pygame.KEYUP:
-                with self.key_lock:
-                    self.current_keys.discard(event.key)
-        return True
-
 
 class AgentInputSource(InputSource):
     """Agent input via policy function."""
@@ -635,17 +614,6 @@ class AgentInputSource(InputSource):
         """Forward step results to the policy when it needs feedback."""
         if hasattr(self.policy, "observe_step"):
             self.policy.observe_step(reward, terminated, truncated, info)
-
-    def handle_events(self) -> bool:
-        """Minimal event handling - just check for ESC if not headless."""
-        if not self.headless:
-            for event in pygame.event.get():
-                if event.type == pygame.QUIT:
-                    return False
-                elif event.type == pygame.KEYDOWN:
-                    if event.key == pygame.K_ESCAPE:
-                        return False
-        return True
 
 
 # =============================================================================
@@ -1410,12 +1378,8 @@ class DatasetRecorderWrapper(gym.Wrapper):
             # Use the wrapper event loop whenever a window is present so
             # shared controls like ESC, +/- FPS, and TAB overlay toggles work
             # consistently in both gameplay and playback.
-            if self.headless:
-                if not self.input_source.handle_events():
-                    break
-            else:
-                if not self._input_loop():
-                    break
+            if not self.headless and not self._input_loop():
+                break
 
             # Get action from input source
             action = self.input_source.get_action(obs)
@@ -1720,10 +1684,8 @@ def _decode_hf_repo_name(repo_name):
 
 
 def env_id_to_hf_repo_id(env_id):
-    user_info = whoami()
-    username = user_info.get("name") or user_info.get("user") or user_info.get("username")
     encoded_env_id = _encode_env_id_for_hf(env_id)
-    hf_repo_id = f"{username}/{CONFIG['dataset']['repo_prefix']}{encoded_env_id}"
+    hf_repo_id = f"{_current_hf_username()}/{CONFIG['dataset']['repo_prefix']}{encoded_env_id}"
     return hf_repo_id
 
 
@@ -1761,12 +1723,11 @@ def _get_available_envs_from_local():
         if os.path.isdir(entry_path):
             # Check if this is a valid dataset directory
             if os.path.exists(os.path.join(entry_path, "dataset_info.json")):
-                # Skip old-format directories that don't use the encoding scheme
-                # (directories created before encoding was implemented won't have _dash_ or _underscore_)
-                if "_dash_" not in entry and "_underscore_" not in entry:
-                    continue
-                # Decode the directory name back to env_id
                 env_id = _decode_hf_repo_name(entry)
+                # Skip old-format directories that do not round-trip through
+                # the current reversible encoding scheme.
+                if _encode_env_id_for_hf(env_id) != entry:
+                    continue
                 available.append(env_id)
     return sorted(set(available))
 
@@ -1774,8 +1735,7 @@ def _get_available_envs_from_local():
 def _get_available_envs_from_hf():
     """Get list of env_ids that have HF Hub recordings."""
     try:
-        user_info = whoami()
-        username = user_info.get("name") or user_info.get("user") or user_info.get("username")
+        username = _current_hf_username()
     except Exception:
         return []
 
@@ -2653,7 +2613,7 @@ def _size_category(n):
 
 def _current_hf_username():
     user_info = whoami()
-    return user_info.get("name") or user_info.get("user") or "unknown"
+    return user_info.get("name") or user_info.get("user") or user_info.get("username") or "unknown"
 
 
 def _provenance_from_metadata(metadata):
@@ -2879,10 +2839,10 @@ def _create_env__stableretro(env_id):
         console.print(f"\n[{STYLE_FAIL}]Error: ROM not found for '{env_id}'.[/]")
         console.print("\nStable-retro requires ROM files to be imported separately.")
         console.print(
-            f"Import ROMs with:  [{STYLE_CMD}]python -m stable_retro.import /path/to/your/roms/[/]"
+            f"Import ROMs with:  [{STYLE_CMD}]{_gymrec_cmd('import_roms', '/path/to/roms')}[/]"
         )
         console.print(
-            f"\nUse [{STYLE_CMD}]list_environments[/] to see which games have ROMs imported."
+            f"\nUse [{STYLE_CMD}]{_gymrec_cmd('list_environments')}[/] to see which games have ROMs imported."
         )
         sys.exit(1)
     env._stable_retro = True
@@ -3733,7 +3693,12 @@ async def main():
 
     env = None
     fps = args.fps
-    if args.command in ("record", "playback"):
+    parallel_record = (
+        args.command == "record"
+        and getattr(args, "agent", "human") != "human"
+        and getattr(args, "workers", 1) > 1
+    )
+    if args.command == "playback" or (args.command == "record" and not parallel_record):
         env = create_env(env_id)
         if fps is None:
             fps = get_default_fps(env)
@@ -3799,10 +3764,8 @@ async def main():
                     fps=fps,
                 )
                 if recorded_dataset is None:
-                    env.close()
                     return
                 save_dataset_locally(recorded_dataset, env_id, metadata=env_metadata)
-                env.close()
 
             else:
                 # Single-worker agent path with progress bar
