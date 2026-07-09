@@ -268,7 +268,7 @@ def _load_config():
 
 def _gymrec_cmd(*parts):
     """Format a user-facing command with the installed CLI entrypoint."""
-    return " ".join(("uv", "run", "gymrec", *(str(part) for part in parts)))
+    return " ".join(("gymrec", *(str(part) for part in parts)))
 
 
 def _get_roms_path() -> str | None:
