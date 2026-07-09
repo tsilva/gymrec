@@ -13,7 +13,6 @@
 # repo_prefix = "gymrec__"
 # license = "mit"
 # task_categories = ["reinforcement-learning"]
-# commit_message = "Update dataset card"
 
 [storage]
 # local_dir = "~/.gymrec/datasets"

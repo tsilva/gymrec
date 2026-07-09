@@ -49,8 +49,6 @@ _initialized = False
 
 def _get_gymrec_version():
     """Return version string like '0.1.0+abc1234' (or just '0.1.0' if git unavailable)."""
-    import subprocess
-
     pyproject_path = os.path.join(os.path.dirname(__file__), "pyproject.toml")
     try:
         with open(pyproject_path, "rb") as f:
@@ -167,7 +165,6 @@ DEFAULT_CONFIG = {
         "repo_prefix": "gymrec__",
         "license": "mit",
         "task_categories": ["reinforcement-learning"],
-        "commit_message": "Update dataset card",
     },
     "storage": {
         "local_dir": os.path.join(os.path.expanduser("~"), ".gymrec", "datasets"),
@@ -257,14 +254,21 @@ def _load_config():
 
     config = copy.deepcopy(DEFAULT_CONFIG)
     config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.toml")
-    if not os.path.exists(config_path):
-        return config
-    with open(config_path, "rb") as f:
-        user_config = tomllib.load(f)
-    for section in config:
-        if section in user_config:
-            config[section].update(user_config[section])
+    if os.path.exists(config_path):
+        with open(config_path, "rb") as f:
+            user_config = tomllib.load(f)
+        for section in config:
+            if section in user_config:
+                config[section].update(user_config[section])
+    config["storage"]["local_dir"] = os.path.abspath(
+        os.path.expanduser(config["storage"]["local_dir"])
+    )
     return config
+
+
+def _gymrec_cmd(*parts):
+    """Format a user-facing command with the installed CLI entrypoint."""
+    return " ".join(("uv", "run", "gymrec", *(str(part) for part in parts)))
 
 
 def _lazy_init():
@@ -364,7 +368,7 @@ def ensure_hf_login(force=False) -> bool:
                 console.print(f"[{STYLE_FAIL}]Login failed: {e}[/]")
 
     console.print(
-        f"[{STYLE_FAIL}]Could not authenticate. Try:[/] [{STYLE_CMD}]uv run python main.py login[/]"
+        f"[{STYLE_FAIL}]Could not authenticate. Try:[/] [{STYLE_CMD}]{_gymrec_cmd('login')}[/]"
     )
     return False
 
@@ -1040,7 +1044,7 @@ class DatasetRecorderWrapper(gym.Wrapper):
         else:
             return [int(action)]
 
-    def _record_frame(self, episode_uuid, seed, step, frame, action):
+    def _record_frame(self, episode_uuid, frame, action):
         """Save a frame and action to temporary storage."""
         if not self.recording:
             return
@@ -1342,15 +1346,10 @@ class DatasetRecorderWrapper(gym.Wrapper):
         self._step_callback = step_callback
         self.recording = True
         try:
-            return await self._record(fps=fps)
-        finally:
-            self.recording = False
-
-    async def _record(self, fps=None):
-        try:
-            await self._play(fps)  # bypass play() to avoid premature close()
+            await self._play(fps)
             return self._recorded_dataset
         finally:
+            self.recording = False
             # Don't delete temp_dir here - dataset.save_to_disk() needs the image files
             # temp_dir cleanup happens in main() after save_dataset_locally()
             if not self.headless:
@@ -1421,7 +1420,7 @@ class DatasetRecorderWrapper(gym.Wrapper):
             # Get action from input source
             action = self.input_source.get_action(obs)
 
-            self._record_frame(self._current_episode_uuid, seed, step, obs, action)
+            self._record_frame(self._current_episode_uuid, obs, action)
             obs, reward, terminated, truncated, info = self.env.step(action)
             if hasattr(self.input_source, "observe_step"):
                 self.input_source.observe_step(reward, terminated, truncated, info)
@@ -1943,7 +1942,12 @@ def load_recorded_dataset(env_id, streaming=False):
 def _print_missing_dataset(env_id):
     console.print(f"[{STYLE_FAIL}]No dataset found for {env_id}.[/]")
     console.print(f"  Local path: [{STYLE_PATH}]{get_local_dataset_path(env_id)}[/]")
-    console.print(f"  Record a session first: [{STYLE_CMD}]uv run python main.py record {env_id}[/]")
+    console.print(f"  Record a session first: [{STYLE_CMD}]{_gymrec_cmd('record', env_id)}[/]")
+
+
+def _is_terminal_action(action):
+    """Return True for terminal observation rows with no action."""
+    return action is None or (isinstance(action, list) and len(action) == 0)
 
 
 def _get_row_value(row, current_name, legacy_name=None):
@@ -1962,8 +1966,7 @@ def _get_row_action(row):
 
 def _is_step_row(row):
     """Filter out terminal observation rows."""
-    action = _get_row_action(row)
-    return not (action is None or (isinstance(action, list) and len(action) == 0))
+    return not _is_terminal_action(_get_row_action(row))
 
 
 def _get_default_fps_for_env_id(env_id, metadata=None):
@@ -2285,13 +2288,7 @@ def upload_local_dataset(env_id, max_retries=5, base_wait=1.0):
     new_indices = []
     new_episode_ids = set()
     for i, row in enumerate(local_dataset):
-        eid = row["episode_id"]
-        if isinstance(eid, bytes):
-            eid = uuid.UUID(bytes=eid).hex
-        elif isinstance(eid, uuid.UUID):
-            eid = eid.hex
-        else:
-            eid = str(eid)
+        eid = _normalize_episode_id(row["episode_id"])
         if eid not in already_uploaded:
             new_indices.append(i)
             new_episode_ids.add(eid)
@@ -2486,7 +2483,7 @@ def minari_export(env_id, dataset_name=None, author=None):
 
             # Detect terminal observation by empty/missing actions
             action = _get_row_action(row)
-            if (isinstance(action, list) and len(action) == 0) or action is None:
+            if _is_terminal_action(action):
                 continue
 
             if isinstance(action, list) and len(action) == 1:
@@ -2563,16 +2560,11 @@ def minari_export(env_id, dataset_name=None, author=None):
     return True
 
 
-def _detect_backend(env_id):
-    """Return backend name for metadata tags."""
-    return classify_env_id(env_id)
-
-
 def _capture_env_metadata(env):
     """Capture environment configuration metadata for dataset card."""
     metadata = {
         "env_id": getattr(env, "_env_id", "unknown"),
-        "backend": _detect_backend(getattr(env, "_env_id", "")),
+        "backend": classify_env_id(getattr(env, "_env_id", "")),
         "frameskip": get_frameskip(env),
         "fps": get_default_fps(env),
     }
@@ -2752,7 +2744,7 @@ def render_dataset_card_content(
     curator=None,
 ):
     """Render the shared Hugging Face dataset card Markdown."""
-    backend = _detect_backend(env_id)
+    backend = classify_env_id(env_id)
     collectors = collectors or []
     gymrec_versions = gymrec_versions or []
     curator = curator or _current_hf_username()
@@ -3061,9 +3053,27 @@ def _get_env_platform(env_id: str) -> str:
     }[classify_env_id(env_id)]
 
 
+def _build_environment_menu_entries(grouped_envs):
+    """Build menu entries and env lookup, preserving backend display order."""
+    entries = []
+    env_id_map = []
+    groups = [(label, envs) for label, envs in grouped_envs if envs]
+
+    for group_index, (label, envs) in enumerate(groups):
+        if group_index > 0:
+            entries.append("")
+            env_id_map.append(None)
+        for env_id in envs:
+            entries.append(f"[{label}]  {env_id}")
+            env_id_map.append(env_id)
+
+    return entries, env_id_map
+
+
 def select_environment_interactive(available_recordings_only: bool = False) -> str:
     from simple_term_menu import TerminalMenu
 
+    status_bar = "  ↑↓ navigate · / search · Enter select · Esc cancel"
     if available_recordings_only:
         # Get envs with available recordings
         local_envs = _get_available_envs_from_local()
@@ -3074,7 +3084,7 @@ def select_environment_interactive(available_recordings_only: bool = False) -> s
             console.print(
                 f"[{STYLE_FAIL}]No recordings found.[/]\n"
                 f"  Local path: [{STYLE_PATH}]{CONFIG['storage']['local_dir']}[/]\n"
-                f"  Record first: [{STYLE_CMD}]uv run python main.py record <env_id>[/]"
+                f"  Record first: [{STYLE_CMD}]{_gymrec_cmd('record', '<env_id>')}[/]"
             )
             raise SystemExit(1)
 
@@ -3082,56 +3092,18 @@ def select_environment_interactive(available_recordings_only: bool = False) -> s
         atari_envs = [e for e in all_recorded_envs if _get_env_platform(e) == "Atari"]
         retro_envs = [e for e in all_recorded_envs if _get_env_platform(e) == "Stable-Retro"]
         vizdoom_envs = [e for e in all_recorded_envs if _get_env_platform(e) == "VizDoom"]
-
-        entries = []
-        env_id_map = []
-
-        for env_id in atari_envs:
-            entries.append(f"[Atari]  {env_id}")
-            env_id_map.append(env_id)
-        if atari_envs and (retro_envs or vizdoom_envs):
-            entries.append("")
-            env_id_map.append(None)
-
-        for env_id in retro_envs:
-            entries.append(f"[Stable-Retro]  {env_id}")
-            env_id_map.append(env_id)
-        if retro_envs and vizdoom_envs:
-            entries.append("")
-            env_id_map.append(None)
-
-        for env_id in vizdoom_envs:
-            entries.append(f"[VizDoom]  {env_id}")
-            env_id_map.append(env_id)
-
+        entries, env_id_map = _build_environment_menu_entries(
+            (("Atari", atari_envs), ("Stable-Retro", retro_envs), ("VizDoom", vizdoom_envs))
+        )
         title = "  Select Recording\n"
-        status_bar = "  ↑↓ navigate · / search · Enter select · Esc cancel"
     else:
         # Original behavior: list all available environments
         atari_envs = _get_atari_envs()
         retro_envs = _get_stableretro_envs(imported_only=True)
         vizdoom_envs = _get_vizdoom_envs()
-
-        entries = []
-        env_id_map = []
-
-        for env_id in atari_envs:
-            entries.append(f"[Atari]  {env_id}")
-            env_id_map.append(env_id)
-        if atari_envs and (retro_envs or vizdoom_envs):
-            entries.append("")
-            env_id_map.append(None)
-
-        for env_id in retro_envs:
-            entries.append(f"[Stable-Retro]  {env_id}")
-            env_id_map.append(env_id)
-        if retro_envs and vizdoom_envs:
-            entries.append("")
-            env_id_map.append(None)
-
-        for env_id in vizdoom_envs:
-            entries.append(f"[VizDoom]  {env_id}")
-            env_id_map.append(env_id)
+        entries, env_id_map = _build_environment_menu_entries(
+            (("Atari", atari_envs), ("Stable-Retro", retro_envs), ("VizDoom", vizdoom_envs))
+        )
 
         if not entries:
             console.print(
@@ -3140,7 +3112,6 @@ def select_environment_interactive(available_recordings_only: bool = False) -> s
             raise SystemExit(1)
 
         title = "  Select Environment\n"
-        status_bar = "  ↑↓ navigate · / search · Enter select · Esc cancel"
 
     menu = TerminalMenu(
         entries,
@@ -3570,24 +3541,34 @@ def _parallel_record(env_id, num_workers, total_episodes, max_steps, agent_type,
     return merged, merged_metadata
 
 
-async def main():
-    parser = argparse.ArgumentParser(description="Gymnasium Recorder/Playback")
-    subparsers = parser.add_subparsers(dest="command")
-
-    parser_record = subparsers.add_parser("record", help="Record gameplay")
-    parser_record.add_argument(
+def _add_env_id_arg(parser):
+    parser.add_argument(
         "env_id",
         type=str,
         nargs="?",
         default=None,
         help="Gymnasium environment id (e.g. BreakoutNoFrameskip-v4)",
     )
-    parser_record.add_argument(
-        "--fps", type=int, default=None, help="Frames per second for playback/recording"
-    )
-    parser_record.add_argument(
+
+
+def _add_fps_arg(parser, help_text):
+    parser.add_argument("--fps", type=int, default=None, help=help_text)
+
+
+def _add_scale_arg(parser):
+    parser.add_argument(
         "--scale", type=int, default=None, help="Display scale factor (default: 2)"
     )
+
+
+async def main():
+    parser = argparse.ArgumentParser(description="Gymnasium Recorder/Playback")
+    subparsers = parser.add_subparsers(dest="command")
+
+    parser_record = subparsers.add_parser("record", help="Record gameplay")
+    _add_env_id_arg(parser_record)
+    _add_fps_arg(parser_record, "Frames per second for playback/recording")
+    _add_scale_arg(parser_record)
     parser_record.add_argument(
         "--dry-run",
         action="store_true",
@@ -3630,19 +3611,9 @@ async def main():
     )
 
     parser_playback = subparsers.add_parser("playback", help="Replay a dataset")
-    parser_playback.add_argument(
-        "env_id",
-        type=str,
-        nargs="?",
-        default=None,
-        help="Gymnasium environment id (e.g. BreakoutNoFrameskip-v4)",
-    )
-    parser_playback.add_argument(
-        "--fps", type=int, default=None, help="Frames per second for playback/recording"
-    )
-    parser_playback.add_argument(
-        "--scale", type=int, default=None, help="Display scale factor (default: 2)"
-    )
+    _add_env_id_arg(parser_playback)
+    _add_fps_arg(parser_playback, "Frames per second for playback/recording")
+    _add_scale_arg(parser_playback)
     parser_playback.add_argument(
         "--verify",
         action="store_true",
@@ -3653,16 +3624,8 @@ async def main():
     parser_video = subparsers.add_parser(
         "video", help="Render recorded dataset episodes to a video file"
     )
-    parser_video.add_argument(
-        "env_id",
-        type=str,
-        nargs="?",
-        default=None,
-        help="Gymnasium environment id (e.g. BreakoutNoFrameskip-v4)",
-    )
-    parser_video.add_argument(
-        "--fps", type=int, default=None, help="Frames per second for exported video"
-    )
+    _add_env_id_arg(parser_video)
+    _add_fps_arg(parser_video, "Frames per second for exported video")
     parser_video.add_argument(
         "--output",
         type=str,
@@ -3690,13 +3653,7 @@ async def main():
     )
 
     parser_upload = subparsers.add_parser("upload", help="Upload local dataset to Hugging Face Hub")
-    parser_upload.add_argument(
-        "env_id",
-        type=str,
-        nargs="?",
-        default=None,
-        help="Gymnasium environment id (e.g. BreakoutNoFrameskip-v4)",
-    )
+    _add_env_id_arg(parser_upload)
 
     subparsers.add_parser("login", help="Log in to Hugging Face Hub")
     subparsers.add_parser("list_environments", help="List available environments")
@@ -3713,13 +3670,7 @@ async def main():
     parser_minari = subparsers.add_parser(
         "minari-export", help="Export local dataset to Minari format"
     )
-    parser_minari.add_argument(
-        "env_id",
-        type=str,
-        nargs="?",
-        default=None,
-        help="Gymnasium environment id (e.g. BreakoutNoFrameskip-v4)",
-    )
+    _add_env_id_arg(parser_minari)
     parser_minari.add_argument(
         "--name",
         type=str,
@@ -3895,7 +3846,7 @@ async def main():
         if recorder is not None:
             save_dataset_locally(recorded_dataset, env_id, metadata=recorder._env_metadata)
             recorder.close()  # cleanup temp files after dataset is saved
-        console.print(f"To play back: [{STYLE_CMD}]uv run python main.py playback {env_id}[/]")
+        console.print(f"To play back: [{STYLE_CMD}]{_gymrec_cmd('playback', env_id)}[/]")
 
         if not args.dry_run:
             try:
@@ -3907,11 +3858,11 @@ async def main():
             if do_upload:
                 if not upload_local_dataset(env_id):
                     console.print(
-                        f"To retry: [{STYLE_CMD}]uv run python main.py upload {env_id}[/]"
+                        f"To retry: [{STYLE_CMD}]{_gymrec_cmd('upload', env_id)}[/]"
                     )
             else:
                 console.print(
-                    f"To upload later: [{STYLE_CMD}]uv run python main.py upload {env_id}[/]"
+                    f"To upload later: [{STYLE_CMD}]{_gymrec_cmd('upload', env_id)}[/]"
                 )
     elif args.command == "playback":
         loaded_dataset, source, total = load_recorded_dataset(env_id, streaming=True)
