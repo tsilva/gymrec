@@ -27,7 +27,7 @@ Use the PyPI `stable-retro-turbo` package for Stable-Retro support. It publishes
 import stable_retro as retro
 ```
 
-`pyproject.toml` pins `stable-retro-turbo` and exempts only that package from the global `exclude-newer = "7 days"` policy because the Python 3.12 macOS arm64 wheels are from the current PyPI release line. Do not reintroduce the old committed-wheel or `stable-retro-apple-silicon` setup unless explicitly requested.
+`pyproject.toml` depends on the latest resolvable `stable-retro-turbo` and exempts only that package from the global `exclude-newer = "7 days"` policy because the Python 3.12 macOS arm64 wheels are from the current PyPI release line. Do not reintroduce the old committed-wheel or `stable-retro-apple-silicon` setup unless explicitly requested.
 
 ## Core Commands
 
@@ -75,7 +75,7 @@ All code is in `main.py`. The project prioritizes simplicity over modularization
 - Accepts `InputSource` for flexible input (human or agent)
 - Supports headless mode for fast automated data collection
 - Manages pygame rendering (2x scaled display, skipped in headless mode)
-- Records frames to temporary WebP files, then converts to HF Dataset
+- Records observations as either lossless WebP image rows or per-episode lossless RGB video artifacts, then converts to an HF Dataset
 - Handles three environment types with different action spaces:
   - Atari (ALE-py): Discrete actions
   - VizDoom: MultiBinary actions (or Dict with binary/continuous)
@@ -96,7 +96,8 @@ All code is in `main.py`. The project prioritizes simplicity over modularization
 - Naming convention: `{username}/gymrec__{encoded_env_id}`, where env IDs use the reversible `_slash_`, `_dash_`, and `_underscore_` encoding.
 - Concatenates new recordings with existing datasets on Hub
 - Auto-generates dataset cards with episode/frame statistics
-- Fields: `episode_id`, `seed`, `observations`, `actions`, `rewards`, `terminations`, `truncations`, `infos`, `session_id`, `collector`, `gymrec_version`
+- Fields: `episode_id`, `seed`, `actions`, `rewards`, `terminations`, `truncations`, `infos`, `session_id`, `collector`, `gymrec_version`, `storage_format`
+- Image-backed storage adds `observations`; video-backed storage adds `video_path`, `frame_index`, `frame_sha256`, `frame_width`, `frame_height`, and `episode_num_observations`
 - **Provenance columns** (added per-row, constant per session):
   - `session_id` (`binary(16)`): UUID grouping all episodes from one `gymrec record` run
   - `collector` (`string`): Who collected the data (`"human"`, `"random"`, `"mario"`, `"breakout"`, or future agent names)
@@ -155,7 +156,7 @@ if isinstance(frame, dict):
 
 ## Key Constraints
 
-- **No testing infrastructure**: The project has no tests. Changes must be manually verified.
+- **Lightweight tests**: Pure helper behavior is covered in `tests/`; environment, rendering, ROM, Hub, and ffmpeg behavior still require manual verification.
 - **Pygame dependency**: All rendering and input uses pygame. The screen is created lazily after first observation.
 - **Async design**: Main loop uses `asyncio` with `await asyncio.sleep()` for frame pacing.
 - **Environment variables**: Requires `HF_TOKEN` in `.env` for dataset uploads.
@@ -175,7 +176,7 @@ class MyPolicy(BasePolicy):
 
 # Use it in the record command
 policy = MyPolicy(env.action_space)
-input_source = AgentInputSource(policy, headless=True)
+input_source = AgentInputSource(policy)
 recorder = DatasetRecorderWrapper(env, input_source=input_source, headless=True)
 ```
 

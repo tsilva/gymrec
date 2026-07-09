@@ -52,9 +52,9 @@ gymrec record BreakoutNoFrameskip-v4 --dry-run   # save locally without upload p
 gymrec record BreakoutNoFrameskip-v4 --storage lossless-video --dry-run
 gymrec record SuperMarioBros-Nes-v0 --agent random --headless --episodes 100
 gymrec record BreakoutNoFrameskip-v4 --agent breakout --headless --episodes 50
-gymrec record BreakoutNoFrameskip-v4 --agent random --headless --episodes 100 --workers 5
 
 gymrec upload BreakoutNoFrameskip-v4             # upload new local episodes to Hub
+gymrec upload BreakoutNoFrameskip-v4 --replace   # replace remote files with local dataset
 gymrec playback BreakoutNoFrameskip-v4           # replay recorded actions
 gymrec playback BreakoutNoFrameskip-v4 --verify  # compare replay frames against recorded frames
 
@@ -71,9 +71,11 @@ gymrec minari-export BreakoutNoFrameskip-v4      # export local data to Minari f
 
 Human recording opens a pygame window. Press `Space` to start recording, use the environment-specific controls printed in the terminal, press `Tab` to toggle the overlay, use `+`/`-` to adjust FPS, and press `Esc` to stop.
 
-Agent recording supports `human`, `random`, `mario`, and `breakout`. `--headless` is for agent mode only and requires `--episodes`; `--workers` runs parallel headless collection and cannot exceed the requested episode count.
+Agent recording supports `human`, `random`, `mario`, and `breakout`. `--headless` is for agent mode only and requires `--episodes`.
 
-Observation storage defaults to `lossless-video`, which stores canonical observations as per-episode lossless RGB streams under `observation_videos/` plus table rows containing `video_path`, `frame_index`, and `frame_sha256`; each canonical stream is decoded and hash-verified before the recording is accepted. Browser-friendly MP4 files under `videos/` are preview-only and are not used for replay/training. Lossless video storage requires `ffmpeg` and `ffprobe` on `PATH` and currently does not support `--workers > 1`. Use `--storage images` to store one lossless WebP-backed HF `Image` row per observation instead.
+Observation storage defaults to `lossless-video`, which stores canonical observations as per-episode lossless RGB streams under `observation_videos/` plus table rows containing `video_path`, `frame_index`, and `frame_sha256`; each canonical stream is decoded and hash-verified before the recording is accepted. Browser-friendly MP4 files under `videos/` are preview-only and are not used for replay/training. Lossless video storage requires `ffmpeg` and `ffprobe` on `PATH`. Use `--storage images` to store one lossless WebP-backed HF `Image` row per observation instead.
+
+Hub uploads append new parquet shards only when the existing remote dataset has the same storage layout as the local dataset. If an older Hub repo still contains image-backed `observations` shards or legacy `videos/*.mkv` files, `gymrec upload` refuses to append so the Dataset Viewer does not show a mixed/stale schema; use `gymrec upload <env_id> --replace` to intentionally rewrite the remote repo from the current local dataset.
 
 The interactive recording menu only shows Atari and Stable-Retro environments whose ROMs are installed in the active Python environment. It uses a full-screen terminal menu by default and falls back to a plain text search prompt when the terminal cannot support it. Set `GYMREC_TEXT_MENU=1` to force the text selector. `list_environments` also shows missing ROMs for backends that register games separately from installed game files.
 

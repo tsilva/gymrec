@@ -2,9 +2,7 @@ import argparse
 import asyncio
 import hashlib
 import json
-import multiprocessing
 import os
-import queue
 import shutil
 import subprocess
 import sys
@@ -14,6 +12,7 @@ import time
 import tomllib
 import uuid
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 
 import gymnasium as gym
 from dotenv import find_dotenv, load_dotenv
@@ -648,6 +647,7 @@ def _lazy_init():
         login, \
         get_token, \
         CommitOperationAdd, \
+        CommitOperationDelete, \
         hf_hub_download
     global Dataset, HFImage, Value, load_dataset, load_from_disk, load_dataset_builder
     global START_KEY, ATARI_KEY_BINDINGS, VIZDOOM_KEY_BINDINGS, STABLE_RETRO_KEY_BINDINGS
@@ -666,6 +666,7 @@ def _lazy_init():
     )
     from huggingface_hub import (
         CommitOperationAdd,
+        CommitOperationDelete,
         DatasetCardData,
         HfApi,
         get_token,
@@ -959,9 +960,8 @@ class HumanInputSource(InputSource):
 class AgentInputSource(InputSource):
     """Agent input via policy function."""
 
-    def __init__(self, policy, headless=False):
+    def __init__(self, policy, headless=None):
         self.policy = policy
-        self.headless = headless
 
     def reset(self):
         """Reset any episode-local policy state."""
@@ -2438,12 +2438,10 @@ def _is_terminal_action(action):
     return action is None or (isinstance(action, list) and len(action) == 0)
 
 
-def _get_row_value(row, current_name, legacy_name=None):
-    """Read a dataset row field, preserving support for the legacy singular schema."""
+def _get_row_value(row, current_name):
+    """Read a dataset row field from the current plural schema."""
     if current_name in row:
         return row[current_name]
-    if legacy_name is not None:
-        return row.get(legacy_name)
     return None
 
 
@@ -2488,7 +2486,7 @@ def _strip_runtime_columns(dataset):
 
 def _get_row_action(row):
     """Return the action from a dataset row."""
-    return _get_row_value(row, "actions", "action")
+    return _get_row_value(row, "actions")
 
 
 def _is_step_row(row):
@@ -2600,7 +2598,7 @@ def _get_row_observation(row):
     """Return the observation image from a dataset row."""
     if _is_video_row(row):
         return _get_video_row_observation(row)
-    observation = _get_row_value(row, "observations", "observation")
+    observation = _get_row_value(row, "observations")
     if observation is None:
         raise ValueError("Dataset row is missing observations")
     return observation
@@ -2820,7 +2818,55 @@ def export_dataset_video(
     return True
 
 
-def upload_local_dataset(env_id, max_retries=5, base_wait=1.0):
+REMOTE_STORAGE_FORMAT_LEGACY_VIDEO = "legacy-lossless-video"
+
+
+def _remote_storage_format_from_files(file_paths):
+    """Infer the remote dataset storage layout from committed Hub files."""
+    has_data_shard = any(
+        path.startswith("data/") and path.endswith(".parquet") for path in file_paths
+    )
+    has_canonical_video = any(
+        path.startswith(f"{VIDEO_ARTIFACT_DIR}/") and path.endswith(CANONICAL_VIDEO_SUFFIX)
+        for path in file_paths
+    )
+    has_legacy_mkv = any(
+        path.startswith(f"{PREVIEW_VIDEO_ARTIFACT_DIR}/") and path.endswith(".mkv")
+        for path in file_paths
+    )
+
+    if has_canonical_video:
+        return STORAGE_FORMAT_LOSSLESS_VIDEO
+    if has_legacy_mkv:
+        return REMOTE_STORAGE_FORMAT_LEGACY_VIDEO
+    if has_data_shard:
+        return STORAGE_FORMAT_IMAGES
+    return None
+
+
+def _remote_storage_conflict_message(env_id, hf_repo_id, local_format, remote_format):
+    if remote_format is None or remote_format == local_format:
+        return None
+    if remote_format == REMOTE_STORAGE_FORMAT_LEGACY_VIDEO:
+        remote_label = "legacy lossless-video"
+        detail = (
+            "It contains old browser-playable `.mkv` files under `videos/` rather than "
+            f"canonical RGB streams under `{VIDEO_ARTIFACT_DIR}/`."
+        )
+    else:
+        remote_label = remote_format
+        detail = "Its parquet shards use a different observation schema."
+
+    return (
+        f"Remote dataset {hf_repo_id} already contains {remote_label} data, "
+        f"but the local dataset is {local_format}. {detail} "
+        "Refusing to append because Hugging Face would show a mixed/stale schema. "
+        f"Run `{_gymrec_cmd('upload', env_id)} --replace` to intentionally replace "
+        "the remote files with the current local dataset."
+    )
+
+
+def upload_local_dataset(env_id, max_retries=5, base_wait=1.0, replace=False):
     """Upload new episodes to HF Hub using append-only shard uploads.
 
     Only uploads episodes that have not been uploaded before (tracked in a local
@@ -2832,6 +2878,7 @@ def upload_local_dataset(env_id, max_retries=5, base_wait=1.0):
         env_id: The environment ID to upload
         max_retries: Maximum number of retry attempts on conflict (default: 5)
         base_wait: Base wait time between retries in seconds (default: 1.0)
+        replace: Replace all remote dataset files with the local dataset.
     """
     if not ensure_hf_login():
         return False
@@ -2849,32 +2896,52 @@ def upload_local_dataset(env_id, max_retries=5, base_wait=1.0):
     new_episode_ids = set()
     for i, row in enumerate(local_dataset):
         eid = _normalize_episode_id(row["episode_id"])
-        if eid not in already_uploaded:
+        if replace or eid not in already_uploaded:
             new_indices.append(i)
             new_episode_ids.add(eid)
 
+    hf_repo_id = env_id_to_hf_repo_id(env_id)
+    api = HfApi()
+
     if not new_indices:
+        if not replace:
+            try:
+                api.repo_info(repo_id=hf_repo_id, repo_type="dataset")
+                remote_files = list(api.list_repo_files(repo_id=hf_repo_id, repo_type="dataset"))
+                remote_format = _remote_storage_format_from_files(remote_files)
+                conflict_message = _remote_storage_conflict_message(
+                    env_id, hf_repo_id, storage_format, remote_format
+                )
+                if conflict_message:
+                    console.print(f"[{STYLE_FAIL}]{conflict_message}[/]")
+                    return False
+            except Exception:
+                pass
         console.print(f"[{STYLE_INFO}]All episodes already uploaded, nothing to do[/]")
         return True
 
     new_dataset = local_dataset.select(new_indices)
     n_new_episodes = len(new_episode_ids)
-    console.print(
-        f"[{STYLE_INFO}]Uploading {n_new_episodes} new episodes ({len(new_indices)} frames)...[/]"
-    )
-
-    hf_repo_id = env_id_to_hf_repo_id(env_id)
-    api = HfApi()
+    if replace:
+        console.print(
+            f"[{STYLE_INFO}]Replacing remote dataset with {n_new_episodes} local episodes ({len(new_indices)} frames)...[/]"
+        )
+    else:
+        console.print(
+            f"[{STYLE_INFO}]Uploading {n_new_episodes} new episodes ({len(new_indices)} frames)...[/]"
+        )
 
     for attempt in range(1, max_retries + 1):
         try:
             # 1. Check repo existence and get parent commit
             repo_exists = False
             parent_commit = None
+            remote_files = []
             try:
                 repo_info = api.repo_info(repo_id=hf_repo_id, repo_type="dataset")
                 repo_exists = True
                 parent_commit = repo_info.sha
+                remote_files = list(api.list_repo_files(repo_id=hf_repo_id, repo_type="dataset"))
             except Exception:
                 pass
 
@@ -2882,10 +2949,18 @@ def upload_local_dataset(env_id, max_retries=5, base_wait=1.0):
                 api.create_repo(repo_id=hf_repo_id, repo_type="dataset", exist_ok=True)
                 repo_info = api.repo_info(repo_id=hf_repo_id, repo_type="dataset")
                 parent_commit = repo_info.sha
+            elif not replace:
+                remote_format = _remote_storage_format_from_files(remote_files)
+                conflict_message = _remote_storage_conflict_message(
+                    env_id, hf_repo_id, storage_format, remote_format
+                )
+                if conflict_message:
+                    console.print(f"[{STYLE_FAIL}]{conflict_message}[/]")
+                    return False
 
             # 2. Count existing shards to determine next shard index
             next_shard_idx = 0
-            if repo_exists:
+            if repo_exists and not replace:
                 try:
                     for item in api.list_repo_tree(
                         hf_repo_id, repo_type="dataset", path_in_repo="data"
@@ -2903,11 +2978,22 @@ def upload_local_dataset(env_id, max_retries=5, base_wait=1.0):
             import tempfile
 
             operations = []
+            if replace:
+                operations.extend(
+                    CommitOperationDelete(path_in_repo=path)
+                    for path in remote_files
+                    if path != ".gitattributes"
+                )
+
             with tempfile.TemporaryDirectory() as tmpdir:
                 shard_path = os.path.join(tmpdir, "shard.parquet")
                 new_dataset = _strip_runtime_columns(new_dataset)
                 new_dataset.to_parquet(shard_path)
-                shard_name = f"data/train-{next_shard_idx:05d}-of-{next_shard_idx + 1:05d}.parquet"
+                shard_name = (
+                    "data/train-00000-of-00001.parquet"
+                    if replace
+                    else f"data/train-{next_shard_idx:05d}-of-{next_shard_idx + 1:05d}.parquet"
+                )
                 operations.append(
                     CommitOperationAdd(
                         path_in_repo=shard_name,
@@ -2981,12 +3067,17 @@ def upload_local_dataset(env_id, max_retries=5, base_wait=1.0):
                     repo_id=hf_repo_id,
                     repo_type="dataset",
                     operations=operations,
-                    commit_message=f"Add recordings from {env_id}",
+                    commit_message=(
+                        f"Replace recordings from {env_id}"
+                        if replace
+                        else f"Add recordings from {env_id}"
+                    ),
                     parent_commit=parent_commit,
                 )
 
             # 6. Track uploaded episodes locally
-            _save_uploaded_episode_ids(env_id, already_uploaded | new_episode_ids)
+            uploaded_episode_ids = new_episode_ids if replace else already_uploaded | new_episode_ids
+            _save_uploaded_episode_ids(env_id, uploaded_episode_ids)
 
             console.print(
                 f"[{STYLE_SUCCESS}]Dataset uploaded: https://huggingface.co/datasets/{hf_repo_id}[/]"
@@ -3079,7 +3170,7 @@ def minari_export(env_id, dataset_name=None, author=None):
                 img = np.array(img)
             observations.append(img)
 
-            # Detect terminal observation by empty/missing actions
+            # Detect terminal observation by empty actions
             action = _get_row_action(row)
             if _is_terminal_action(action):
                 continue
@@ -3088,17 +3179,19 @@ def minari_export(env_id, dataset_name=None, author=None):
                 action = action[0]
             actions.append(action)
 
-            reward = _get_row_value(row, "rewards", "reward")
+            reward = _get_row_value(row, "rewards")
             rewards.append(float(reward) if reward is not None else 0.0)
-            term = _get_row_value(row, "terminations", "termination")
+            term = _get_row_value(row, "terminations")
             terminations.append(bool(term) if term is not None else False)
-            trunc = _get_row_value(row, "truncations", "truncation")
+            trunc = _get_row_value(row, "truncations")
             truncations.append(bool(trunc) if trunc is not None else False)
 
-        # Fallback for old datasets without terminal observation:
-        # duplicate last obs to satisfy Minari N+1 requirement
-        if len(observations) == len(actions):
-            observations.append(observations[-1])
+        if len(observations) != len(actions) + 1:
+            console.print(
+                f"[{STYLE_FAIL}]Episode {ep_idx} is malformed: expected N+1 observations "
+                f"for {len(actions)} actions, found {len(observations)} observations.[/]"
+            )
+            return False
 
         buffers.append(
             EpisodeBuffer(
@@ -3422,6 +3515,7 @@ def render_dataset_card_content(
             "- **session_id** (`binary(16)`): UUID grouping all episodes from one `gymrec record` run",
             '- **collector** (`string`): Who collected the data (`"human"`, `"random"`, or future agent names)',
             '- **gymrec_version** (`string`): Version of gymrec used to record (e.g. `"0.1.0+abc1234"`)',
+            "- **storage_format** (`string`): Observation storage backend (`images` or `lossless-video`)",
             "",
             "## Usage",
             "",
@@ -4125,249 +4219,6 @@ def _import_roms(
     return imported_games
 
 
-def _distribute_episodes(total, num_workers):
-    """Divide total episodes evenly among workers, distributing remainder to first workers."""
-    base = total // num_workers
-    remainder = total % num_workers
-    return [base + (1 if i < remainder else 0) for i in range(num_workers)]
-
-
-def _worker_collect_episodes(
-    env_id,
-    worker_id,
-    num_episodes,
-    max_steps,
-    agent_type,
-    fps,
-    progress_queue,
-    output_dir,
-):
-    """Top-level worker function for parallel episode collection (must be picklable)."""
-    try:
-        _lazy_init()
-        env = create_env(env_id)
-        if fps is None:
-            fps = get_default_fps(env)
-
-        policy = create_agent_policy(agent_type, env)
-        input_source = AgentInputSource(policy, headless=True)
-        recorder = DatasetRecorderWrapper(
-            env, input_source=input_source, headless=True, collector=agent_type
-        )
-
-        def progress_callback(episode_number, steps_in_episode):
-            try:
-                progress_queue.put(
-                    ("progress", worker_id, episode_number, steps_in_episode),
-                    block=False,
-                )
-            except Exception:
-                pass
-
-        def step_callback(episode_number, step_number):
-            try:
-                progress_queue.put(
-                    ("step", worker_id, episode_number, step_number),
-                    block=False,
-                )
-            except Exception:
-                pass
-
-        import asyncio as _asyncio
-
-        recorded_dataset = _asyncio.run(
-            recorder.record(
-                fps=fps,
-                max_episodes=num_episodes,
-                max_steps=max_steps,
-                progress_callback=progress_callback,
-                step_callback=step_callback,
-            )
-        )
-
-        env_metadata = recorder._env_metadata
-
-        if recorded_dataset is not None:
-            worker_path = os.path.join(output_dir, f"worker_{worker_id}")
-            recorded_dataset.save_to_disk(worker_path)
-            progress_queue.put(("done", worker_id, worker_path, env_metadata))
-        else:
-            progress_queue.put(("done", worker_id, None, None))
-        recorder.close()  # cleanup temp files after dataset is saved
-
-    except Exception as e:
-        import traceback
-
-        progress_queue.put(("error", worker_id, str(e), traceback.format_exc()))
-
-
-def _parallel_record(env_id, num_workers, total_episodes, max_steps, agent_type, fps):
-    """Run parallel episode collection across multiple worker processes."""
-    from datasets import concatenate_datasets
-    from datasets import load_from_disk as _load_from_disk
-
-    episode_counts = _distribute_episodes(total_episodes, num_workers)
-    # Filter out workers with 0 episodes
-    active_counts = [(i, count) for i, count in enumerate(episode_counts) if count > 0]
-    actual_workers = len(active_counts)
-
-    output_dir = tempfile.mkdtemp(prefix="gymrec_parallel_")
-
-    ctx = multiprocessing.get_context("spawn")
-    progress_queue = ctx.Queue()
-
-    console.print(
-        f"[{STYLE_INFO}]Starting {actual_workers} worker(s) to collect {total_episodes} episode(s)[/]"
-    )
-
-    processes = []
-    for worker_id, num_eps in active_counts:
-        p = ctx.Process(
-            target=_worker_collect_episodes,
-            args=(
-                env_id,
-                worker_id,
-                num_eps,
-                max_steps,
-                agent_type,
-                fps,
-                progress_queue,
-                output_dir,
-            ),
-            daemon=True,
-        )
-        p.start()
-        processes.append((worker_id, p))
-
-    worker_paths = {}
-    worker_metadata = {}
-    completed_workers = 0
-    total_steps = 0
-
-    # Track per-worker state
-    worker_states = {wid: {"episode": 0, "step": 0} for wid, _ in active_counts}
-
-    with _episode_progress(transient=False) as progress:
-        # Create per-worker progress bars
-        worker_task_ids = {}
-        for wid, num_eps in active_counts:
-            worker_task_ids[wid] = progress.add_task(
-                f"[cyan]Worker {wid}[/] [dim]waiting...[/]",
-                total=num_eps,
-            )
-
-        # Main overall progress bar
-        main_task_id = progress.add_task("[bold]Episodes[/]", total=total_episodes)
-
-        try:
-            while completed_workers < actual_workers:
-                # Check for dead workers
-                for worker_id, p in processes:
-                    if not p.is_alive() and p.exitcode != 0 and worker_id not in worker_paths:
-                        console.print(
-                            f"[{STYLE_FAIL}]Worker {worker_id} crashed (exit code {p.exitcode})[/]"
-                        )
-                        worker_paths[worker_id] = None
-                        completed_workers += 1
-
-                try:
-                    msg = progress_queue.get(timeout=0.1)
-                except queue.Empty:
-                    continue
-
-                msg_type = msg[0]
-                if msg_type == "step":
-                    # Live step update from a worker
-                    _, wid, episode_number, step_number = msg
-                    worker_states[wid]["episode"] = episode_number
-                    worker_states[wid]["step"] = step_number
-                    # Calculate total steps across all workers
-                    current_total_steps = sum(s["step"] for s in worker_states.values())
-                    progress.update(
-                        worker_task_ids[wid],
-                        description=f"[cyan]Worker {wid}[/] [dim]Ep {episode_number}, Step {step_number}[/]",
-                    )
-                    # Update main progress bar with live step count (don't advance, just update description)
-                    progress.update(
-                        main_task_id,
-                        description=f"[bold]Episodes[/] [dim]({current_total_steps} steps)[/]",
-                    )
-                elif msg_type == "progress":
-                    # Episode completed
-                    _, wid, episode_number, steps_in_episode = msg
-                    total_steps += steps_in_episode
-                    worker_states[wid]["episode"] = episode_number
-                    worker_states[wid]["step"] = 0
-                    progress.update(
-                        worker_task_ids[wid],
-                        advance=1,
-                        description=f"[cyan]Worker {wid}[/] [dim]Ep {episode_number} done ({steps_in_episode} steps)[/]",
-                    )
-                    progress.update(
-                        main_task_id,
-                        advance=1,
-                        description=f"[bold]Episodes[/] [dim]({total_steps} steps total)[/]",
-                    )
-                elif msg_type == "done":
-                    _, wid, path, metadata = msg
-                    worker_paths[wid] = path
-                    if metadata is not None:
-                        worker_metadata[wid] = metadata
-                    # Mark worker task as complete
-                    if wid in worker_task_ids:
-                        progress.update(
-                            worker_task_ids[wid],
-                            description=f"[green]Worker {wid}[/] [dim]complete[/]",
-                        )
-                    completed_workers += 1
-                elif msg_type == "error":
-                    _, wid, err_msg, tb = msg
-                    console.print(f"[{STYLE_FAIL}]Worker {wid} error: {err_msg}[/]")
-                    if wid in worker_task_ids:
-                        progress.update(
-                            worker_task_ids[wid],
-                            description=f"[red]Worker {wid}[/] [dim]error[/]",
-                        )
-                    worker_paths[wid] = None
-                    completed_workers += 1
-
-        except KeyboardInterrupt:
-            console.print(f"\n[{STYLE_INFO}]Interrupted — terminating workers...[/]")
-            for _, p in processes:
-                p.terminate()
-            for _, p in processes:
-                p.join(timeout=5)
-            # Drain remaining messages
-            while True:
-                try:
-                    msg = progress_queue.get_nowait()
-                    if msg[0] == "done" and msg[2] is not None:
-                        worker_paths[msg[1]] = msg[2]
-                        if msg[3] is not None:
-                            worker_metadata[msg[1]] = msg[3]
-                except queue.Empty:
-                    break
-
-    for _, p in processes:
-        p.join(timeout=10)
-
-    # Collect valid datasets
-    valid_paths = [p for p in worker_paths.values() if p is not None and os.path.exists(p)]
-    if not valid_paths:
-        shutil.rmtree(output_dir, ignore_errors=True)
-        console.print(f"[{STYLE_FAIL}]No data collected from any worker.[/]")
-        return None, None
-
-    datasets = [_load_from_disk(p, keep_in_memory=True) for p in valid_paths]
-    merged = concatenate_datasets(datasets) if len(datasets) > 1 else datasets[0]
-
-    # Use metadata from first successful worker
-    merged_metadata = next(iter(worker_metadata.values()), None) if worker_metadata else None
-
-    shutil.rmtree(output_dir, ignore_errors=True)
-    return merged, merged_metadata
-
-
 def _add_env_id_arg(parser):
     parser.add_argument(
         "env_id",
@@ -4384,7 +4235,10 @@ def _add_fps_arg(parser, help_text):
 
 def _add_scale_arg(parser):
     parser.add_argument(
-        "--scale", type=int, default=None, help="Display scale factor (default: 2)"
+        "--scale",
+        type=int,
+        default=None,
+        help=f"Display scale factor (default: {DEFAULT_CONFIG['display']['scale_factor']})",
     )
 
 
@@ -4394,6 +4248,44 @@ def _add_roms_path_arg(parser, default=None):
         type=str,
         default=default,
         help="Path to ROM files. Also configurable with ROMS_PATH in .env or the shell.",
+    )
+
+
+@dataclass(frozen=True)
+class RecordPlan:
+    agent: str
+    headless: bool
+    max_episodes: int | None
+    max_steps: int | None
+
+    @property
+    def human(self) -> bool:
+        return self.agent == "human"
+
+
+def _make_record_plan(args):
+    """Normalize record-mode flags into one validated execution plan."""
+    agent = getattr(args, "agent", "human")
+    headless = bool(getattr(args, "headless", False))
+    episodes = getattr(args, "episodes", None)
+    max_steps = getattr(args, "max_steps", None)
+
+    if agent == "human":
+        if headless:
+            return None, "--headless can only be used with --agent (not human mode)"
+        return RecordPlan(agent=agent, headless=False, max_episodes=episodes, max_steps=max_steps), None
+
+    if headless and episodes is None:
+        return None, "--headless requires --episodes to be specified"
+
+    return (
+        RecordPlan(
+            agent=agent,
+            headless=headless,
+            max_episodes=episodes if episodes is not None else 1,
+            max_steps=max_steps,
+        ),
+        None,
     )
 
 
@@ -4440,12 +4332,6 @@ async def main():
         default=None,
         dest="max_steps",
         help="Maximum steps per episode (truncates episode after N steps)",
-    )
-    parser_record.add_argument(
-        "--workers",
-        type=int,
-        default=1,
-        help="Number of parallel worker processes for agent data collection (default: 1)",
     )
     parser_record.add_argument(
         "--storage",
@@ -4502,9 +4388,13 @@ async def main():
     parser_upload = subparsers.add_parser("upload", help="Upload local dataset to Hugging Face Hub")
     _add_roms_path_arg(parser_upload, default=argparse.SUPPRESS)
     _add_env_id_arg(parser_upload)
+    parser_upload.add_argument(
+        "--replace",
+        action="store_true",
+        help="Replace all remote dataset files with the current local dataset",
+    )
 
-    parser_login = subparsers.add_parser("login", help="Log in to Hugging Face Hub")
-    _add_roms_path_arg(parser_login, default=argparse.SUPPRESS)
+    subparsers.add_parser("login", help="Log in to Hugging Face Hub")
     parser_list = subparsers.add_parser("list_environments", help="List available environments")
     _add_roms_path_arg(parser_list, default=argparse.SUPPRESS)
     parser_reindex = subparsers.add_parser(
@@ -4553,7 +4443,6 @@ async def main():
             ("headless", False),
             ("episodes", None),
             ("max_steps", None),
-            ("workers", 1),
             ("storage", None),
         ]:
             if not hasattr(args, attr):
@@ -4588,7 +4477,7 @@ async def main():
     _lazy_init()
 
     if args.command == "upload":
-        upload_local_dataset(env_id)
+        upload_local_dataset(env_id, replace=args.replace)
         return
 
     if args.command == "minari-export":
@@ -4603,12 +4492,7 @@ async def main():
 
     env = None
     fps = args.fps
-    parallel_record = (
-        args.command == "record"
-        and getattr(args, "agent", "human") != "human"
-        and getattr(args, "workers", 1) > 1
-    )
-    if args.command == "playback" or (args.command == "record" and not parallel_record):
+    if args.command == "playback" or args.command == "record":
         env = create_env(env_id)
         if fps is None:
             fps = get_default_fps(env)
@@ -4617,16 +4501,13 @@ async def main():
 
     if args.command == "record":
         recorder = None
-        # Setup input source based on --agent flag
-        if args.agent == "human":
-            if args.headless:
-                console.print(
-                    f"[{STYLE_FAIL}]Error: --headless can only be used with --agent (not human mode)[/]"
-                )
-                return
+        record_plan, plan_error = _make_record_plan(args)
+        if plan_error:
+            console.print(f"[{STYLE_FAIL}]Error: {plan_error}[/]")
+            return
+
+        if record_plan.human:
             input_source = None  # Will default to HumanInputSource in _play
-            max_episodes = args.episodes  # None = unlimited for human
-            max_steps = getattr(args, "max_steps", None)
             recorder = DatasetRecorderWrapper(
                 env,
                 input_source=input_source,
@@ -4635,92 +4516,48 @@ async def main():
                 storage_format=storage_format,
             )
             recorded_dataset = await recorder.record(
-                fps=fps, max_episodes=max_episodes, max_steps=max_steps
+                fps=fps,
+                max_episodes=record_plan.max_episodes,
+                max_steps=record_plan.max_steps,
             )
         else:
-            # Agent mode
-            # Validate --workers usage
-            workers = getattr(args, "workers", 1)
-            if workers > 1:
-                args.headless = True  # Force headless for parallel workers
-                if storage_format == STORAGE_FORMAT_LOSSLESS_VIDEO:
-                    console.print(
-                        f"[{STYLE_FAIL}]Error: --storage {STORAGE_FORMAT_LOSSLESS_VIDEO} "
-                        "does not support --workers > 1 yet[/]"
-                    )
-                    return
-
-            # Don't allow headless mode without specifying episodes
-            if args.headless and args.episodes is None:
-                console.print(
-                    f"[{STYLE_FAIL}]Error: --headless requires --episodes to be specified[/]"
-                )
-                return
-
-            # Default to 1 episode for agent if not specified
-            max_episodes = args.episodes if args.episodes is not None else 1
-            max_steps = getattr(args, "max_steps", None)
-
-            # Don't allow more workers than episodes
-            if workers > max_episodes:
-                console.print(
-                    f"[{STYLE_FAIL}]Error: --workers ({workers}) cannot be greater than --episodes ({max_episodes})[/]"
-                )
-                return
-
-            mode_str = "headless" if args.headless else "with display"
+            mode_str = "headless" if record_plan.headless else "with display"
             console.print(
-                f"[{STYLE_INFO}]Recording with {args.agent} agent ({mode_str}), {max_episodes} episode(s)[/]"
+                f"[{STYLE_INFO}]Recording with {record_plan.agent} agent ({mode_str}), {record_plan.max_episodes} episode(s)[/]"
             )
 
-            if workers > 1:
-                # Parallel collection path
-                recorded_dataset, env_metadata = _parallel_record(
-                    env_id=env_id,
-                    num_workers=workers,
-                    total_episodes=max_episodes,
-                    max_steps=max_steps,
-                    agent_type=args.agent,
-                    fps=fps,
-                )
-                if recorded_dataset is None:
-                    return
-                save_dataset_locally(recorded_dataset, env_id, metadata=env_metadata)
+            policy = create_agent_policy(record_plan.agent, env)
+            input_source = AgentInputSource(policy)
 
-            else:
-                # Single-worker agent path with progress bar
-                policy = create_agent_policy(args.agent, env)
-                input_source = AgentInputSource(policy, headless=args.headless)
+            recorder = DatasetRecorderWrapper(
+                env,
+                input_source=input_source,
+                headless=record_plan.headless,
+                collector=record_plan.agent,
+                storage_format=storage_format,
+            )
 
-                recorder = DatasetRecorderWrapper(
-                    env,
-                    input_source=input_source,
-                    headless=args.headless,
-                    collector=args.agent,
-                    storage_format=storage_format,
-                )
+            total_steps_counter = [0]
 
-                total_steps_counter = [0]
-
-                def _make_progress_callback(task_id, progress_bar):
-                    def callback(episode_number, steps_in_episode):
-                        total_steps_counter[0] += steps_in_episode
-                        progress_bar.update(
-                            task_id,
-                            advance=1,
-                            description=f"[bold]Episodes[/] [dim]({total_steps_counter[0]} steps total)[/]",
-                        )
-
-                    return callback
-
-                with _episode_progress(transient=False) as progress:
-                    task_id = progress.add_task("[bold]Episodes[/]", total=max_episodes)
-                    recorded_dataset = await recorder.record(
-                        fps=fps,
-                        max_episodes=max_episodes,
-                        max_steps=max_steps,
-                        progress_callback=_make_progress_callback(task_id, progress),
+            def _make_progress_callback(task_id, progress_bar):
+                def callback(episode_number, steps_in_episode):
+                    total_steps_counter[0] += steps_in_episode
+                    progress_bar.update(
+                        task_id,
+                        advance=1,
+                        description=f"[bold]Episodes[/] [dim]({total_steps_counter[0]} steps total)[/]",
                     )
+
+                return callback
+
+            with _episode_progress(transient=False) as progress:
+                task_id = progress.add_task("[bold]Episodes[/]", total=record_plan.max_episodes)
+                recorded_dataset = await recorder.record(
+                    fps=fps,
+                    max_episodes=record_plan.max_episodes,
+                    max_steps=record_plan.max_steps,
+                    progress_callback=_make_progress_callback(task_id, progress),
+                )
 
         if recorded_dataset is None:
             if recorder is not None:
@@ -4775,9 +4612,9 @@ async def main():
                 (
                     _get_row_action(row),
                     _get_row_observation(row),
-                    _get_row_value(row, "rewards", "reward"),
-                    _get_row_value(row, "terminations", "termination"),
-                    _get_row_value(row, "truncations", "truncation"),
+                    _get_row_value(row, "rewards"),
+                    _get_row_value(row, "terminations"),
+                    _get_row_value(row, "truncations"),
                 )
                 for row in loaded_dataset
                 if _is_step_row(row)
