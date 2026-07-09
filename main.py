@@ -15,7 +15,7 @@ import uuid
 from abc import ABC, abstractmethod
 
 import gymnasium as gym
-from dotenv import load_dotenv
+from dotenv import find_dotenv, load_dotenv
 from rich.console import Console
 from rich.panel import Panel
 from rich.progress import (
@@ -41,9 +41,10 @@ STYLE_SUCCESS = "bold green"
 STYLE_FAIL = "bold red"
 STYLE_INFO = "cyan"
 
-load_dotenv(override=True)  # Load environment variables from .env file
+load_dotenv(find_dotenv(usecwd=True), override=True)  # Load .env from the invocation cwd.
 
 _initialized = False
+_stableretro_roms_path_imported = set()
 
 
 def _get_gymrec_version():
@@ -268,6 +269,41 @@ def _load_config():
 def _gymrec_cmd(*parts):
     """Format a user-facing command with the installed CLI entrypoint."""
     return " ".join(("uv", "run", "gymrec", *(str(part) for part in parts)))
+
+
+def _get_roms_path() -> str | None:
+    roms_path = os.environ.get("ROMS_PATH")
+    if not roms_path:
+        return None
+    return os.path.abspath(os.path.expanduser(roms_path))
+
+
+def _configure_atari_roms_path():
+    """Use ROMS_PATH as ALE-py's ROM directory unless ALE_ROMS_DIR is explicit."""
+    roms_path = _get_roms_path()
+    if roms_path and not os.environ.get("ALE_ROMS_DIR"):
+        os.environ["ALE_ROMS_DIR"] = (
+            os.path.dirname(roms_path) if os.path.isfile(roms_path) else roms_path
+        )
+
+
+def _ensure_stableretro_roms_path_imported(quiet: bool = True):
+    """Import ROMS_PATH into Stable-Retro's integration store once per process."""
+    roms_path = _get_roms_path()
+    if not roms_path or roms_path in _stableretro_roms_path_imported:
+        return
+
+    _stableretro_roms_path_imported.add(roms_path)
+    if not os.path.exists(roms_path):
+        if not quiet:
+            console.print(f"[{STYLE_FAIL}]ROMS_PATH does not exist: {roms_path}[/]")
+        return
+
+    imported_games = _import_roms(roms_path, quiet=quiet, source_label="ROMS_PATH")
+    if quiet and imported_games:
+        console.print(
+            f"[{STYLE_SUCCESS}]Imported {imported_games} Stable-Retro ROM(s) from ROMS_PATH[/]"
+        )
 
 
 def _lazy_init():
@@ -2831,6 +2867,8 @@ def _build_dataset_card_content(env_id, repo_id, new_frames, new_episodes, repo_
 
 
 def _create_env__stableretro(env_id):
+    _ensure_stableretro_roms_path_imported()
+
     import stable_retro as retro
 
     try:
@@ -2858,10 +2896,42 @@ def _create_env__vizdoom(env_id):
 
 
 def _create_env__alepy(env_id):
+    _configure_atari_roms_path()
+
     import ale_py
 
     gym.register_envs(ale_py)
-    return gym.make(env_id, render_mode="rgb_array")
+    has_rom, rom_status = _get_atari_rom_status(env_id)
+    if not has_rom:
+        game = _get_atari_game_name(env_id) or env_id
+        console.print(f"\n[{STYLE_FAIL}]Error: Atari ROM not available for '{env_id}'.[/]")
+        console.print(
+            f"\nALE-py registered this environment, but the ROM file for [{STYLE_ENV}]{game}[/] is not usable in this Python environment ([{STYLE_FAIL}]{rom_status}[/])."
+        )
+        console.print(
+            f"Use [{STYLE_CMD}]{_gymrec_cmd('list_environments')}[/] to see which Atari environments have ROMs installed."
+        )
+        sys.exit(1)
+
+    try:
+        return gym.make(env_id, render_mode="rgb_array")
+    except FileNotFoundError:
+        game = _get_atari_game_name(env_id) or env_id
+        console.print(f"\n[{STYLE_FAIL}]Error: Atari ROM not found for '{env_id}'.[/]")
+        console.print(
+            f"\nALE-py registered this environment, but the ROM file for [{STYLE_ENV}]{game}[/] is not installed in this Python environment."
+        )
+        console.print(
+            f"Use [{STYLE_CMD}]{_gymrec_cmd('list_environments')}[/] to see which Atari environments have ROMs installed."
+        )
+        sys.exit(1)
+    except OSError as e:
+        console.print(f"\n[{STYLE_FAIL}]Error: Atari ROM failed validation for '{env_id}'.[/]")
+        console.print(f"[dim]{e}[/]")
+        console.print(
+            f"Use [{STYLE_CMD}]{_gymrec_cmd('list_environments')}[/] to see which Atari environments have valid ROMs installed."
+        )
+        sys.exit(1)
 
 
 def create_env(env_id):
@@ -2961,23 +3031,64 @@ def get_default_fps(env):
     return base_fps
 
 
-def _get_atari_envs() -> list[str]:
+def _get_atari_game_name(env_id: str) -> str | None:
     try:
+        spec = gym.spec(env_id)
+    except Exception:
+        return None
+    kwargs = getattr(spec, "kwargs", {}) or {}
+    game = kwargs.get("game")
+    return str(game) if game else None
+
+
+def _get_atari_rom_status(env_id: str) -> tuple[bool, str]:
+    game = _get_atari_game_name(env_id)
+    if not game:
+        return False, "missing ROM metadata"
+
+    try:
+        import contextlib
+        import io
+
+        from ale_py import roms
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            rom_path = roms.get_rom_path(game)
+        if rom_path and os.path.exists(rom_path):
+            return True, "installed"
+        return False, "missing ROM"
+    except FileNotFoundError:
+        return False, "missing ROM"
+    except OSError:
+        return False, "invalid ROM"
+    except Exception:
+        return False, "ROM unavailable"
+
+
+def _get_atari_envs(imported_only: bool = False) -> list[str]:
+    try:
+        _configure_atari_roms_path()
+
         import ale_py
 
         gym.register_envs(ale_py)
-        return sorted(
+        atari_ids = sorted(
             env_id
             for env_id in gym.envs.registry.keys()
             if str(gym.spec(env_id).entry_point) == "ale_py.env:AtariEnv"
             and env_id.startswith("ALE/")
         )
+        if imported_only:
+            return [env_id for env_id in atari_ids if _get_atari_rom_status(env_id)[0]]
+        return atari_ids
     except Exception:
         return []
 
 
 def _get_stableretro_envs(imported_only: bool = False) -> list[str]:
     try:
+        _ensure_stableretro_roms_path_imported()
+
         import stable_retro as retro
 
         all_games = sorted(retro.data.list_games(retro.data.Integrations.ALL))
@@ -3030,6 +3141,76 @@ def _build_environment_menu_entries(grouped_envs):
     return entries, env_id_map
 
 
+def _terminal_menu_supported() -> bool:
+    if os.environ.get("TERM") in (None, "", "dumb"):
+        return False
+    size = shutil.get_terminal_size(fallback=(0, 0))
+    return size.columns > 0 and size.lines > 0 and sys.stdin.isatty() and sys.stdout.isatty()
+
+
+def _select_environment_text_fallback(entries, env_id_map, title: str) -> str:
+    selectable = [(entry, env_id) for entry, env_id in zip(entries, env_id_map, strict=False) if env_id]
+    if not selectable:
+        console.print(f"[{STYLE_FAIL}]No environments found.[/]")
+        raise SystemExit(1)
+
+    console.print(f"[bold]{title.strip()}[/]: [{STYLE_INFO}]{len(selectable)}[/] environments available")
+    console.print(
+        "[dim]Terminal menu is unavailable here. Type part of a name to search, or paste an exact env id.[/]"
+    )
+
+    while True:
+        query = Prompt.ask("Search").strip()
+        if not query:
+            matches = selectable[:25]
+        else:
+            query_lower = query.lower()
+            exact_matches = [
+                (entry, env_id) for entry, env_id in selectable if env_id.lower() == query_lower
+            ]
+            if exact_matches:
+                return exact_matches[0][1]
+            matches = [
+                (entry, env_id)
+                for entry, env_id in selectable
+                if query_lower in env_id.lower() or query_lower in entry.lower()
+            ][:25]
+
+        if not matches:
+            console.print(f"[{STYLE_FAIL}]No matches. Try a shorter search.[/]")
+            continue
+
+        for index, (entry, _env_id) in enumerate(matches, start=1):
+            console.print(f"{index:2d}. {entry}")
+
+        choice = Prompt.ask("Select number, or search again").strip()
+        if not choice:
+            continue
+        if choice.isdigit():
+            selected_index = int(choice)
+            if 1 <= selected_index <= len(matches):
+                return matches[selected_index - 1][1]
+        query_lower = choice.lower()
+        exact_matches = [
+            (entry, env_id) for entry, env_id in selectable if env_id.lower() == query_lower
+        ]
+        if exact_matches:
+            return exact_matches[0][1]
+
+        matches = [
+            (entry, env_id)
+            for entry, env_id in selectable
+            if query_lower in env_id.lower() or query_lower in entry.lower()
+        ][:25]
+        if len(matches) == 1:
+            return matches[0][1]
+        if matches:
+            for index, (entry, _env_id) in enumerate(matches, start=1):
+                console.print(f"{index:2d}. {entry}")
+        else:
+            console.print(f"[{STYLE_FAIL}]No matches. Try a shorter search.[/]")
+
+
 def select_environment_interactive(available_recordings_only: bool = False) -> str:
     from simple_term_menu import TerminalMenu
 
@@ -3058,7 +3239,7 @@ def select_environment_interactive(available_recordings_only: bool = False) -> s
         title = "  Select Recording\n"
     else:
         # Original behavior: list all available environments
-        atari_envs = _get_atari_envs()
+        atari_envs = _get_atari_envs(imported_only=True)
         retro_envs = _get_stableretro_envs(imported_only=True)
         vizdoom_envs = _get_vizdoom_envs()
         entries, env_id_map = _build_environment_menu_entries(
@@ -3072,6 +3253,9 @@ def select_environment_interactive(available_recordings_only: bool = False) -> s
             raise SystemExit(1)
 
         title = "  Select Environment\n"
+
+    if not _terminal_menu_supported():
+        return _select_environment_text_fallback(entries, env_id_map, title)
 
     menu = TerminalMenu(
         entries,
@@ -3099,7 +3283,12 @@ def select_environment_interactive(available_recordings_only: bool = False) -> s
 def _list_environments__alepy():
     atari_ids = _get_atari_envs()
     if atari_ids:
-        lines = "\n".join(atari_ids)
+        lines = []
+        for env_id in atari_ids:
+            has_rom, status = _get_atari_rom_status(env_id)
+            style = STYLE_SUCCESS if has_rom else STYLE_FAIL
+            lines.append(f"{env_id} [{style}]({status})[/]")
+        lines = "\n".join(lines)
     else:
         lines = "[dim]Could not list Atari environments.[/]"
     console.print(
@@ -3176,15 +3365,16 @@ def list_environments():
     _list_environments__vizdoom()
 
 
-def _import_roms(path: str):
+def _import_roms(path: str, quiet: bool = False, source_label: str | None = None) -> int:
     """Import ROMs into stable-retro from a directory or file."""
     import zipfile
 
     import stable_retro.data
 
     if not os.path.exists(path):
-        console.print(f"[{STYLE_FAIL}]Error: Path not found: {path}[/]")
-        return
+        if not quiet:
+            console.print(f"[{STYLE_FAIL}]Error: Path not found: {path}[/]")
+        return 0
 
     known_hashes = stable_retro.data.get_known_hashes()
     imported_games = 0
@@ -3199,6 +3389,13 @@ def _import_roms(path: str):
             game, ext, curpath = known_hashes[hash]
             game_path = os.path.join(curpath, game)
             rom_path = os.path.join(game_path, "rom%s" % ext)
+            if os.path.exists(rom_path):
+                try:
+                    with open(rom_path, "rb") as existing:
+                        if existing.read() == data:
+                            return
+                except OSError:
+                    pass
             with open(rom_path, "wb") as f:
                 f.write(data)
 
@@ -3255,7 +3452,10 @@ def _import_roms(path: str):
                     else:
                         save_if_matches(filename, f)
 
-    console.print(f"[{STYLE_SUCCESS}]Imported {imported_games} ROM(s)[/]")
+    if not quiet:
+        label = f" from {source_label}" if source_label else ""
+        console.print(f"[{STYLE_SUCCESS}]Imported {imported_games} ROM(s){label}[/]")
+    return imported_games
 
 
 def _distribute_episodes(total, num_workers):
@@ -3521,11 +3721,22 @@ def _add_scale_arg(parser):
     )
 
 
+def _add_roms_path_arg(parser, default=None):
+    parser.add_argument(
+        "--roms-path",
+        type=str,
+        default=default,
+        help="Path to ROM files. Also configurable with ROMS_PATH in .env or the shell.",
+    )
+
+
 async def main():
     parser = argparse.ArgumentParser(description="Gymnasium Recorder/Playback")
+    _add_roms_path_arg(parser)
     subparsers = parser.add_subparsers(dest="command")
 
     parser_record = subparsers.add_parser("record", help="Record gameplay")
+    _add_roms_path_arg(parser_record, default=argparse.SUPPRESS)
     _add_env_id_arg(parser_record)
     _add_fps_arg(parser_record, "Frames per second for playback/recording")
     _add_scale_arg(parser_record)
@@ -3571,6 +3782,7 @@ async def main():
     )
 
     parser_playback = subparsers.add_parser("playback", help="Replay a dataset")
+    _add_roms_path_arg(parser_playback, default=argparse.SUPPRESS)
     _add_env_id_arg(parser_playback)
     _add_fps_arg(parser_playback, "Frames per second for playback/recording")
     _add_scale_arg(parser_playback)
@@ -3584,6 +3796,7 @@ async def main():
     parser_video = subparsers.add_parser(
         "video", help="Render recorded dataset episodes to a video file"
     )
+    _add_roms_path_arg(parser_video, default=argparse.SUPPRESS)
     _add_env_id_arg(parser_video)
     _add_fps_arg(parser_video, "Frames per second for exported video")
     parser_video.add_argument(
@@ -3613,14 +3826,18 @@ async def main():
     )
 
     parser_upload = subparsers.add_parser("upload", help="Upload local dataset to Hugging Face Hub")
+    _add_roms_path_arg(parser_upload, default=argparse.SUPPRESS)
     _add_env_id_arg(parser_upload)
 
-    subparsers.add_parser("login", help="Log in to Hugging Face Hub")
-    subparsers.add_parser("list_environments", help="List available environments")
+    parser_login = subparsers.add_parser("login", help="Log in to Hugging Face Hub")
+    _add_roms_path_arg(parser_login, default=argparse.SUPPRESS)
+    parser_list = subparsers.add_parser("list_environments", help="List available environments")
+    _add_roms_path_arg(parser_list, default=argparse.SUPPRESS)
 
     parser_import = subparsers.add_parser(
         "import_roms", help="Import ROMs into stable-retro from a directory or file"
     )
+    _add_roms_path_arg(parser_import, default=argparse.SUPPRESS)
     parser_import.add_argument(
         "path",
         type=str,
@@ -3630,6 +3847,7 @@ async def main():
     parser_minari = subparsers.add_parser(
         "minari-export", help="Export local dataset to Minari format"
     )
+    _add_roms_path_arg(parser_minari, default=argparse.SUPPRESS)
     _add_env_id_arg(parser_minari)
     parser_minari.add_argument(
         "--name",
@@ -3642,6 +3860,10 @@ async def main():
     )
 
     args = parser.parse_args()
+    roms_path = getattr(args, "roms_path", None)
+    if roms_path:
+        os.environ["ROMS_PATH"] = os.path.abspath(os.path.expanduser(roms_path))
+
     if args.command is None:
         args.command = "record"
         for attr, default in [

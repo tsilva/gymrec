@@ -20,7 +20,7 @@ dependencies = [
     "rich",
     "huggingface-hub",
     "simple-term-menu",
-    "stable-retro-turbo==1.0.1.post9",
+    "stable-retro-turbo",
 ]
 
 [project.scripts]
