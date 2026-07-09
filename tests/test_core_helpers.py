@@ -70,6 +70,17 @@ class DummyAtariEnv:
     reward_range = (-float("inf"), float("inf"))
 
 
+class DummyAtariRenderFpsEnv:
+    _env_id = "ALE/Breakout-v5"
+    _gymrec_make_kwargs = {}
+    spec = DummySpec()
+    unwrapped = None
+    metadata = {"render_fps": 30}
+    action_space = gym.spaces.Discrete(4)
+    observation_space = gym.spaces.Box(0, 255, shape=(1, 1, 3), dtype=np.uint8)
+    reward_range = (-float("inf"), float("inf"))
+
+
 class DummyVizDoomDictObservationEnv:
     _env_id = "VizdoomBasic-v0"
     _vizdoom = True
@@ -149,6 +160,14 @@ def test_get_frameskip_and_metadata_prefer_actual_make_kwargs():
         "frameskip": 1,
         "repeat_action_probability": 0.0,
     }
+
+
+def test_atari_default_fps_uses_sixty_hz_base_not_ale_render_metadata():
+    if main.CONFIG is None:
+        main.CONFIG = main._load_config()
+
+    assert main.get_default_fps(DummyAtariEnv()) == 60
+    assert main.get_default_fps(DummyAtariRenderFpsEnv()) == 15
 
 
 def test_capture_env_metadata_handles_dict_observation_space():

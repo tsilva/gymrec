@@ -165,7 +165,7 @@ def _load_keymappings(pygame):
 
 DEFAULT_CONFIG = {
     "display": {"scale_factor": 2},
-    "fps_defaults": {"atari": 90, "vizdoom": 45, "retro": 90},
+    "fps_defaults": {"atari": 60, "vizdoom": 45, "retro": 90},
     "dataset": {
         "repo_prefix": "gymrec__",
         "license": "mit",
@@ -5142,9 +5142,13 @@ def get_frameskip(env) -> int:
 def get_default_fps(env):
     """Determine a sensible default FPS for an environment."""
 
-    base_fps = None
+    env_id = getattr(env, "_env_id", "")
+    backend = classify_env_id(env_id)
+    base_fps = CONFIG["fps_defaults"]["atari"] if backend == "atari" else None
 
     for key in ("render_fps", "video.frames_per_second"):
+        if base_fps is not None:
+            break
         fps = env.metadata.get(key)
         if fps:
             try:
@@ -5154,8 +5158,6 @@ def get_default_fps(env):
                 pass
 
     if base_fps is None:
-        env_id = getattr(env, "_env_id", "")
-        backend = classify_env_id(env_id)
         if backend == "stable-retro":
             base_fps = CONFIG["fps_defaults"]["retro"]
         elif backend == "vizdoom":
