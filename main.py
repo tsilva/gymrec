@@ -209,10 +209,11 @@ OBSERVATION_IMAGE_KEYS = ("obs", "image", "screen")
 STORAGE_FORMAT_IMAGES = "images"
 STORAGE_FORMAT_LOSSLESS_VIDEO = "lossless-video"
 STORAGE_FORMATS = (STORAGE_FORMAT_IMAGES, STORAGE_FORMAT_LOSSLESS_VIDEO)
-VIDEO_ARTIFACT_DIR = "observation_videos"
+VIDEO_ARTIFACT_DIR = "videos"
+LEGACY_VIDEO_ARTIFACT_DIR = "observation_videos"
 PREVIEW_VIDEO_ARTIFACT_DIR = "videos"
 CANONICAL_VIDEO_SUFFIX = ".rgb.mkv.bin"
-PREVIEW_VIDEO_SUFFIX = ".mp4"
+PREVIEW_VIDEO_SUFFIX = ".preview.mp4"
 RUNTIME_VIDEO_BASE_COLUMN = "_gymrec_video_base_path"
 RUNTIME_HF_REPO_COLUMN = "_gymrec_hf_repo_id"
 _VIDEO_DECODE_CACHE = {}
@@ -2280,8 +2281,12 @@ def _copy_artifact_tree(src_root, dst_root, relative_dir):
 
 def _copy_video_artifacts(src_root, dst_root):
     """Copy canonical and preview video artifacts into a saved local dataset directory."""
-    _copy_artifact_tree(src_root, dst_root, VIDEO_ARTIFACT_DIR)
-    _copy_artifact_tree(src_root, dst_root, PREVIEW_VIDEO_ARTIFACT_DIR)
+    for relative_dir in {
+        VIDEO_ARTIFACT_DIR,
+        PREVIEW_VIDEO_ARTIFACT_DIR,
+        LEGACY_VIDEO_ARTIFACT_DIR,
+    }:
+        _copy_artifact_tree(src_root, dst_root, relative_dir)
 
 
 def save_dataset_locally(dataset, env_id, metadata=None, video_artifact_dir=None):
@@ -2821,6 +2826,73 @@ def export_dataset_video(
 REMOTE_STORAGE_FORMAT_LEGACY_VIDEO = "legacy-lossless-video"
 
 
+def _upload_canonical_video_relpath(video_relpath):
+    """Return the current Hub path for a canonical video artifact."""
+    if not video_relpath:
+        return video_relpath
+    if video_relpath.startswith(f"{LEGACY_VIDEO_ARTIFACT_DIR}/"):
+        video_name = os.path.basename(video_relpath)
+        if video_name.endswith(".mkv") and not video_name.endswith(CANONICAL_VIDEO_SUFFIX):
+            video_name = f"{video_name[:-4]}{CANONICAL_VIDEO_SUFFIX}"
+        return f"{VIDEO_ARTIFACT_DIR}/{video_name}"
+    if (
+        video_relpath.startswith(f"{VIDEO_ARTIFACT_DIR}/")
+        and video_relpath.endswith(".mkv")
+        and not video_relpath.endswith(CANONICAL_VIDEO_SUFFIX)
+    ):
+        return f"{VIDEO_ARTIFACT_DIR}/{os.path.basename(video_relpath)[:-4]}{CANONICAL_VIDEO_SUFFIX}"
+    return video_relpath
+
+
+def _rewrite_video_paths_for_upload(dataset):
+    """Normalize legacy local video paths before writing Hub parquet shards."""
+    if "video_path" not in dataset.column_names:
+        return dataset
+    video_paths = list(dataset["video_path"])
+    rewritten_paths = [_upload_canonical_video_relpath(path) for path in video_paths]
+    if rewritten_paths == video_paths:
+        return dataset
+    data = {
+        column_name: rewritten_paths if column_name == "video_path" else dataset[column_name]
+        for column_name in dataset.column_names
+    }
+    return Dataset.from_dict(data, features=dataset.features)
+
+
+def _local_canonical_video_path(local_root, upload_relpath):
+    """Find the local source file for a canonical video uploaded at upload_relpath."""
+    candidates = [upload_relpath]
+    if upload_relpath.startswith(f"{VIDEO_ARTIFACT_DIR}/"):
+        video_name = os.path.basename(upload_relpath)
+        candidates.append(f"{LEGACY_VIDEO_ARTIFACT_DIR}/{video_name}")
+        if video_name.endswith(CANONICAL_VIDEO_SUFFIX):
+            episode_stem = video_name[: -len(CANONICAL_VIDEO_SUFFIX)]
+            candidates.append(f"{VIDEO_ARTIFACT_DIR}/{episode_stem}.mkv")
+            candidates.append(f"{LEGACY_VIDEO_ARTIFACT_DIR}/{episode_stem}.mkv")
+    for relpath in candidates:
+        path = os.path.join(local_root, relpath)
+        if os.path.exists(path):
+            return path
+    return os.path.join(local_root, upload_relpath)
+
+
+def _preview_video_relpath(episode_stem):
+    return f"{PREVIEW_VIDEO_ARTIFACT_DIR}/{episode_stem}{PREVIEW_VIDEO_SUFFIX}"
+
+
+def _local_preview_video_path(local_root, episode_stem):
+    """Find a current or legacy local preview source file."""
+    candidates = [
+        _preview_video_relpath(episode_stem),
+        f"{PREVIEW_VIDEO_ARTIFACT_DIR}/{episode_stem}.mp4",
+    ]
+    for relpath in candidates:
+        path = os.path.join(local_root, relpath)
+        if os.path.exists(path):
+            return path
+    return None
+
+
 def _remote_storage_format_from_files(file_paths):
     """Infer the remote dataset storage layout from committed Hub files."""
     has_data_shard = any(
@@ -2830,6 +2902,10 @@ def _remote_storage_format_from_files(file_paths):
         path.startswith(f"{VIDEO_ARTIFACT_DIR}/") and path.endswith(CANONICAL_VIDEO_SUFFIX)
         for path in file_paths
     )
+    has_legacy_canonical_video = any(
+        path.startswith(f"{LEGACY_VIDEO_ARTIFACT_DIR}/") and path.endswith(CANONICAL_VIDEO_SUFFIX)
+        for path in file_paths
+    )
     has_legacy_mkv = any(
         path.startswith(f"{PREVIEW_VIDEO_ARTIFACT_DIR}/") and path.endswith(".mkv")
         for path in file_paths
@@ -2837,7 +2913,7 @@ def _remote_storage_format_from_files(file_paths):
 
     if has_canonical_video:
         return STORAGE_FORMAT_LOSSLESS_VIDEO
-    if has_legacy_mkv:
+    if has_legacy_canonical_video or has_legacy_mkv:
         return REMOTE_STORAGE_FORMAT_LEGACY_VIDEO
     if has_data_shard:
         return STORAGE_FORMAT_IMAGES
@@ -2850,8 +2926,9 @@ def _remote_storage_conflict_message(env_id, hf_repo_id, local_format, remote_fo
     if remote_format == REMOTE_STORAGE_FORMAT_LEGACY_VIDEO:
         remote_label = "legacy lossless-video"
         detail = (
-            "It contains old browser-playable `.mkv` files under `videos/` rather than "
-            f"canonical RGB streams under `{VIDEO_ARTIFACT_DIR}/`."
+            "It contains old video artifact names rather than canonical "
+            f"`{VIDEO_ARTIFACT_DIR}/*{CANONICAL_VIDEO_SUFFIX}` streams with "
+            f"`{VIDEO_ARTIFACT_DIR}/*{PREVIEW_VIDEO_SUFFIX}` previews."
         )
     else:
         remote_label = remote_format
@@ -2988,6 +3065,8 @@ def upload_local_dataset(env_id, max_retries=5, base_wait=1.0, replace=False):
             with tempfile.TemporaryDirectory() as tmpdir:
                 shard_path = os.path.join(tmpdir, "shard.parquet")
                 new_dataset = _strip_runtime_columns(new_dataset)
+                if storage_format == STORAGE_FORMAT_LOSSLESS_VIDEO:
+                    new_dataset = _rewrite_video_paths_for_upload(new_dataset)
                 new_dataset.to_parquet(shard_path)
                 shard_name = (
                     "data/train-00000-of-00001.parquet"
@@ -3011,7 +3090,7 @@ def upload_local_dataset(env_id, max_retries=5, base_wait=1.0, replace=False):
                         }
                     )
                     for video_relpath in video_paths:
-                        video_path = os.path.join(local_root, video_relpath)
+                        video_path = _local_canonical_video_path(local_root, video_relpath)
                         if not os.path.exists(video_path):
                             raise FileNotFoundError(
                                 f"Missing video artifact for upload: {video_path}"
@@ -3025,12 +3104,9 @@ def upload_local_dataset(env_id, max_retries=5, base_wait=1.0, replace=False):
                         video_name = os.path.basename(video_relpath)
                         if video_name.endswith(CANONICAL_VIDEO_SUFFIX):
                             episode_stem = video_name[: -len(CANONICAL_VIDEO_SUFFIX)]
-                            preview_relpath = (
-                                f"{PREVIEW_VIDEO_ARTIFACT_DIR}/"
-                                f"{episode_stem}{PREVIEW_VIDEO_SUFFIX}"
-                            )
-                            preview_path = os.path.join(local_root, preview_relpath)
-                            if os.path.exists(preview_path):
+                            preview_relpath = _preview_video_relpath(episode_stem)
+                            preview_path = _local_preview_video_path(local_root, episode_stem)
+                            if preview_path:
                                 operations.append(
                                     CommitOperationAdd(
                                         path_in_repo=preview_relpath,
@@ -3481,12 +3557,12 @@ def render_dataset_card_content(
 
     if storage_format == STORAGE_FORMAT_LOSSLESS_VIDEO:
         observation_lines = [
-            "- **video_path** (`string`): Relative path to the canonical lossless RGB observation stream under `observation_videos/`",
+            f"- **video_path** (`string`): Relative path to the canonical lossless RGB observation stream under `{VIDEO_ARTIFACT_DIR}/`, named `*{CANONICAL_VIDEO_SUFFIX}`",
             "- **frame_index** (`int`): Observation frame index within `video_path`",
             "- **frame_sha256** (`string`): SHA-256 of the raw RGB frame bytes, verified after video encode/decode",
             "- **frame_width** / **frame_height** (`int`): Decoded RGB frame dimensions",
             "- **episode_num_observations** (`int`): Number of observations in the episode video",
-            "- Browser-friendly files under `videos/` are lossy previews only and are not used for trajectory replay/training",
+            f"- Browser-friendly `*{PREVIEW_VIDEO_SUFFIX}` files under `{PREVIEW_VIDEO_ARTIFACT_DIR}/` are lossy previews only and are not used for trajectory replay/training",
         ]
     else:
         observation_lines = [
