@@ -83,7 +83,6 @@ logs/
 .spyderproject
 .spyproject
 .tox/
-.venv
 .webassets-cache
 .worktrees/
 /site
@@ -122,6 +121,3 @@ share/python-wheels/
 target/
 var/
 venv.bak/
-wheels/*
-
-!wheels

@@ -29,14 +29,7 @@ jobs:
           enable-cache: true
       - run: uv sync
       - run: uv run --with ruff ruff check .
-      - run: |
-          exit_code=0
-          uv run --with pytest pytest || exit_code=$?
-          if [ $exit_code -eq 5 ]; then
-            echo "No tests collected -- skipping"
-            exit 0
-          fi
-          exit $exit_code
+      - run: uv run pytest
 
   publish:
     needs: [test]

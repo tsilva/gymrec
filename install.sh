@@ -16,8 +16,6 @@ else
   uv tool install . -e "$@"
 fi
 
-uv tool run --from gymrec python - <<'PY'
-from importlib.metadata import version
-
-print(f"stable-retro-turbo {version('stable-retro-turbo')} installed")
-PY
+tool_path="$(uv tool dir --bin)/gymrec"
+"$tool_path" --help >/dev/null
+echo "gymrec installed successfully: $tool_path"

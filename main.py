@@ -301,64 +301,14 @@ def _require_lossless_video_tools():
 
 def _encode_lossless_rgb_video(frames, output_path, fps, ffmpeg_path=None):
     """Encode a sequence of RGB frames to a canonical lossless RGB Matroska stream."""
-    if not frames:
-        raise ValueError("Cannot encode an empty video")
-    ffmpeg_path = ffmpeg_path or _require_lossless_video_tools()[0]
-
-    first = frames[0]
-    height, width = first.shape[:2]
-    for frame in frames:
-        if frame.shape != first.shape:
-            raise ValueError(
-                f"All video frames must have shape {first.shape}; got {frame.shape}"
-            )
-
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    cmd = [
-        ffmpeg_path,
-        "-y",
-        "-loglevel",
-        "error",
-        "-f",
-        "rawvideo",
-        "-pix_fmt",
-        "rgb24",
-        "-s",
-        f"{width}x{height}",
-        "-r",
-        str(max(int(round(float(fps))), 1)),
-        "-i",
-        "-",
-        "-an",
-        "-c:v",
-        "libx264rgb",
-        "-crf",
-        "0",
-        "-preset",
-        "veryslow",
-        "-pix_fmt",
-        "rgb24",
-        "-f",
-        "matroska",
-        output_path,
-    ]
-    process = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+    writer = _StreamingLosslessVideoWriter(output_path, fps, ffmpeg_path=ffmpeg_path)
     try:
         for frame in frames:
-            process.stdin.write(np.ascontiguousarray(frame).tobytes())
-        process.stdin.close()
-        stderr = process.stderr.read().decode("utf-8", errors="replace").strip()
-        return_code = process.wait()
-        if return_code != 0:
-            raise RuntimeError(stderr or f"ffmpeg exited with status {return_code}")
+            writer.write(frame)
+        writer.close()
     except Exception:
-        if process.stdin is not None and not process.stdin.closed:
-            process.stdin.close()
-        process.wait()
+        writer.abort()
         raise
-    finally:
-        if process.stderr is not None:
-            process.stderr.close()
 
 
 class _StreamingLosslessVideoWriter:
@@ -1833,16 +1783,60 @@ class LiveEpisodePackage:
         return os.path.join(self.package_dir, "frames")
 
     @property
-    def parquet_path(self):
-        return os.path.join(self.package_dir, "episode.parquet")
-
-    @property
     def journal_path(self):
         return os.path.join(self.package_dir, "journal.jsonl")
 
     @property
     def terminal_candidate_path(self):
         return os.path.join(self.package_dir, "terminal_candidate.webp")
+
+
+def _upload_live_episode_package(
+    env_id,
+    episode_id,
+    package_dir,
+    dataset,
+    *,
+    storage_format,
+    max_retries,
+    base_wait,
+    persist_dataset,
+):
+    """Upload and transition one live episode package, persisting it when requested."""
+    os.makedirs(package_dir, exist_ok=True)
+    dataset = _strip_runtime_columns(dataset)
+    if persist_dataset:
+        dataset.to_parquet(os.path.join(package_dir, "episode.parquet"))
+    manifest_kwargs = {
+        "package_dir": package_dir,
+        "storage_format": storage_format,
+        "frames": len(dataset),
+    }
+    _set_live_upload_manifest_entry(env_id, episode_id, state="pending", **manifest_kwargs)
+    success = _upload_dataset_shard_to_hub(
+        env_id,
+        dataset,
+        storage_format=storage_format,
+        local_root=package_dir,
+        episode_ids={episode_id},
+        replace=False,
+        include_previews=False,
+        max_retries=max_retries,
+        base_wait=base_wait,
+    )
+    if success:
+        _set_live_upload_manifest_entry(env_id, episode_id, state="uploaded", **manifest_kwargs)
+        shutil.rmtree(package_dir, ignore_errors=True)
+        return True
+
+    _set_live_upload_manifest_entry(
+        env_id,
+        episode_id,
+        state="failed",
+        error="upload failed",
+        **manifest_kwargs,
+    )
+    return False
 
 
 class LiveEpisodeUploadManager:
@@ -1873,50 +1867,16 @@ class LiveEpisodeUploadManager:
         return package
 
     def upload_episode(self, package, dataset):
-        os.makedirs(package.package_dir, exist_ok=True)
-        dataset = _strip_runtime_columns(dataset)
-        dataset.to_parquet(package.parquet_path)
-        _set_live_upload_manifest_entry(
+        return _upload_live_episode_package(
             self.env_id,
             package.episode_id,
-            state="pending",
-            package_dir=package.package_dir,
-            storage_format=self.storage_format,
-            frames=len(dataset),
-        )
-        success = _upload_dataset_shard_to_hub(
-            self.env_id,
+            package.package_dir,
             dataset,
             storage_format=self.storage_format,
-            local_root=package.package_dir,
-            episode_ids={package.episode_id},
-            replace=False,
-            include_previews=False,
             max_retries=self.max_retries,
             base_wait=self.base_wait,
+            persist_dataset=True,
         )
-        if success:
-            _set_live_upload_manifest_entry(
-                self.env_id,
-                package.episode_id,
-                state="uploaded",
-                package_dir=package.package_dir,
-                storage_format=self.storage_format,
-                frames=len(dataset),
-            )
-            shutil.rmtree(package.package_dir, ignore_errors=True)
-            return True
-
-        _set_live_upload_manifest_entry(
-            self.env_id,
-            package.episode_id,
-            state="failed",
-            package_dir=package.package_dir,
-            storage_format=self.storage_format,
-            frames=len(dataset),
-            error="upload failed",
-        )
-        return False
 
 
 def create_agent_policy(agent_type, env):
@@ -2234,20 +2194,13 @@ class DatasetRecorderWrapper(gym.Wrapper):
             ffmpeg_path=self._ffmpeg_path,
         )
         height, width = self._current_episode_video_frames[0].shape[:2]
-        decoded_frames = _decode_lossless_rgb_video(video_path, width, height, cache=False)
-        if len(decoded_frames) != frame_count:
-            raise RuntimeError(
-                f"Video round-trip produced {len(decoded_frames)} frames; expected {frame_count}"
-            )
-        for frame_index, (decoded_frame, expected_hash) in enumerate(
-            zip(decoded_frames, expected_hashes)
-        ):
-            actual_hash = _sha256_rgb(decoded_frame)
-            if actual_hash != expected_hash:
-                raise RuntimeError(
-                    "Lossless video verification failed for "
-                    f"{video_relpath} frame {frame_index}: {actual_hash} != {expected_hash}"
-                )
+        _verify_lossless_rgb_video_stream(
+            video_path,
+            width,
+            height,
+            expected_hashes,
+            ffmpeg_path=self._ffmpeg_path,
+        )
 
         start_index = len(self.episode_num_observations) - frame_count
         for row_index in range(start_index, len(self.episode_num_observations)):
@@ -3274,19 +3227,16 @@ def load_recorded_dataset(env_id):
     """Load a recorded dataset from local disk first, then from the Hub."""
     local_dataset = load_local_dataset(env_id)
     if local_dataset is not None:
-        return local_dataset, "local", len(local_dataset)
+        return local_dataset, "local"
 
     try:
         hf_repo_id = env_id_to_hf_repo_id(env_id)
-        api = HfApi()
-        api.dataset_info(hf_repo_id)
         dataset = load_dataset(hf_repo_id, split="train")
     except Exception:
-        return None, None, None
+        return None, None
 
     dataset = _attach_video_runtime_source(dataset, hf_repo_id=hf_repo_id)
-    total = len(dataset)
-    return dataset, "hub", total
+    return dataset, "hub"
 
 
 def _print_missing_dataset(env_id):
@@ -3298,13 +3248,6 @@ def _print_missing_dataset(env_id):
 def _is_terminal_action(action):
     """Return True for terminal observation rows with no action."""
     return action is None or (isinstance(action, list) and len(action) == 0)
-
-
-def _get_row_value(row, current_name):
-    """Read a dataset row field from the current plural schema."""
-    if current_name in row:
-        return row[current_name]
-    return None
 
 
 def _dataset_storage_format(dataset):
@@ -3320,7 +3263,7 @@ def _dataset_storage_format(dataset):
 
 
 def _is_video_row(row):
-    return _get_row_value(row, "video_path") not in (None, "")
+    return row.get("video_path") not in (None, "")
 
 
 def _attach_video_runtime_source(dataset, local_base_path=None, hf_repo_id=None):
@@ -3346,14 +3289,9 @@ def _strip_runtime_columns(dataset):
     return dataset
 
 
-def _get_row_action(row):
-    """Return the action from a dataset row."""
-    return _get_row_value(row, "actions")
-
-
 def _is_step_row(row):
     """Filter out terminal observation rows."""
-    return not _is_terminal_action(_get_row_action(row))
+    return not _is_terminal_action(row.get("actions"))
 
 
 def _get_default_fps_for_env_id(env_id, metadata=None):
@@ -3463,7 +3401,7 @@ def _ordered_episode_rows(dataset):
 def _episode_reset_seed(dataset, row_indices):
     """Return the first usable reset seed recorded for an episode."""
     for row_index in row_indices:
-        seed = _get_row_value(dataset[row_index], "seed")
+        seed = dataset[row_index].get("seed")
         if seed is not None:
             try:
                 return int(seed)
@@ -3480,20 +3418,20 @@ def _iter_playback_items(dataset, row_indices, verify=False):
             continue
         if verify:
             if position + 1 >= len(row_indices):
-                episode_key = _normalize_episode_id(_get_row_value(row, "episode_id"))
+                episode_key = _normalize_episode_id(row.get("episode_id"))
                 raise ValueError(
                     f"Episode {episode_key} is missing the terminal observation row"
                 )
             next_row = dataset[row_indices[position + 1]]
             yield (
-                _get_row_action(row),
+                row.get("actions"),
                 _get_row_observation(next_row),
-                _get_row_value(row, "rewards"),
-                _get_row_value(row, "terminations"),
-                _get_row_value(row, "truncations"),
+                row.get("rewards"),
+                row.get("terminations"),
+                row.get("truncations"),
             )
         else:
-            yield _get_row_action(row)
+            yield row.get("actions")
 
 
 def _dataset_playback_episodes(dataset, verify=False):
@@ -3583,7 +3521,7 @@ def _get_row_observation(row):
     """Return the observation image from a dataset row."""
     if _is_video_row(row):
         return _get_video_row_observation(row)
-    observation = _get_row_value(row, "observations")
+    observation = row.get("observations")
     if observation is None:
         raise ValueError("Dataset row is missing observations")
     return observation
@@ -3591,17 +3529,17 @@ def _get_row_observation(row):
 
 def _resolve_video_path(row):
     """Resolve a row's relative video path to a local file path."""
-    video_path = _get_row_value(row, "video_path")
+    video_path = row.get("video_path")
     if os.path.isabs(video_path) and os.path.exists(video_path):
         return video_path
 
-    local_base_path = _get_row_value(row, RUNTIME_VIDEO_BASE_COLUMN)
+    local_base_path = row.get(RUNTIME_VIDEO_BASE_COLUMN)
     if local_base_path:
         candidate = os.path.join(local_base_path, video_path)
         if os.path.exists(candidate):
             return candidate
 
-    hf_repo_id = _get_row_value(row, RUNTIME_HF_REPO_COLUMN)
+    hf_repo_id = row.get(RUNTIME_HF_REPO_COLUMN)
     if hf_repo_id:
         return hf_hub_download(repo_id=hf_repo_id, filename=video_path, repo_type="dataset")
 
@@ -3613,26 +3551,21 @@ def _resolve_video_path(row):
 def _get_video_row_observation(row):
     """Decode and verify one video-backed observation row."""
     video_path = _resolve_video_path(row)
-    width = int(_get_row_value(row, "frame_width"))
-    height = int(_get_row_value(row, "frame_height"))
-    frame_index = int(_get_row_value(row, "frame_index"))
+    width = int(row.get("frame_width"))
+    height = int(row.get("frame_height"))
+    frame_index = int(row.get("frame_index"))
     frames = _decode_lossless_rgb_video(video_path, width, height)
     if frame_index < 0 or frame_index >= len(frames):
         raise IndexError(
             f"Frame index {frame_index} out of range for {video_path} ({len(frames)} frames)"
         )
     frame = np.array(frames[frame_index], copy=True)
-    expected_hash = _get_row_value(row, "frame_sha256")
+    expected_hash = row.get("frame_sha256")
     if expected_hash and _sha256_rgb(frame) != expected_hash:
         raise RuntimeError(
             f"Decoded frame hash mismatch for {video_path} frame {frame_index}"
         )
     return frame
-
-
-def _frame_to_rgb_array(frame):
-    """Normalize a dataset frame to an HxWx3 uint8 RGB array."""
-    return _observation_to_rgb_array(frame)
 
 
 def _overlay_episode_number(frame_array, episode_number):
@@ -3723,7 +3656,9 @@ def export_dataset_video(
         console.print(f"[{STYLE_FAIL}]No frames found for selected episodes.[/]")
         return False
 
-    first_frame = _frame_to_rgb_array(_get_row_observation(dataset[selected_episodes[0][1][0]]))
+    first_frame = _observation_to_rgb_array(
+        _get_row_observation(dataset[selected_episodes[0][1][0]])
+    )
     height, width = first_frame.shape[:2]
 
     if output_path is None:
@@ -3774,7 +3709,7 @@ def export_dataset_video(
             for episode_number, row_indices in selected_episodes:
                 for row_index in row_indices:
                     row = dataset[row_index]
-                    frame = _frame_to_rgb_array(_get_row_observation(row))
+                    frame = _observation_to_rgb_array(_get_row_observation(row))
                     if frame.shape[:2] != (height, width):
                         raise ValueError(
                             "All exported frames must have the same dimensions; "
@@ -3806,19 +3741,8 @@ def export_dataset_video(
 REMOTE_STORAGE_FORMAT_UNSUPPORTED = "unsupported"
 
 
-def _local_canonical_video_path(local_root, upload_relpath):
-    """Find the local source file for a canonical video uploaded at upload_relpath."""
-    return os.path.join(local_root, upload_relpath)
-
-
 def _preview_video_relpath(episode_stem):
     return f"{PREVIEW_VIDEO_ARTIFACT_DIR}/{episode_stem}{PREVIEW_VIDEO_SUFFIX}"
-
-
-def _local_preview_video_path(local_root, episode_stem):
-    """Find a current local preview source file."""
-    path = os.path.join(local_root, _preview_video_relpath(episode_stem))
-    return path if os.path.exists(path) else None
 
 
 def _remote_storage_format_from_files(file_paths):
@@ -3959,7 +3883,7 @@ def _upload_dataset_shard_to_hub(
                         }
                     )
                     for video_relpath in video_paths:
-                        video_path = _local_canonical_video_path(local_root, video_relpath)
+                        video_path = os.path.join(local_root, video_relpath)
                         if not os.path.exists(video_path):
                             raise FileNotFoundError(
                                 f"Missing video artifact for upload: {video_path}"
@@ -3975,8 +3899,8 @@ def _upload_dataset_shard_to_hub(
                             if video_name.endswith(CANONICAL_VIDEO_SUFFIX):
                                 episode_stem = video_name[: -len(CANONICAL_VIDEO_SUFFIX)]
                                 preview_relpath = _preview_video_relpath(episode_stem)
-                                preview_path = _local_preview_video_path(local_root, episode_stem)
-                                if preview_path:
+                                preview_path = os.path.join(local_root, preview_relpath)
+                                if os.path.exists(preview_path):
                                     operations.append(
                                         CommitOperationAdd(
                                             path_in_repo=preview_relpath,
@@ -4202,21 +4126,10 @@ def _dataset_from_recovered_live_records(package_dir, episode_id, records):
     return _recording_dataset_from_dict(data, storage_format)
 
 
-def _recover_live_recording_package(env_id, episode_id, entry):
+def _recover_live_recording_package(episode_id, entry):
     package_dir = entry["package_dir"]
     records = _load_live_episode_journal(package_dir)
-    dataset = _dataset_from_recovered_live_records(package_dir, episode_id, records)
-    dataset.to_parquet(os.path.join(package_dir, "episode.parquet"))
-    storage_format = _dataset_storage_format(dataset)
-    _set_live_upload_manifest_entry(
-        env_id,
-        episode_id,
-        state="pending",
-        package_dir=package_dir,
-        storage_format=storage_format,
-        frames=len(dataset),
-    )
-    return dataset
+    return _dataset_from_recovered_live_records(package_dir, episode_id, records)
 
 
 def drain_live_upload_queue(env_id, max_retries=5, base_wait=1.0):
@@ -4248,42 +4161,24 @@ def drain_live_upload_queue(env_id, max_retries=5, base_wait=1.0):
                 console.print(
                     f"[{STYLE_INFO}]Recovering interrupted live episode {episode_id}...[/]"
                 )
-                dataset = _recover_live_recording_package(env_id, episode_id, entry)
+                dataset = _recover_live_recording_package(episode_id, entry)
+                persist_dataset = True
             else:
                 dataset = _load_live_episode_package_dataset(package_dir)
+                persist_dataset = False
             storage_format = _dataset_storage_format(dataset)
-            success = _upload_dataset_shard_to_hub(
+            success = _upload_live_episode_package(
                 env_id,
+                episode_id,
+                package_dir,
                 dataset,
                 storage_format=storage_format,
-                local_root=package_dir,
-                episode_ids={episode_id},
-                replace=False,
-                include_previews=False,
                 max_retries=max_retries,
                 base_wait=base_wait,
+                persist_dataset=persist_dataset,
             )
-            if success:
-                _set_live_upload_manifest_entry(
-                    env_id,
-                    episode_id,
-                    state="uploaded",
-                    package_dir=package_dir,
-                    storage_format=storage_format,
-                    frames=len(dataset),
-                )
-                shutil.rmtree(package_dir, ignore_errors=True)
-            else:
+            if not success:
                 ok = False
-                _set_live_upload_manifest_entry(
-                    env_id,
-                    episode_id,
-                    state="failed",
-                    package_dir=package_dir,
-                    storage_format=storage_format,
-                    frames=len(dataset),
-                    error="upload failed",
-                )
         except Exception as e:
             ok = False
             _set_live_upload_manifest_entry(
@@ -4417,7 +4312,10 @@ def minari_export(env_id, dataset_name=None, author=None):
         from minari.data_collector import EpisodeBuffer
     except ImportError:
         console.print(f"[{STYLE_FAIL}]Minari is not installed.[/]")
-        console.print(f"Install with: [{STYLE_CMD}]uv pip install 'minari>=0.5.0'[/]")
+        console.print(
+            f"Tool install: [{STYLE_CMD}]uv tool install gymrec --with 'minari>=0.5.0' --reinstall[/]"
+        )
+        console.print(f"Repository development: [{STYLE_CMD}]uv sync --extra minari[/]")
         return False
 
     dataset = load_local_dataset(env_id)
@@ -4426,17 +4324,7 @@ def minari_export(env_id, dataset_name=None, author=None):
         console.print(f"  Expected at: [{STYLE_PATH}]{get_local_dataset_path(env_id)}[/]")
         return False
 
-    # Group rows by episode
-    episodes = {}
-    for row in dataset:
-        eid = row["episode_id"]
-        key = _normalize_episode_id(eid)
-        if key not in episodes:
-            episodes[key] = []
-        episodes[key].append(row)
-    for rows in episodes.values():
-        if "step" in rows[0]:
-            rows.sort(key=lambda r: r["step"])
+    episode_keys, row_indices_by_episode = _ordered_episode_rows(dataset)
 
     # Try to extract action/observation spaces from the environment
     action_space = None
@@ -4452,7 +4340,10 @@ def minari_export(env_id, dataset_name=None, author=None):
     # Build EpisodeBuffers
     buffers = []
     total_steps = 0
-    for ep_idx, (_eid, rows) in enumerate(sorted(episodes.items())):
+    for ep_idx, episode_key in enumerate(sorted(episode_keys)):
+        rows = [dataset[row_index] for row_index in row_indices_by_episode[episode_key]]
+        if "step" in rows[0]:
+            rows.sort(key=lambda row: row["step"])
         observations = []
         actions = []
         rewards = []
@@ -4467,7 +4358,7 @@ def minari_export(env_id, dataset_name=None, author=None):
             observations.append(img)
 
             # Detect terminal observation by empty actions
-            action = _get_row_action(row)
+            action = row.get("actions")
             if _is_terminal_action(action):
                 continue
 
@@ -4475,11 +4366,11 @@ def minari_export(env_id, dataset_name=None, author=None):
                 action = action[0]
             actions.append(action)
 
-            reward = _get_row_value(row, "rewards")
+            reward = row.get("rewards")
             rewards.append(float(reward) if reward is not None else 0.0)
-            term = _get_row_value(row, "terminations")
+            term = row.get("terminations")
             terminations.append(bool(term) if term is not None else False)
-            trunc = _get_row_value(row, "truncations")
+            trunc = row.get("truncations")
             truncations.append(bool(trunc) if trunc is not None else False)
 
         if len(observations) != len(actions) + 1:
@@ -5033,6 +4924,16 @@ def create_env(
     return env
 
 
+def _normalize_frameskip_value(value):
+    """Normalize a scalar or two-value frameskip to a positive integer."""
+    try:
+        if isinstance(value, (tuple, list)) and len(value) == 2:
+            value = (value[0] + value[1]) / 2
+        return max(int(round(value)), 1)
+    except (TypeError, ValueError):
+        return None
+
+
 def get_frameskip(env) -> int:
     """Detect the frameskip value for an environment.
 
@@ -5042,14 +4943,9 @@ def get_frameskip(env) -> int:
     env_id = getattr(env, "_env_id", "")
     make_kwargs = getattr(env, "_gymrec_make_kwargs", {}) or {}
     for key in ("frameskip", "frame_skip"):
-        fs = make_kwargs.get(key)
-        if fs is not None:
-            if isinstance(fs, (tuple, list)) and len(fs) == 2:
-                return max(int(round((fs[0] + fs[1]) / 2)), 1)
-            try:
-                return max(int(fs), 1)
-            except (TypeError, ValueError):
-                pass
+        frameskip = _normalize_frameskip_value(make_kwargs.get(key))
+        if frameskip is not None:
+            return frameskip
 
     # VizDoom and Retro have different frameskip semantics; skip detection
     if hasattr(env, "_vizdoom") and env._vizdoom:
@@ -5061,26 +4957,16 @@ def get_frameskip(env) -> int:
     spec = getattr(env, "spec", None)
     if spec is not None:
         kwargs = getattr(spec, "kwargs", {}) or {}
-        fs = kwargs.get("frameskip")
-        if fs is not None:
-            if isinstance(fs, (tuple, list)) and len(fs) == 2:
-                return max(int(round((fs[0] + fs[1]) / 2)), 1)
-            try:
-                return max(int(fs), 1)
-            except (TypeError, ValueError):
-                pass
+        frameskip = _normalize_frameskip_value(kwargs.get("frameskip"))
+        if frameskip is not None:
+            return frameskip
 
     # ALE-specific attribute fallback
     unwrapped = getattr(env, "unwrapped", None)
     if unwrapped is not None:
-        fs = getattr(unwrapped, "_frameskip", None)
-        if fs is not None:
-            if isinstance(fs, (tuple, list)) and len(fs) == 2:
-                return max(int(round((fs[0] + fs[1]) / 2)), 1)
-            try:
-                return max(int(fs), 1)
-            except (TypeError, ValueError):
-                pass
+        frameskip = _normalize_frameskip_value(getattr(unwrapped, "_frameskip", None))
+        if frameskip is not None:
+            return frameskip
 
     # Name-based: NoFrameskip means frameskip=1
     if "NoFrameskip" in env_id:
@@ -6097,7 +5983,7 @@ async def main():
                     f"To upload later: [{STYLE_CMD}]{_gymrec_cmd('upload', env_id)}[/]"
                 )
     elif args.command == "playback":
-        loaded_dataset, source, total = load_recorded_dataset(env_id)
+        loaded_dataset, source = load_recorded_dataset(env_id)
         if loaded_dataset is None:
             _print_missing_dataset(env_id)
             return
@@ -6119,10 +6005,11 @@ async def main():
             episodes=playback_episodes,
         )
     elif args.command == "video":
-        loaded_dataset, source, total = load_recorded_dataset(env_id)
+        loaded_dataset, source = load_recorded_dataset(env_id)
         if loaded_dataset is None:
             _print_missing_dataset(env_id)
             return
+        total = len(loaded_dataset)
         if source == "local":
             console.print(
                 f"[{STYLE_INFO}]Loading local dataset for video export "

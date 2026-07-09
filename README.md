@@ -97,7 +97,7 @@ Playback uses the local dataset first, then falls back to the Hugging Face Hub d
 - `keymappings.toml` controls Atari, VizDoom, and Stable-Retro keyboard bindings.
 - Stable-Retro support uses the latest resolvable `stable-retro-turbo`, which keeps the `stable_retro` import name and provides PyPI wheels for macOS arm64.
 - `ffmpeg` must be available on `PATH` for `video` exports; `ffmpeg` and `ffprobe` are required for `--storage lossless-video`.
-- `minari-export` requires Minari; install it with `uv sync --extra minari` or `uv pip install 'minari>=0.5.0'`.
+- `minari-export` requires Minari. For the installed tool, run `./install.sh --with 'minari>=0.5.0'`; for repository development, run `uv sync --extra minari`.
 
 ## Architecture
 

@@ -249,6 +249,21 @@ def test_get_frameskip_and_metadata_prefer_actual_make_kwargs():
     }
 
 
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (4, 4),
+        ((2, 5), 4),
+        ([1, 3], 2),
+        (0, 1),
+        ("invalid", None),
+        (None, None),
+    ],
+)
+def test_normalize_frameskip_value(value, expected):
+    assert main._normalize_frameskip_value(value) == expected
+
+
 def test_atari_default_fps_uses_sixty_hz_base_not_ale_render_metadata():
     if main.CONFIG is None:
         main.CONFIG = main._load_config()
@@ -296,6 +311,45 @@ def test_dataset_storage_format_uses_current_columns():
         main._dataset_storage_format(DatasetLike({"observations": ["frame.webp"]}))
         == main.STORAGE_FORMAT_IMAGES
     )
+
+
+def test_load_recorded_dataset_prefers_local_without_hub_lookup(monkeypatch):
+    local_dataset = DatasetLike({"actions": [[0]]})
+    monkeypatch.setattr(main, "load_local_dataset", lambda env_id: local_dataset)
+
+    def fail_hub_lookup(*args, **kwargs):
+        raise AssertionError("Hub lookup should not run when local data exists")
+
+    monkeypatch.setattr(main, "load_dataset", fail_hub_lookup, raising=False)
+
+    assert main.load_recorded_dataset("BreakoutNoFrameskip-v4") == (
+        local_dataset,
+        "local",
+    )
+
+
+def test_load_recorded_dataset_uses_single_hub_load(monkeypatch):
+    hub_dataset = DatasetLike({"actions": [[0]]})
+    calls = []
+    monkeypatch.setattr(main, "load_local_dataset", lambda env_id: None)
+    monkeypatch.setattr(main, "env_id_to_hf_repo_id", lambda env_id: "user/gymrec__env")
+    monkeypatch.setattr(
+        main,
+        "load_dataset",
+        lambda repo_id, split: calls.append((repo_id, split)) or hub_dataset,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        main,
+        "_attach_video_runtime_source",
+        lambda dataset, hf_repo_id: dataset,
+    )
+
+    assert main.load_recorded_dataset("BreakoutNoFrameskip-v4") == (
+        hub_dataset,
+        "hub",
+    )
+    assert calls == [("user/gymrec__env", "train")]
 
 
 def test_dataset_playback_episodes_verify_items_use_next_observation_row():
@@ -608,7 +662,10 @@ def test_build_recorded_dataset_includes_video_episode_metadata():
     assert dataset["storage_format"] == [main.STORAGE_FORMAT_LOSSLESS_VIDEO] * 2
 
 
-def test_live_episode_manager_packages_shard_without_previews(temp_storage_dir, monkeypatch):
+@pytest.mark.parametrize("upload_success", [True, False])
+def test_live_episode_manager_packages_shard_without_previews(
+    temp_storage_dir, monkeypatch, upload_success
+):
     main._lazy_init()
     episode_uuid = uuid.uuid4()
     episode_id = episode_uuid.hex
@@ -642,9 +699,8 @@ def test_live_episode_manager_packages_shard_without_previews(temp_storage_dir, 
         calls.append((env_id, shard, kwargs))
         assert kwargs["include_previews"] is False
         assert kwargs["episode_ids"] == {episode_id}
-        assert package.parquet_path and package.parquet_path.endswith("episode.parquet")
-        assert package_path.exists()
-        return True
+        assert (package_path / "episode.parquet").exists()
+        return upload_success
 
     monkeypatch.setattr(main, "_upload_dataset_shard_to_hub", fake_upload)
     manager = main.LiveEpisodeUploadManager(
@@ -656,11 +712,12 @@ def test_live_episode_manager_packages_shard_without_previews(temp_storage_dir, 
     video_path.parent.mkdir(parents=True)
     video_path.write_bytes(b"video")
 
-    assert manager.upload_episode(package, dataset) is True
+    assert manager.upload_episode(package, dataset) is upload_success
     assert calls
-    assert not package_path.exists()
     manifest = main._load_live_upload_manifest("BreakoutNoFrameskip-v4")
-    assert manifest["episodes"][episode_id]["state"] == "uploaded"
+    expected_state = "uploaded" if upload_success else "failed"
+    assert manifest["episodes"][episode_id]["state"] == expected_state
+    assert package_path.exists() is not upload_success
 
 
 def test_upload_uses_remote_episode_ids_when_local_marker_is_stale(

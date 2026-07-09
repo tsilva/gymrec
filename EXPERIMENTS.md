@@ -1,7 +1,8 @@
 # Experiments Roadmap
 
 AI/ML experiments using SuperMarioBros gameplay data recorded with gymrec.
-Assumes a dataset of dozens of episodes recorded via `uv run gymrec record SuperMarioBros-Nes`.
+Assumes a frame-row dataset of dozens of episodes recorded via
+`uv run gymrec record SuperMarioBros-Nes-v0 --storage images`.
 
 Each experiment builds on the previous ones. Follow the suggested learning path at the bottom.
 

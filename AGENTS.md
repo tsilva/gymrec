@@ -1,6 +1,6 @@
-# CLAUDE.md
+# gymrec Project Guide
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides repository-specific guidance for coding agents.
 
 ## Project Overview
 
@@ -14,7 +14,7 @@ uv sync
 
 # Set up environment variables
 cp .env.example .env
-# Edit .env and add your HF_TOKEN
+# Add HF_TOKEN only when using token-based Hub uploads
 ```
 
 Dependencies are defined in `pyproject.toml` and include Python 3.12+, gymnasium, pygame, datasets, and platform-specific game engines (ale-py, vizdoom, stable-retro-turbo).
@@ -29,33 +29,9 @@ import stable_retro as retro
 
 `pyproject.toml` depends on the latest resolvable `stable-retro-turbo` and exempts only that package from the global `exclude-newer = "7 days"` policy because the Python 3.12 macOS arm64 wheels are from the current PyPI release line. Do not reintroduce the old committed-wheel or `stable-retro-apple-silicon` setup unless explicitly requested.
 
-## Core Commands
+## Commands
 
-### Recording gameplay
-```bash
-uv run python main.py record <env_id>
-uv run python main.py record BreakoutNoFrameskip-v4 --fps 30
-```
-
-### Recording with agent (automated data collection)
-```bash
-# Random agent, headless, collect 100 episodes
-uv run python main.py record SuperMarioBros-Nes --agent random --headless --episodes 100
-
-# Random agent with display (for monitoring)
-uv run python main.py record SuperMarioBros-Nes --agent random --episodes 10
-```
-
-### Replaying recorded datasets
-```bash
-uv run python main.py playback <env_id>
-uv run python main.py playback BreakoutNoFrameskip-v4 --fps 30
-```
-
-### Listing available environments
-```bash
-uv run python main.py list_environments
-```
+README.md is the authoritative user command reference. For repository development, run the same commands as `uv run gymrec ...`.
 
 ## Architecture
 
@@ -102,7 +78,7 @@ uv run python main.py list_environments
 
 **FPS Handling**
 - Attempts to read from environment metadata first
-- Falls back to defaults: Atari=90fps, VizDoom=45fps, Retro=90fps (see config.toml)
+- Falls back to defaults: Atari=60fps, VizDoom=45fps, Retro=90fps (see config.toml)
 - Pattern matches env_id when metadata unavailable
 
 ## Important Patterns
@@ -155,7 +131,7 @@ if isinstance(frame, dict):
 - **Lightweight tests**: Pure helper behavior is covered in `tests/`; environment, rendering, ROM, Hub, and ffmpeg behavior still require manual verification.
 - **Pygame dependency**: All rendering and input uses pygame. The screen is created lazily after first observation.
 - **Async design**: Main loop uses `asyncio` with `await asyncio.sleep()` for frame pacing.
-- **Environment variables**: Requires `HF_TOKEN` in `.env` for dataset uploads.
+- **Hub authentication**: Uploads require Hugging Face authentication through `gymrec login` or `HF_TOKEN`; local recording and `--dry-run` do not.
 - **Headless mode**: Only available with `--agent` flag (not human mode).
 - README.md must be kept up to date with significant project changes.
 
@@ -185,11 +161,3 @@ Policies receive the full observation (RGB array) and must return actions compat
 
 - `config.toml` — Override display scale, FPS defaults, dataset settings, overlay. All keys commented out by default.
 - `keymappings.toml` — Customize key bindings per platform (Atari, VizDoom, Stable-Retro).
-
-## CLI Shorthand
-
-The `gymrec` entry point is installed in the venv:
-```bash
-uv run gymrec record BreakoutNoFrameskip-v4
-uv run gymrec playback BreakoutNoFrameskip-v4
-```
