@@ -48,6 +48,9 @@ load_dotenv(find_dotenv(usecwd=True), override=True)  # Load .env from the invoc
 _initialized = False
 _stableretro_roms_path_imported = set()
 
+HUMAN_RECORD_FRAMESKIP = 1
+HUMAN_RECORD_STICKY_ACTION_PROB = 0.0
+
 
 def _get_gymrec_version():
     """Return version string like '0.1.0+abc1234' (or just '0.1.0' if git unavailable)."""
@@ -2918,6 +2921,67 @@ def _get_default_fps_for_env_id(env_id, metadata=None):
     return CONFIG["fps_defaults"]["atari"]
 
 
+def _human_record_env_make_kwargs(backend):
+    """Return deterministic control kwargs for human recording on supported backends."""
+    if backend == "atari":
+        return {
+            "frameskip": HUMAN_RECORD_FRAMESKIP,
+            "repeat_action_probability": HUMAN_RECORD_STICKY_ACTION_PROB,
+        }
+    if backend == "stable-retro":
+        return {
+            "frame_skip": HUMAN_RECORD_FRAMESKIP,
+            "sticky_action_prob": HUMAN_RECORD_STICKY_ACTION_PROB,
+        }
+    return {}
+
+
+def _coerce_metadata_int(metadata, key):
+    if not metadata or metadata.get(key) is None:
+        return None
+    try:
+        return int(metadata[key])
+    except (TypeError, ValueError):
+        return None
+
+
+def _coerce_metadata_float(metadata, key):
+    if not metadata or metadata.get(key) is None:
+        return None
+    try:
+        return float(metadata[key])
+    except (TypeError, ValueError):
+        return None
+
+
+def _env_make_kwargs_from_metadata(env_id, metadata, backend=None):
+    """Rebuild environment creation kwargs from saved recording metadata."""
+    if not metadata:
+        return {}
+
+    saved_kwargs = metadata.get("env_make_kwargs")
+    if isinstance(saved_kwargs, dict):
+        return dict(saved_kwargs)
+
+    backend = backend or metadata.get("backend") or classify_env_id(env_id)
+    frameskip = _coerce_metadata_int(metadata, "frameskip")
+    sticky = _coerce_metadata_float(metadata, "sticky_actions")
+    kwargs = {}
+
+    if backend == "atari":
+        if frameskip is not None:
+            kwargs["frameskip"] = max(frameskip, 1)
+        if sticky is not None:
+            kwargs["repeat_action_probability"] = sticky
+    elif backend == "stable-retro":
+        if frameskip is not None:
+            kwargs["frame_skip"] = max(frameskip, 1)
+        if sticky is not None:
+            kwargs["sticky_action_prob"] = sticky
+
+    return kwargs
+
+
 def _normalize_episode_id(eid):
     """Normalize episode identifiers to a stable string key."""
     if isinstance(eid, bytes):
@@ -3794,12 +3858,15 @@ def minari_export(env_id, dataset_name=None, author=None):
 
 def _capture_env_metadata(env):
     """Capture environment configuration metadata for dataset card."""
+    env_make_kwargs = dict(getattr(env, "_gymrec_make_kwargs", {}) or {})
     metadata = {
         "env_id": getattr(env, "_env_id", "unknown"),
         "backend": classify_env_id(getattr(env, "_env_id", "")),
         "frameskip": get_frameskip(env),
         "fps": get_default_fps(env),
     }
+    if env_make_kwargs:
+        metadata["env_make_kwargs"] = env_make_kwargs
 
     # Action space info
     action_space = env.action_space
@@ -3835,14 +3902,19 @@ def _capture_env_metadata(env):
             metadata["max_episode_steps"] = spec.max_episode_steps
         kwargs = getattr(spec, "kwargs", {}) or {}
         # Sticky actions (ALE)
-        if "repeat_action_probability" in kwargs:
+        if "repeat_action_probability" in kwargs and "sticky_actions" not in metadata:
             metadata["sticky_actions"] = kwargs["repeat_action_probability"]
+
+    if "repeat_action_probability" in env_make_kwargs:
+        metadata["sticky_actions"] = env_make_kwargs["repeat_action_probability"]
+    elif "sticky_action_prob" in env_make_kwargs:
+        metadata["sticky_actions"] = env_make_kwargs["sticky_action_prob"]
 
     # ALE-specific: check unwrapped for sticky actions
     unwrapped = getattr(env, "unwrapped", None)
     if unwrapped is not None:
         sticky = getattr(unwrapped, "_repeat_action_probability", None)
-        if sticky is not None:
+        if sticky is not None and "sticky_actions" not in metadata:
             metadata["sticky_actions"] = sticky
 
     # Reward range
@@ -4123,7 +4195,22 @@ def _build_dataset_card_content(env_id, repo_id, new_frames, new_episodes, repo_
     )
 
 
-def _create_env__stableretro(env_id, state=None):
+def _is_unexpected_env_kwarg_error(exc):
+    text = str(exc).lower()
+    return "unexpected keyword" in text or "got an unexpected" in text
+
+
+def _warn_unsupported_env_kwargs(env_id, kwargs):
+    if not kwargs:
+        return
+    keys = ", ".join(sorted(kwargs))
+    console.print(
+        f"[yellow]Warning:[/] {env_id} does not accept env kwargs ({keys}); "
+        "using backend defaults."
+    )
+
+
+def _create_env__stableretro(env_id, state=None, env_make_kwargs=None):
     _ensure_stableretro_roms_path_imported()
 
     import stable_retro as retro
@@ -4131,8 +4218,10 @@ def _create_env__stableretro(env_id, state=None):
     make_kwargs = {"render_mode": "rgb_array"}
     if state:
         make_kwargs["state"] = state
+    optional_kwargs = dict(env_make_kwargs or {})
     try:
-        env = retro.make(env_id, **make_kwargs)
+        env = retro.make(env_id, **make_kwargs, **optional_kwargs)
+        env._gymrec_make_kwargs = optional_kwargs
     except FileNotFoundError:
         console.print(f"\n[{STYLE_FAIL}]Error: ROM not found for '{env_id}'.[/]")
         console.print("\nStable-retro requires ROM files to be imported separately.")
@@ -4143,6 +4232,12 @@ def _create_env__stableretro(env_id, state=None):
             f"\nUse [{STYLE_CMD}]{_gymrec_cmd('list_environments')}[/] to see which games have ROMs imported."
         )
         sys.exit(1)
+    except TypeError as exc:
+        if not optional_kwargs or not _is_unexpected_env_kwarg_error(exc):
+            raise
+        _warn_unsupported_env_kwargs(env_id, optional_kwargs)
+        env = retro.make(env_id, **make_kwargs)
+        env._gymrec_make_kwargs = {}
     env._stable_retro = True
     return env
 
@@ -4155,7 +4250,7 @@ def _create_env__vizdoom(env_id):
     return env
 
 
-def _create_env__alepy(env_id):
+def _create_env__alepy(env_id, env_make_kwargs=None):
     _configure_atari_roms_path()
 
     import ale_py
@@ -4173,8 +4268,18 @@ def _create_env__alepy(env_id):
         )
         sys.exit(1)
 
+    optional_kwargs = dict(env_make_kwargs or {})
     try:
-        return gym.make(env_id, render_mode="rgb_array")
+        env = gym.make(env_id, render_mode="rgb_array", **optional_kwargs)
+        env._gymrec_make_kwargs = optional_kwargs
+        return env
+    except TypeError as exc:
+        if not optional_kwargs or not _is_unexpected_env_kwarg_error(exc):
+            raise
+        _warn_unsupported_env_kwargs(env_id, optional_kwargs)
+        env = gym.make(env_id, render_mode="rgb_array")
+        env._gymrec_make_kwargs = {}
+        return env
     except FileNotFoundError:
         game = _get_atari_game_name(env_id) or env_id
         console.print(f"\n[{STYLE_FAIL}]Error: Atari ROM not found for '{env_id}'.[/]")
@@ -4194,17 +4299,33 @@ def _create_env__alepy(env_id):
         sys.exit(1)
 
 
-def create_env(env_id, *, stable_retro_state=None):
+def create_env(
+    env_id,
+    *,
+    stable_retro_state=None,
+    human_recording=False,
+    metadata=None,
+):
     """Create a Gymnasium environment with the appropriate backend."""
 
     stable_retro_envs = set(_get_stableretro_envs())
     backend = classify_env_id(env_id, stable_retro_envs=stable_retro_envs)
+    if human_recording:
+        env_make_kwargs = _human_record_env_make_kwargs(backend)
+    else:
+        env_make_kwargs = _env_make_kwargs_from_metadata(env_id, metadata, backend=backend)
+
     if backend == "stable-retro":
-        env = _create_env__stableretro(env_id, state=stable_retro_state)
+        env = _create_env__stableretro(
+            env_id,
+            state=stable_retro_state,
+            env_make_kwargs=env_make_kwargs,
+        )
     elif backend == "vizdoom":
         env = _create_env__vizdoom(env_id)
+        env._gymrec_make_kwargs = {}
     else:
-        env = _create_env__alepy(env_id)
+        env = _create_env__alepy(env_id, env_make_kwargs=env_make_kwargs)
 
     env._env_id = env_id
     return env
@@ -4217,6 +4338,16 @@ def get_frameskip(env) -> int:
     For stochastic frameskip tuples like (2, 5), returns the average.
     """
     env_id = getattr(env, "_env_id", "")
+    make_kwargs = getattr(env, "_gymrec_make_kwargs", {}) or {}
+    for key in ("frameskip", "frame_skip"):
+        fs = make_kwargs.get(key)
+        if fs is not None:
+            if isinstance(fs, (tuple, list)) and len(fs) == 2:
+                return max(int(round((fs[0] + fs[1]) / 2)), 1)
+            try:
+                return max(int(fs), 1)
+            except (TypeError, ValueError):
+                pass
 
     # VizDoom and Retro have different frameskip semantics; skip detection
     if hasattr(env, "_vizdoom") and env._vizdoom:
@@ -5099,24 +5230,33 @@ async def main():
         getattr(args, "storage", None) or CONFIG["storage"].get("format", STORAGE_FORMAT_IMAGES)
     )
 
+    record_plan = None
+    if args.command == "record":
+        record_plan, plan_error = _make_record_plan(args)
+        if plan_error:
+            console.print(f"[{STYLE_FAIL}]Error: {plan_error}[/]")
+            return
+
+    playback_metadata = load_local_metadata(env_id) if args.command == "playback" else None
     env = None
     fps = args.fps
     if args.command == "playback" or args.command == "record":
         env = create_env(
             env_id,
             stable_retro_state=hf_policy_source.state if hf_policy_source else None,
+            human_recording=bool(record_plan and record_plan.human),
+            metadata=playback_metadata,
         )
         if fps is None:
-            fps = get_default_fps(env)
+            if args.command == "playback" and playback_metadata:
+                fps = _get_default_fps_for_env_id(env_id, metadata=playback_metadata)
+            else:
+                fps = get_default_fps(env)
     elif args.command == "video" and fps is None:
         fps = _get_default_fps_for_env_id(env_id, metadata=load_local_metadata(env_id))
 
     if args.command == "record":
         recorder = None
-        record_plan, plan_error = _make_record_plan(args)
-        if plan_error:
-            console.print(f"[{STYLE_FAIL}]Error: {plan_error}[/]")
-            return
 
         if record_plan.human:
             input_source = None  # Will default to HumanInputSource in _play

@@ -47,12 +47,90 @@ class OneStepTerminalEnv(gym.Env):
         return np.ones((1, 1, 3), dtype=np.uint8), 0.0, True, False, {}
 
 
+class DummySpec:
+    max_episode_steps = None
+    kwargs = {
+        "frameskip": 4,
+        "repeat_action_probability": 0.25,
+    }
+
+
+class DummyAtariEnv:
+    _env_id = "ALE/Breakout-v5"
+    _gymrec_make_kwargs = {
+        "frameskip": 1,
+        "repeat_action_probability": 0.0,
+    }
+    spec = DummySpec()
+    unwrapped = None
+    metadata = {}
+    action_space = gym.spaces.Discrete(4)
+    observation_space = gym.spaces.Box(0, 255, shape=(1, 1, 3), dtype=np.uint8)
+    reward_range = (-float("inf"), float("inf"))
+
+
 def test_env_id_encoding_round_trips_special_characters():
     env_id = "ALE/Breakout-v5_custom"
     encoded = main._encode_env_id_for_hf(env_id)
 
     assert encoded == "ALE_slash_Breakout_dash_v5_underscore_custom"
     assert main._decode_hf_repo_name(encoded) == env_id
+
+
+def test_human_record_env_make_kwargs_force_deterministic_supported_backends():
+    assert main._human_record_env_make_kwargs("atari") == {
+        "frameskip": 1,
+        "repeat_action_probability": 0.0,
+    }
+    assert main._human_record_env_make_kwargs("stable-retro") == {
+        "frame_skip": 1,
+        "sticky_action_prob": 0.0,
+    }
+    assert main._human_record_env_make_kwargs("vizdoom") == {}
+
+
+def test_env_make_kwargs_from_metadata_recovers_recording_contract():
+    metadata = {"frameskip": 4, "sticky_actions": 0.25}
+
+    assert main._env_make_kwargs_from_metadata("ALE/Breakout-v5", metadata, backend="atari") == {
+        "frameskip": 4,
+        "repeat_action_probability": 0.25,
+    }
+    assert main._env_make_kwargs_from_metadata(
+        "SuperMarioBros-Nes-v0", metadata, backend="stable-retro"
+    ) == {
+        "frame_skip": 4,
+        "sticky_action_prob": 0.25,
+    }
+
+
+def test_env_make_kwargs_from_metadata_prefers_saved_make_kwargs():
+    metadata = {
+        "frameskip": 4,
+        "sticky_actions": 0.25,
+        "env_make_kwargs": {"frameskip": 1, "repeat_action_probability": 0.0},
+    }
+
+    assert main._env_make_kwargs_from_metadata("ALE/Breakout-v5", metadata, backend="atari") == {
+        "frameskip": 1,
+        "repeat_action_probability": 0.0,
+    }
+
+
+def test_get_frameskip_and_metadata_prefer_actual_make_kwargs():
+    env = DummyAtariEnv()
+    if main.CONFIG is None:
+        main.CONFIG = main._load_config()
+
+    assert main.get_frameskip(env) == 1
+
+    metadata = main._capture_env_metadata(env)
+    assert metadata["frameskip"] == 1
+    assert metadata["sticky_actions"] == 0.0
+    assert metadata["env_make_kwargs"] == {
+        "frameskip": 1,
+        "repeat_action_probability": 0.0,
+    }
 
 
 def test_episode_selection_rejects_multiple_selectors():

@@ -71,7 +71,7 @@ gymrec minari-export BreakoutNoFrameskip-v4      # export local data to Minari f
 
 ## Usage
 
-Human recording opens a pygame window. Press `Space` to start recording, use the environment-specific controls printed in the terminal, press `Tab` to toggle the overlay, use `+`/`-` to adjust FPS, and press `Esc` to stop.
+Human recording opens a pygame window. Press `Space` to start recording, use the environment-specific controls printed in the terminal, press `Tab` to toggle the overlay, use `+`/`-` to adjust FPS, and press `Esc` to stop. For backends that expose deterministic control knobs, human recording forces one environment step per emulator frame and disables sticky actions (`frameskip=1` / sticky probability `0.0`); the resolved kwargs are saved in local metadata and reused for local playback.
 
 Agent recording supports `human`, `random`, `mario`, and `breakout`. `--headless` is for agent mode only and requires `--episodes`.
 
