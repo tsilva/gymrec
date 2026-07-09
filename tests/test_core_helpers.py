@@ -70,6 +70,23 @@ class DummyAtariEnv:
     reward_range = (-float("inf"), float("inf"))
 
 
+class DummyVizDoomDictObservationEnv:
+    _env_id = "VizdoomBasic-v0"
+    _vizdoom = True
+    _gymrec_make_kwargs = {}
+    spec = None
+    unwrapped = None
+    metadata = {}
+    action_space = gym.spaces.MultiBinary(3)
+    observation_space = gym.spaces.Dict(
+        {
+            "screen": gym.spaces.Box(0, 255, shape=(120, 160, 3), dtype=np.uint8),
+            "variables": gym.spaces.Box(-np.inf, np.inf, shape=(2,), dtype=np.float32),
+        }
+    )
+    reward_range = (-float("inf"), float("inf"))
+
+
 def test_env_id_encoding_round_trips_special_characters():
     env_id = "ALE/Breakout-v5_custom"
     encoded = main._encode_env_id_for_hf(env_id)
@@ -132,6 +149,20 @@ def test_get_frameskip_and_metadata_prefer_actual_make_kwargs():
         "frameskip": 1,
         "repeat_action_probability": 0.0,
     }
+
+
+def test_capture_env_metadata_handles_dict_observation_space():
+    env = DummyVizDoomDictObservationEnv()
+    if main.CONFIG is None:
+        main.CONFIG = main._load_config()
+
+    metadata = main._capture_env_metadata(env)
+
+    assert metadata["observation_space_type"] == "Dict"
+    assert "observation_shape" not in metadata
+    assert "observation_dtype" not in metadata
+    assert "Box" in metadata["observation_space_screen"]
+    assert "Box" in metadata["observation_space_variables"]
 
 
 def test_episode_selection_rejects_multiple_selectors():
@@ -550,6 +581,102 @@ def test_upload_local_dataset_fails_without_local_dataset_or_pending_queue(tmp_p
         assert main.upload_local_dataset("BreakoutNoFrameskip-v4") is False
     finally:
         main.CONFIG["storage"]["local_dir"] = old_local_dir
+
+
+def test_recover_live_image_journal_adds_truncated_terminal_row(tmp_path):
+    main._lazy_init()
+    episode_id = uuid.uuid4().hex
+    session_id = uuid.uuid4().hex
+    frame_path = tmp_path / "frames" / "frame_00000.webp"
+    frame_path.parent.mkdir()
+    terminal_path = tmp_path / "terminal_candidate.webp"
+    frame = np.zeros((2, 2, 3), dtype=np.uint8)
+    terminal = np.full((2, 2, 3), 64, dtype=np.uint8)
+    main.PILImage.fromarray(frame).save(frame_path, format="WEBP", lossless=True)
+    main.PILImage.fromarray(terminal).save(terminal_path, format="WEBP", lossless=True)
+    records = [
+        {
+            "row_index": 0,
+            "episode_id": episode_id,
+            "seed": 123,
+            "action": [0],
+            "reward": 1.0,
+            "termination": False,
+            "truncation": False,
+            "info": "{}",
+            "session_id": session_id,
+            "collector": "random",
+            "gymrec_version": "0.1.0+test",
+            "storage_format": main.STORAGE_FORMAT_IMAGES,
+            "observation_path": "frames/frame_00000.webp",
+            "terminal_candidate_path": "terminal_candidate.webp",
+            "terminal_candidate_sha256": main._sha256_rgb(terminal),
+            "terminal_candidate_width": 2,
+            "terminal_candidate_height": 2,
+        }
+    ]
+
+    dataset = main._dataset_from_recovered_live_records(str(tmp_path), episode_id, records)
+
+    assert len(dataset) == 2
+    assert dataset["actions"] == [[0], []]
+    assert dataset["truncations"] == [True, None]
+
+
+def test_recover_live_video_journal_appends_terminal_candidate(tmp_path):
+    if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
+        pytest.skip("ffmpeg/ffprobe not available")
+    main._lazy_init()
+    episode_id = uuid.uuid4().hex
+    session_id = uuid.uuid4().hex
+    video_relpath = f"videos/{episode_id}.rgb.mkv.bin"
+    video_path = tmp_path / video_relpath
+    terminal_path = tmp_path / "terminal_candidate.webp"
+    step_frame = np.zeros((2, 2, 3), dtype=np.uint8)
+    terminal_frame = np.full((2, 2, 3), 128, dtype=np.uint8)
+    main._encode_lossless_rgb_video([step_frame], str(video_path), fps=30)
+    main.PILImage.fromarray(terminal_frame).save(
+        terminal_path, format="WEBP", lossless=True
+    )
+    records = [
+        {
+            "row_index": 0,
+            "episode_id": episode_id,
+            "seed": 123,
+            "action": [0],
+            "reward": 1.0,
+            "termination": False,
+            "truncation": False,
+            "info": "{}",
+            "session_id": session_id,
+            "collector": "random",
+            "gymrec_version": "0.1.0+test",
+            "storage_format": main.STORAGE_FORMAT_LOSSLESS_VIDEO,
+            "fps": 30,
+            "video_path": video_relpath,
+            "frame_index": 0,
+            "frame_sha256": main._sha256_rgb(step_frame),
+            "frame_width": 2,
+            "frame_height": 2,
+            "terminal_candidate_path": "terminal_candidate.webp",
+            "terminal_candidate_sha256": main._sha256_rgb(terminal_frame),
+            "terminal_candidate_width": 2,
+            "terminal_candidate_height": 2,
+        }
+    ]
+
+    dataset = main._dataset_from_recovered_live_records(str(tmp_path), episode_id, records)
+
+    assert len(dataset) == 2
+    assert dataset["frame_index"] == [0, 1]
+    assert dataset["episode_num_observations"] == [2, 2]
+    assert dataset["truncations"] == [True, None]
+    main._verify_lossless_rgb_video_stream(
+        str(video_path),
+        2,
+        2,
+        [main._sha256_rgb(step_frame), main._sha256_rgb(terminal_frame)],
+    )
 
 
 def test_streaming_video_verifier_accepts_hashes_and_rejects_corruption(tmp_path):

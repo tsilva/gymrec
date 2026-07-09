@@ -593,6 +593,8 @@ def _verify_lossless_rgb_video_stream(video_path, width, height, expected_hashes
             process.stdout.close()
         if process.stderr is not None:
             process.stderr.close()
+        if process.poll() is None:
+            process.wait()
 
 
 def _episode_progress(transient=False):
@@ -1825,6 +1827,14 @@ class LiveEpisodePackage:
     def parquet_path(self):
         return os.path.join(self.package_dir, "episode.parquet")
 
+    @property
+    def journal_path(self):
+        return os.path.join(self.package_dir, "journal.jsonl")
+
+    @property
+    def terminal_candidate_path(self):
+        return os.path.join(self.package_dir, "terminal_candidate.webp")
+
 
 class LiveEpisodeUploadManager:
     """Materialize, upload, and track one verified episode at a time."""
@@ -1842,7 +1852,16 @@ class LiveEpisodeUploadManager:
         if os.path.exists(package_dir):
             shutil.rmtree(package_dir)
         os.makedirs(package_dir, exist_ok=True)
-        return LiveEpisodePackage(episode_id=episode_id, package_dir=package_dir)
+        package = LiveEpisodePackage(episode_id=episode_id, package_dir=package_dir)
+        _set_live_upload_manifest_entry(
+            self.env_id,
+            package.episode_id,
+            state="recording",
+            package_dir=package.package_dir,
+            storage_format=self.storage_format,
+            frames=0,
+        )
+        return package
 
     def upload_episode(self, package, dataset):
         os.makedirs(package.package_dir, exist_ok=True)
@@ -2037,6 +2056,69 @@ class DatasetRecorderWrapper(gym.Wrapper):
             return
         self._live_episode = self.live_upload_manager.begin_episode(episode_uuid)
         self._live_video_writer = None
+
+    def _relative_live_package_path(self, path):
+        if not self._live_episode:
+            return path
+        return os.path.relpath(path, self._live_episode.package_dir)
+
+    def _write_jsonl_record(self, path, record):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a") as f:
+            f.write(json.dumps(record, default=_json_default))
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+
+    def _write_live_step_journal(self, next_observation):
+        if not self._live_upload_enabled or self._live_episode is None or not self.actions:
+            return
+        row_index = len(self.actions) - 1
+        if row_index < 0 or row_index >= len(self.rewards):
+            return
+
+        terminal_frame = _observation_to_rgb_array(next_observation)
+        PILImage.fromarray(terminal_frame).save(
+            self._live_episode.terminal_candidate_path,
+            format="WEBP",
+            lossless=True,
+            method=6,
+        )
+        record = {
+            "type": "step",
+            "row_index": row_index,
+            "episode_id": self._current_episode_uuid.hex,
+            "seed": self.seeds[row_index],
+            "action": self.actions[row_index],
+            "reward": self.rewards[row_index],
+            "termination": self.terminations[row_index],
+            "truncation": self.truncations[row_index],
+            "info": self.infos[row_index],
+            "session_id": self._session_uuid.hex,
+            "collector": self.collector,
+            "gymrec_version": self._gymrec_version,
+            "storage_format": self.storage_format,
+            "fps": self._fps or get_default_fps(self.env),
+            "terminal_candidate_path": self._relative_live_package_path(
+                self._live_episode.terminal_candidate_path
+            ),
+            "terminal_candidate_sha256": _sha256_rgb(terminal_frame),
+            "terminal_candidate_width": int(terminal_frame.shape[1]),
+            "terminal_candidate_height": int(terminal_frame.shape[0]),
+        }
+        if self.storage_format == STORAGE_FORMAT_IMAGES:
+            record["observation_path"] = self._relative_live_package_path(self.frames[row_index])
+        else:
+            record.update(
+                {
+                    "video_path": self.video_paths[row_index],
+                    "frame_index": self.frame_indices[row_index],
+                    "frame_sha256": self.frame_sha256s[row_index],
+                    "frame_width": self.frame_widths[row_index],
+                    "frame_height": self.frame_heights[row_index],
+                }
+            )
+        self._write_jsonl_record(self._live_episode.journal_path, record)
 
     def _ensure_screen(self, frame):
         """
@@ -2601,6 +2683,8 @@ class DatasetRecorderWrapper(gym.Wrapper):
                 if self.recording and self.truncations:
                     self.truncations[-1] = True
 
+            self._write_live_step_journal(obs)
+
             if terminated or truncated:
                 self._record_terminal_observation(self._current_episode_uuid, obs)
 
@@ -3021,7 +3105,7 @@ def _set_live_upload_manifest_entry(
 def _pending_live_upload_entries(env_id):
     manifest = _load_live_upload_manifest(env_id)
     for episode_id, entry in sorted(manifest.get("episodes", {}).items()):
-        if entry.get("state") in {"pending", "failed"}:
+        if entry.get("state") in {"recording", "pending", "failed"}:
             package_dir = entry.get("package_dir")
             if package_dir and os.path.exists(package_dir):
                 yield episode_id, entry
@@ -4032,6 +4116,169 @@ def _load_live_episode_package_dataset(package_dir):
     return Dataset.from_parquet(shard_path)
 
 
+def _load_live_episode_journal(package_dir):
+    journal_path = os.path.join(package_dir, "journal.jsonl")
+    if not os.path.exists(journal_path):
+        return []
+    records = []
+    with open(journal_path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                records.append(json.loads(line))
+    return records
+
+
+def _package_path(package_dir, relpath):
+    return relpath if os.path.isabs(relpath) else os.path.join(package_dir, relpath)
+
+
+def _recover_live_video_artifact(package_dir, records):
+    first = records[0]
+    last = records[-1]
+    video_relpath = first["video_path"]
+    video_path = _package_path(package_dir, video_relpath)
+    width = int(first["frame_width"])
+    height = int(first["frame_height"])
+    step_hashes = [record["frame_sha256"] for record in records]
+    terminal_path = _package_path(package_dir, last["terminal_candidate_path"])
+    terminal_frame = _observation_to_rgb_array(PILImage.open(terminal_path))
+    terminal_hash = _sha256_rgb(terminal_frame)
+    fps = last.get("fps") or CONFIG["fps_defaults"]["atari"]
+
+    try:
+        _verify_lossless_rgb_video_stream(
+            video_path,
+            width,
+            height,
+            step_hashes + [terminal_hash],
+        )
+        return video_relpath, terminal_hash, len(step_hashes) + 1
+    except Exception:
+        pass
+
+    _verify_lossless_rgb_video_stream(video_path, width, height, step_hashes)
+    frames = _decode_lossless_rgb_video(video_path, width, height, cache=False)
+    if len(frames) != len(step_hashes):
+        raise RuntimeError(
+            f"Recovered video has {len(frames)} step frames; expected {len(step_hashes)}"
+        )
+    recovered_frames = [frame.copy() for frame in frames]
+    recovered_frames.append(terminal_frame)
+    tmp_video_path = f"{video_path}.recovered"
+    try:
+        _encode_lossless_rgb_video(recovered_frames, tmp_video_path, fps)
+        _verify_lossless_rgb_video_stream(
+            tmp_video_path,
+            width,
+            height,
+            step_hashes + [terminal_hash],
+        )
+        os.replace(tmp_video_path, video_path)
+    finally:
+        if os.path.exists(tmp_video_path):
+            os.remove(tmp_video_path)
+    return video_relpath, terminal_hash, len(step_hashes) + 1
+
+
+def _dataset_from_recovered_live_records(package_dir, episode_id, records):
+    if not records:
+        raise RuntimeError(f"No recoverable completed steps found for {episode_id}")
+    records = sorted(records, key=lambda record: int(record.get("row_index", 0)))
+    storage_format = _normalize_storage_format(records[0]["storage_format"])
+    last = records[-1]
+    last["truncation"] = bool(last.get("truncation") or not last.get("termination"))
+
+    episode_bytes = uuid.UUID(hex=episode_id).bytes
+    session_bytes = uuid.UUID(hex=records[0]["session_id"]).bytes
+    data = {
+        "episode_id": [episode_bytes for _ in records],
+        "seed": [record["seed"] for record in records],
+        "actions": [record["action"] for record in records],
+        "rewards": [record["reward"] for record in records],
+        "terminations": [bool(record["termination"]) for record in records],
+        "truncations": [bool(record["truncation"]) for record in records],
+        "infos": [record["info"] for record in records],
+        "session_id": [session_bytes for _ in records],
+        "collector": [records[0]["collector"] for _ in records],
+        "gymrec_version": [records[0]["gymrec_version"] for _ in records],
+        "storage_format": [storage_format for _ in records],
+    }
+
+    terminal_record = {
+        "episode_id": episode_bytes,
+        "seed": records[0]["seed"],
+        "actions": [],
+        "rewards": None,
+        "terminations": None,
+        "truncations": None,
+        "infos": None,
+        "session_id": session_bytes,
+        "collector": records[0]["collector"],
+        "gymrec_version": records[0]["gymrec_version"],
+        "storage_format": storage_format,
+    }
+
+    if storage_format == STORAGE_FORMAT_IMAGES:
+        data["observations"] = [
+            _package_path(package_dir, record["observation_path"]) for record in records
+        ]
+        terminal_record["observations"] = _package_path(
+            package_dir, last["terminal_candidate_path"]
+        )
+    else:
+        video_relpath, terminal_hash, total_observations = _recover_live_video_artifact(
+            package_dir, records
+        )
+        data.update(
+            {
+                "video_path": [record["video_path"] for record in records],
+                "frame_index": [int(record["frame_index"]) for record in records],
+                "frame_sha256": [record["frame_sha256"] for record in records],
+                "frame_width": [int(record["frame_width"]) for record in records],
+                "frame_height": [int(record["frame_height"]) for record in records],
+                "episode_num_observations": [total_observations for _ in records],
+            }
+        )
+        terminal_record.update(
+            {
+                "video_path": video_relpath,
+                "frame_index": len(records),
+                "frame_sha256": terminal_hash,
+                "frame_width": int(last["terminal_candidate_width"]),
+                "frame_height": int(last["terminal_candidate_height"]),
+                "episode_num_observations": total_observations,
+            }
+        )
+
+    for key, value in terminal_record.items():
+        data[key].append(value)
+
+    dataset = Dataset.from_dict(data)
+    if storage_format == STORAGE_FORMAT_IMAGES:
+        dataset = dataset.cast_column("observations", HFImage())
+    dataset = dataset.cast_column("episode_id", Value("binary"))
+    dataset = dataset.cast_column("session_id", Value("binary"))
+    return dataset
+
+
+def _recover_live_recording_package(env_id, episode_id, entry):
+    package_dir = entry["package_dir"]
+    records = _load_live_episode_journal(package_dir)
+    dataset = _dataset_from_recovered_live_records(package_dir, episode_id, records)
+    dataset.to_parquet(os.path.join(package_dir, "episode.parquet"))
+    storage_format = _dataset_storage_format(dataset)
+    _set_live_upload_manifest_entry(
+        env_id,
+        episode_id,
+        state="pending",
+        package_dir=package_dir,
+        storage_format=storage_format,
+        frames=len(dataset),
+    )
+    return dataset
+
+
 def drain_live_upload_queue(env_id, max_retries=5, base_wait=1.0):
     """Retry verified live-upload episode packages left from interrupted sessions."""
     entries = list(_pending_live_upload_entries(env_id))
@@ -4055,7 +4302,13 @@ def drain_live_upload_queue(env_id, max_retries=5, base_wait=1.0):
             shutil.rmtree(package_dir, ignore_errors=True)
             continue
         try:
-            dataset = _load_live_episode_package_dataset(package_dir)
+            if entry.get("state") == "recording":
+                console.print(
+                    f"[{STYLE_INFO}]Recovering interrupted live episode {episode_id}...[/]"
+                )
+                dataset = _recover_live_recording_package(env_id, episode_id, entry)
+            else:
+                dataset = _load_live_episode_package_dataset(package_dir)
             storage_format = _dataset_storage_format(dataset)
             success = _upload_dataset_shard_to_hub(
                 env_id,
@@ -4384,10 +4637,15 @@ def _capture_env_metadata(env):
 
     # Observation space shape
     obs_space = env.observation_space
-    if hasattr(obs_space, "shape"):
-        metadata["observation_shape"] = list(obs_space.shape)
-    if hasattr(obs_space, "dtype"):
+    metadata["observation_space_type"] = type(obs_space).__name__
+    obs_shape = getattr(obs_space, "shape", None)
+    if obs_shape is not None:
+        metadata["observation_shape"] = list(obs_shape)
+    if getattr(obs_space, "dtype", None) is not None:
         metadata["observation_dtype"] = str(obs_space.dtype)
+    if isinstance(obs_space, gym.spaces.Dict):
+        for key, space in obs_space.spaces.items():
+            metadata[f"observation_space_{key}"] = str(space)
 
     # Spec-based metadata
     spec = getattr(env, "spec", None)
