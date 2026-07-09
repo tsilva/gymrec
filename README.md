@@ -50,7 +50,7 @@ gymrec reindex_games                             # re-scan ROMS_PATH and refresh
 gymrec record BreakoutNoFrameskip-v4             # record human gameplay
 gymrec record BreakoutNoFrameskip-v4 --dry-run   # save locally without upload prompt
 gymrec record BreakoutNoFrameskip-v4 --storage lossless-video --dry-run
-gymrec record SuperMarioBros-Nes --agent random --headless --episodes 100
+gymrec record SuperMarioBros-Nes-v0 --agent random --headless --episodes 100
 gymrec record BreakoutNoFrameskip-v4 --agent breakout --headless --episodes 50
 gymrec record BreakoutNoFrameskip-v4 --agent random --headless --episodes 100 --workers 5
 

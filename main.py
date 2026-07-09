@@ -497,6 +497,29 @@ def _save_roms_path_import_cache(cache: dict):
         json.dump(cache, f, indent=2)
 
 
+def _roms_path_cache_entry_current(cache_entry, fingerprint) -> bool:
+    """Return True if source and Stable-Retro target imports still look current."""
+    if not isinstance(cache_entry, dict):
+        return False
+
+    cached_fingerprint = cache_entry.get("fingerprint")
+    stable_retro_games = cache_entry.get("stable_retro_games")
+    if cached_fingerprint != fingerprint or stable_retro_games is None:
+        return False
+
+    try:
+        import stable_retro as retro
+    except Exception:
+        return False
+
+    for game in stable_retro_games:
+        try:
+            retro.data.get_romfile_path(game, retro.data.Integrations.ALL)
+        except FileNotFoundError:
+            return False
+    return True
+
+
 def _ensure_stableretro_roms_path_imported(quiet: bool = True, force: bool = False) -> int:
     """Import ROMS_PATH into Stable-Retro's integration store once per process."""
     roms_path = _get_roms_path()
@@ -509,15 +532,35 @@ def _ensure_stableretro_roms_path_imported(quiet: bool = True, force: bool = Fal
             console.print(f"[{STYLE_FAIL}]ROMS_PATH does not exist: {roms_path}[/]")
         return 0
 
-    fingerprint = _roms_path_fingerprint(roms_path)
+    if quiet:
+        with console.status(
+            f"[{STYLE_INFO}]Checking ROMS_PATH game index: [{STYLE_PATH}]{roms_path}[/]"
+        ):
+            fingerprint = _roms_path_fingerprint(roms_path)
+    else:
+        fingerprint = _roms_path_fingerprint(roms_path)
     cache = _load_roms_path_import_cache()
-    if not force and cache.get(roms_path) == fingerprint:
+    if not force and _roms_path_cache_entry_current(cache.get(roms_path), fingerprint):
         return 0
 
-    imported_games = _import_roms(roms_path, quiet=quiet, source_label="ROMS_PATH")
-    cache[roms_path] = fingerprint
+    if quiet:
+        console.print(
+            f"[{STYLE_INFO}]Indexing games from ROMS_PATH: [{STYLE_PATH}]{roms_path}[/]"
+        )
+        with console.status(f"[{STYLE_INFO}]Scanning and importing matching ROMs...[/]"):
+            imported_games, stable_retro_games = _import_roms(
+                roms_path, quiet=quiet, source_label="ROMS_PATH", return_games=True
+            )
+    else:
+        imported_games, stable_retro_games = _import_roms(
+            roms_path, quiet=quiet, source_label="ROMS_PATH", return_games=True
+        )
+    cache[roms_path] = {
+        "fingerprint": fingerprint,
+        "stable_retro_games": stable_retro_games,
+    }
     _save_roms_path_import_cache(cache)
-    if quiet and imported_games:
+    if quiet:
         console.print(
             f"[{STYLE_SUCCESS}]Indexed {imported_games} Stable-Retro ROM(s) from ROMS_PATH[/]"
         )
@@ -3881,7 +3924,12 @@ def reindex_games():
     console.print(f"Cache: [{STYLE_PATH}]{_roms_path_cache_file()}[/]")
 
 
-def _import_roms(path: str, quiet: bool = False, source_label: str | None = None) -> int:
+def _import_roms(
+    path: str,
+    quiet: bool = False,
+    source_label: str | None = None,
+    return_games: bool = False,
+) -> int | tuple[int, list[str]]:
     """Import ROMs into stable-retro from a directory or file."""
     import zipfile
 
@@ -3890,10 +3938,11 @@ def _import_roms(path: str, quiet: bool = False, source_label: str | None = None
     if not os.path.exists(path):
         if not quiet:
             console.print(f"[{STYLE_FAIL}]Error: Path not found: {path}[/]")
-        return 0
+        return (0, []) if return_games else 0
 
     known_hashes = stable_retro.data.get_known_hashes()
     imported_games = 0
+    matched_games = set()
 
     def save_if_matches(filename, f):
         nonlocal imported_games
@@ -3903,6 +3952,7 @@ def _import_roms(path: str, quiet: bool = False, source_label: str | None = None
             return
         if hash in known_hashes:
             game, ext, curpath = known_hashes[hash]
+            matched_games.add(game)
             game_path = os.path.join(curpath, game)
             rom_path = os.path.join(game_path, "rom%s" % ext)
             if os.path.exists(rom_path):
@@ -3971,6 +4021,8 @@ def _import_roms(path: str, quiet: bool = False, source_label: str | None = None
     if not quiet:
         label = f" from {source_label}" if source_label else ""
         console.print(f"[{STYLE_SUCCESS}]Imported {imported_games} ROM(s){label}[/]")
+    if return_games:
+        return imported_games, sorted(matched_games)
     return imported_games
 
 
