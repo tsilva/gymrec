@@ -45,6 +45,7 @@ Run the CLI with the installed `gymrec` command. For local development without t
 ```bash
 gymrec login                                      # authenticate with Hugging Face Hub
 gymrec list_environments                         # list Atari, Stable-Retro, and VizDoom envs with ROM status
+gymrec reindex_games                             # re-scan ROMS_PATH and refresh the game cache
 
 gymrec record BreakoutNoFrameskip-v4             # record human gameplay
 gymrec record BreakoutNoFrameskip-v4 --dry-run   # save locally without upload prompt
@@ -71,7 +72,7 @@ Human recording opens a pygame window. Press `Space` to start recording, use the
 
 Agent recording supports `human`, `random`, `mario`, and `breakout`. `--headless` is for agent mode only and requires `--episodes`; `--workers` runs parallel headless collection and cannot exceed the requested episode count.
 
-The interactive recording menu only shows Atari and Stable-Retro environments whose ROMs are installed in the active Python environment. `list_environments` also shows missing ROMs for backends that register games separately from installed game files.
+The interactive recording menu only shows Atari and Stable-Retro environments whose ROMs are installed in the active Python environment. It uses a full-screen terminal menu by default and falls back to a plain text search prompt when the terminal cannot support it. Set `GYMREC_TEXT_MENU=1` to force the text selector. `list_environments` also shows missing ROMs for backends that register games separately from installed game files.
 
 Playback uses the local dataset first, then falls back to the Hugging Face Hub dataset repo. Video export requires `ffmpeg` and writes MP4 files from local data or downloaded Hub data.
 

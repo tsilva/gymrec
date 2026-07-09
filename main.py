@@ -287,23 +287,84 @@ def _configure_atari_roms_path():
         )
 
 
-def _ensure_stableretro_roms_path_imported(quiet: bool = True):
+def _roms_path_cache_file() -> str:
+    return os.path.expanduser("~/.gymrec/roms_path_imports.json")
+
+
+def _roms_path_fingerprint(path: str) -> dict:
+    file_count = 0
+    total_size = 0
+    newest_mtime_ns = 0
+
+    if os.path.isfile(path):
+        stat = os.stat(path)
+        return {
+            "file_count": 1,
+            "total_size": stat.st_size,
+            "newest_mtime_ns": stat.st_mtime_ns,
+        }
+
+    for root, _dirs, files in os.walk(path):
+        for filename in files:
+            filepath = os.path.join(root, filename)
+            try:
+                stat = os.stat(filepath)
+            except OSError:
+                continue
+            file_count += 1
+            total_size += stat.st_size
+            newest_mtime_ns = max(newest_mtime_ns, stat.st_mtime_ns)
+
+    return {
+        "file_count": file_count,
+        "total_size": total_size,
+        "newest_mtime_ns": newest_mtime_ns,
+    }
+
+
+def _load_roms_path_import_cache() -> dict:
+    cache_file = _roms_path_cache_file()
+    if not os.path.exists(cache_file):
+        return {}
+    try:
+        with open(cache_file, "r") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _save_roms_path_import_cache(cache: dict):
+    cache_file = _roms_path_cache_file()
+    os.makedirs(os.path.dirname(cache_file), exist_ok=True)
+    with open(cache_file, "w") as f:
+        json.dump(cache, f, indent=2)
+
+
+def _ensure_stableretro_roms_path_imported(quiet: bool = True, force: bool = False) -> int:
     """Import ROMS_PATH into Stable-Retro's integration store once per process."""
     roms_path = _get_roms_path()
-    if not roms_path or roms_path in _stableretro_roms_path_imported:
-        return
+    if not roms_path or (not force and roms_path in _stableretro_roms_path_imported):
+        return 0
 
     _stableretro_roms_path_imported.add(roms_path)
     if not os.path.exists(roms_path):
         if not quiet:
             console.print(f"[{STYLE_FAIL}]ROMS_PATH does not exist: {roms_path}[/]")
-        return
+        return 0
+
+    fingerprint = _roms_path_fingerprint(roms_path)
+    cache = _load_roms_path_import_cache()
+    if not force and cache.get(roms_path) == fingerprint:
+        return 0
 
     imported_games = _import_roms(roms_path, quiet=quiet, source_label="ROMS_PATH")
+    cache[roms_path] = fingerprint
+    _save_roms_path_import_cache(cache)
     if quiet and imported_games:
         console.print(
-            f"[{STYLE_SUCCESS}]Imported {imported_games} Stable-Retro ROM(s) from ROMS_PATH[/]"
+            f"[{STYLE_SUCCESS}]Indexed {imported_games} Stable-Retro ROM(s) from ROMS_PATH[/]"
         )
+    return imported_games
 
 
 def _lazy_init():
@@ -3142,6 +3203,8 @@ def _build_environment_menu_entries(grouped_envs):
 
 
 def _terminal_menu_supported() -> bool:
+    if os.environ.get("GYMREC_TEXT_MENU", "").lower() in ("1", "true", "yes"):
+        return False
     if os.environ.get("TERM") in (None, "", "dumb"):
         return False
     size = shutil.get_terminal_size(fallback=(0, 0))
@@ -3363,6 +3426,40 @@ def list_environments():
     _list_environments__alepy()
     _list_environments__stableretro()
     _list_environments__vizdoom()
+
+
+def reindex_games():
+    """Force ROMS_PATH re-scan and refresh cached game availability."""
+    roms_path = _get_roms_path()
+    if not roms_path:
+        console.print(f"[{STYLE_FAIL}]ROMS_PATH is not set.[/]")
+        console.print(
+            f"Set it in .env or pass [{STYLE_CMD}]{_gymrec_cmd('reindex_games', '--roms-path', '/path/to/roms')}[/]"
+        )
+        raise SystemExit(1)
+
+    if not os.path.exists(roms_path):
+        console.print(f"[{STYLE_FAIL}]ROMS_PATH does not exist: {roms_path}[/]")
+        raise SystemExit(1)
+
+    console.print(f"[{STYLE_INFO}]Reindexing ROMS_PATH: [{STYLE_PATH}]{roms_path}[/]")
+    stable_retro_imported = _ensure_stableretro_roms_path_imported(quiet=True, force=True)
+
+    atari_envs = _get_atari_envs(imported_only=True)
+    stable_retro_envs = _get_stableretro_envs(imported_only=True)
+    vizdoom_envs = _get_vizdoom_envs()
+
+    console.print(
+        f"[{STYLE_SUCCESS}]Reindex complete[/]: "
+        f"Atari [{STYLE_INFO}]{len(atari_envs)}[/], "
+        f"Stable-Retro [{STYLE_INFO}]{len(stable_retro_envs)}[/], "
+        f"VizDoom [{STYLE_INFO}]{len(vizdoom_envs)}[/]"
+    )
+    if stable_retro_imported:
+        console.print(
+            f"Stable-Retro ROMs matched during reindex: [{STYLE_INFO}]{stable_retro_imported}[/]"
+        )
+    console.print(f"Cache: [{STYLE_PATH}]{_roms_path_cache_file()}[/]")
 
 
 def _import_roms(path: str, quiet: bool = False, source_label: str | None = None) -> int:
@@ -3833,6 +3930,10 @@ async def main():
     _add_roms_path_arg(parser_login, default=argparse.SUPPRESS)
     parser_list = subparsers.add_parser("list_environments", help="List available environments")
     _add_roms_path_arg(parser_list, default=argparse.SUPPRESS)
+    parser_reindex = subparsers.add_parser(
+        "reindex_games", help="Re-scan ROMS_PATH and refresh game availability cache"
+    )
+    _add_roms_path_arg(parser_reindex, default=argparse.SUPPRESS)
 
     parser_import = subparsers.add_parser(
         "import_roms", help="Import ROMs into stable-retro from a directory or file"
@@ -3889,18 +3990,24 @@ async def main():
         list_environments()
         return
 
+    if args.command == "reindex_games":
+        reindex_games()
+        return
+
     if args.command == "import_roms":
         _import_roms(args.path)
         return
 
     env_id = args.env_id
 
-    _lazy_init()
-
     if env_id is None:
+        if args.command in ("playback", "video"):
+            _lazy_init()
         # For playback, only show environments with available recordings
         is_recording_command = args.command in ("playback", "video")
         env_id = select_environment_interactive(available_recordings_only=is_recording_command)
+
+    _lazy_init()
 
     if args.command == "upload":
         upload_local_dataset(env_id)
@@ -4106,7 +4213,10 @@ async def main():
 
 
 def cli():
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        console.print("\n[dim]Interrupted.[/]")
 
 
 if __name__ == "__main__":
