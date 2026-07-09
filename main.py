@@ -207,6 +207,31 @@ BACKEND_LABELS = {
     "stable-retro": "Stable-Retro",
 }
 
+OBSERVATION_IMAGE_KEYS = ("obs", "image", "screen")
+
+
+def _extract_observation_image(observation):
+    """Extract the image array from an observation, including dict observations."""
+    if isinstance(observation, dict):
+        for key in OBSERVATION_IMAGE_KEYS:
+            if key in observation:
+                return observation[key]
+    return observation
+
+
+def _episode_progress(transient=False):
+    """Create the standard episode/frame progress display."""
+    return Progress(
+        SpinnerColumn(),
+        TextColumn("{task.description}"),
+        BarColumn(),
+        MofNCompleteColumn(),
+        TimeElapsedColumn(),
+        TimeRemainingColumn(),
+        console=console,
+        transient=transient,
+    )
+
 
 def _env_id_has_retro_platform(env_id):
     """Return True when an env id contains a known Stable-Retro platform token."""
@@ -253,7 +278,6 @@ def _lazy_init():
     global np, pygame, PILImage
     global \
         whoami, \
-        DatasetCard, \
         DatasetCardData, \
         HfApi, \
         login, \
@@ -277,7 +301,6 @@ def _lazy_init():
     )
     from huggingface_hub import (
         CommitOperationAdd,
-        DatasetCard,
         DatasetCardData,
         HfApi,
         get_token,
@@ -989,13 +1012,7 @@ class DatasetRecorderWrapper(gym.Wrapper):
         """
         Ensure pygame screen is initialized with the correct shape.
         """
-        # If frame is a dict (e.g., VizDoom), extract the image
-        if isinstance(frame, dict):
-            # Try common keys for image observation
-            for k in ["obs", "image", "screen"]:
-                if k in frame:
-                    frame = frame[k]
-                    break
+        frame = _extract_observation_image(frame)
         if self.screen is None or self.frame_shape is None:
             self.frame_shape = frame.shape
             scale = CONFIG["display"]["scale_factor"]
@@ -1006,11 +1023,7 @@ class DatasetRecorderWrapper(gym.Wrapper):
 
     def _save_frame_image(self, frame):
         """Save a frame as lossless WebP and return the file path."""
-        if isinstance(frame, dict):
-            for k in ["obs", "image", "screen"]:
-                if k in frame:
-                    frame = frame[k]
-                    break
+        frame = _extract_observation_image(frame)
         frame_uint8 = frame.astype(np.uint8)
         path = os.path.join(self.temp_dir, f"frame_{len(self.frames):05d}.webp")
         img = PILImage.fromarray(frame_uint8)
@@ -1098,12 +1111,7 @@ class DatasetRecorderWrapper(gym.Wrapper):
         if self.headless:
             return
 
-        # If frame is a dict (e.g., VizDoom), extract the image
-        if isinstance(frame, dict):
-            for k in ["obs", "image", "screen"]:
-                if k in frame:
-                    frame = frame[k]
-                    break
+        frame = _extract_observation_image(frame)
         self._ensure_screen(frame)
         if frame.dtype != np.uint8:
             frame = frame.astype(np.uint8)
@@ -1505,14 +1513,6 @@ class DatasetRecorderWrapper(gym.Wrapper):
                 "session_id", Value("binary")
             )
 
-    def _extract_obs_image(self, obs):
-        """Extract image array from observation, handling dict obs (e.g. VizDoom)."""
-        if isinstance(obs, dict):
-            for k in ["obs", "image", "screen"]:
-                if k in obs:
-                    return obs[k]
-        return obs
-
     def _convert_action(self, action):
         """Convert stored action back to the environment's expected format."""
         if isinstance(action, list):
@@ -1584,7 +1584,7 @@ class DatasetRecorderWrapper(gym.Wrapper):
                     self._render_frame(obs)
 
                     if verify:
-                        obs_image = self._extract_obs_image(obs)
+                        obs_image = _extract_observation_image(obs)
                         if obs_image.dtype != np.uint8:
                             obs_image = obs_image.astype(np.uint8)
                         recorded_array = np.array(recorded_image, dtype=np.uint8)
@@ -1946,9 +1946,23 @@ def _print_missing_dataset(env_id):
     console.print(f"  Record a session first: [{STYLE_CMD}]uv run python main.py record {env_id}[/]")
 
 
+def _get_row_value(row, current_name, legacy_name=None):
+    """Read a dataset row field, preserving support for the legacy singular schema."""
+    if current_name in row:
+        return row[current_name]
+    if legacy_name is not None:
+        return row.get(legacy_name)
+    return None
+
+
+def _get_row_action(row):
+    """Return the action from a dataset row."""
+    return _get_row_value(row, "actions", "action")
+
+
 def _is_step_row(row):
     """Filter out terminal observation rows."""
-    action = row.get("actions", row.get("action"))
+    action = _get_row_action(row)
     return not (action is None or (isinstance(action, list) and len(action) == 0))
 
 
@@ -2054,7 +2068,7 @@ def _select_episode_numbers(total_episodes, episode_range=None, first=None, last
 
 def _get_row_observation(row):
     """Return the observation image from a dataset row."""
-    observation = row.get("observations", row.get("observation"))
+    observation = _get_row_value(row, "observations", "observation")
     if observation is None:
         raise ValueError("Dataset row is missing observations")
     return observation
@@ -2210,16 +2224,7 @@ def export_dataset_video(
     )
 
     try:
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("{task.description}"),
-            BarColumn(),
-            MofNCompleteColumn(),
-            TimeElapsedColumn(),
-            TimeRemainingColumn(),
-            console=console,
-            transient=False,
-        ) as progress:
+        with _episode_progress(transient=False) as progress:
             task_id = progress.add_task("[bold]Encoding[/]", total=total_frames)
             for episode_number, row_indices in selected_episodes:
                 for row_index in row_indices:
@@ -2356,7 +2361,6 @@ def upload_local_dataset(env_id, max_retries=5, base_wait=1.0):
                 card_content = _build_dataset_card_content(
                     env_id,
                     hf_repo_id,
-                    api,
                     new_frames=len(new_indices),
                     new_episodes=n_new_episodes,
                     repo_exists=repo_exists,
@@ -2444,15 +2448,13 @@ def minari_export(env_id, dataset_name=None, author=None):
     episodes = {}
     for row in dataset:
         eid = row["episode_id"]
-        # Handle both UUID bytes and legacy integer episode IDs
-        if isinstance(eid, bytes):
-            eid = uuid.UUID(bytes=eid)
-        if eid not in episodes:
-            episodes[eid] = []
-        episodes[eid].append(row)
-    for eid in episodes:
-        if "step" in episodes[eid][0]:
-            episodes[eid].sort(key=lambda r: r["step"])
+        key = _normalize_episode_id(eid)
+        if key not in episodes:
+            episodes[key] = []
+        episodes[key].append(row)
+    for rows in episodes.values():
+        if "step" in rows[0]:
+            rows.sort(key=lambda r: r["step"])
 
     # Try to extract action/observation spaces from the environment
     action_space = None
@@ -2468,7 +2470,7 @@ def minari_export(env_id, dataset_name=None, author=None):
     # Build EpisodeBuffers
     buffers = []
     total_steps = 0
-    for ep_idx, (eid, rows) in enumerate(sorted(episodes.items())):
+    for ep_idx, (_eid, rows) in enumerate(sorted(episodes.items())):
         observations = []
         actions = []
         rewards = []
@@ -2477,13 +2479,13 @@ def minari_export(env_id, dataset_name=None, author=None):
         ep_seed = rows[0].get("seed", 0)
 
         for row in rows:
-            img = row.get("observations", row.get("observation"))
+            img = _get_row_observation(row)
             if not isinstance(img, np.ndarray):
                 img = np.array(img)
             observations.append(img)
 
             # Detect terminal observation by empty/missing actions
-            action = row.get("actions", row.get("action"))
+            action = _get_row_action(row)
             if (isinstance(action, list) and len(action) == 0) or action is None:
                 continue
 
@@ -2491,11 +2493,11 @@ def minari_export(env_id, dataset_name=None, author=None):
                 action = action[0]
             actions.append(action)
 
-            reward = row.get("rewards", row.get("reward"))
+            reward = _get_row_value(row, "rewards", "reward")
             rewards.append(float(reward) if reward is not None else 0.0)
-            term = row.get("terminations", row.get("termination"))
+            term = _get_row_value(row, "terminations", "termination")
             terminations.append(bool(term) if term is not None else False)
-            trunc = row.get("truncations", row.get("truncation"))
+            trunc = _get_row_value(row, "truncations", "truncation")
             truncations.append(bool(trunc) if trunc is not None else False)
 
         # Fallback for old datasets without terminal observation:
@@ -2660,12 +2662,6 @@ def _size_category(n):
 def _current_hf_username():
     user_info = whoami()
     return user_info.get("name") or user_info.get("user") or "unknown"
-
-
-def _provenance_from_dataset(dataset):
-    collectors = sorted(set(dataset["collector"])) if "collector" in dataset.column_names else []
-    versions = sorted(set(dataset["gymrec_version"])) if "gymrec_version" in dataset.column_names else []
-    return collectors, versions
 
 
 def _provenance_from_metadata(metadata):
@@ -2833,27 +2829,6 @@ def render_dataset_card_content(
     return "\n".join(content_lines)
 
 
-def generate_dataset_card(dataset, env_id, repo_id, metadata=None):
-    """Generate or update the dataset card for a given dataset repo."""
-    collectors, gymrec_versions = _provenance_from_dataset(dataset)
-    card = DatasetCard(
-        render_dataset_card_content(
-            env_id,
-            repo_id,
-            frames=len(dataset),
-            episodes=len(set(dataset["episode_id"])),
-            metadata=metadata,
-            collectors=collectors,
-            gymrec_versions=gymrec_versions,
-        )
-    )
-    card.push_to_hub(
-        repo_id=repo_id,
-        repo_type="dataset",
-        commit_message=CONFIG["dataset"]["commit_message"],
-    )
-
-
 def _read_existing_dataset_card_counts(repo_id):
     """Return frame and episode counts parsed from an existing Hub README."""
     import re
@@ -2875,7 +2850,7 @@ def _read_existing_dataset_card_counts(repo_id):
         return 0, 0
 
 
-def _build_dataset_card_content(env_id, repo_id, api, new_frames, new_episodes, repo_exists):
+def _build_dataset_card_content(env_id, repo_id, new_frames, new_episodes, repo_exists):
     """Build dataset card content string for an append-only upload.
 
     If the repo exists, downloads the current README and parses existing frame/episode
@@ -3470,21 +3445,11 @@ def _parallel_record(env_id, num_workers, total_episodes, max_steps, agent_type,
     worker_metadata = {}
     completed_workers = 0
     total_steps = 0
-    episodes_done = 0
 
     # Track per-worker state
     worker_states = {wid: {"episode": 0, "step": 0} for wid, _ in active_counts}
 
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("{task.description}"),
-        BarColumn(),
-        MofNCompleteColumn(),
-        TimeElapsedColumn(),
-        TimeRemainingColumn(),
-        console=console,
-        transient=False,
-    ) as progress:
+    with _episode_progress(transient=False) as progress:
         # Create per-worker progress bars
         worker_task_ids = {}
         for wid, num_eps in active_counts:
@@ -3533,7 +3498,6 @@ def _parallel_record(env_id, num_workers, total_episodes, max_steps, agent_type,
                     # Episode completed
                     _, wid, episode_number, steps_in_episode = msg
                     total_steps += steps_in_episode
-                    episodes_done += 1
                     worker_states[wid]["episode"] = episode_number
                     worker_states[wid]["step"] = 0
                     progress.update(
@@ -3845,17 +3809,8 @@ async def main():
             )
         else:
             # Agent mode
-            if args.agent not in AGENT_POLICY_FACTORIES:
-                console.print(f"[{STYLE_FAIL}]Error: Unknown agent type '{args.agent}'[/]")
-                return
-
             # Validate --workers usage
             workers = getattr(args, "workers", 1)
-            if workers > 1 and args.agent == "human":
-                console.print(
-                    f"[{STYLE_FAIL}]Error: --workers requires --agent (not human mode)[/]"
-                )
-                return
             if workers > 1:
                 args.headless = True  # Force headless for parallel workers
 
@@ -3923,16 +3878,7 @@ async def main():
 
                     return callback
 
-                with Progress(
-                    SpinnerColumn(),
-                    TextColumn("{task.description}"),
-                    BarColumn(),
-                    MofNCompleteColumn(),
-                    TimeElapsedColumn(),
-                    TimeRemainingColumn(),
-                    console=console,
-                    transient=False,
-                ) as progress:
+                with _episode_progress(transient=False) as progress:
                     task_id = progress.add_task("[bold]Episodes[/]", total=max_episodes)
                     recorded_dataset = await recorder.record(
                         fps=fps,
@@ -3983,20 +3929,18 @@ async def main():
         if args.verify:
             recorded_data = (
                 (
-                    row.get("actions", row.get("action")),
-                    row.get("observations", row.get("observation")),
-                    row.get("rewards", row.get("reward")),
-                    row.get("terminations", row.get("termination")),
-                    row.get("truncations", row.get("truncation")),
+                    _get_row_action(row),
+                    _get_row_observation(row),
+                    _get_row_value(row, "rewards", "reward"),
+                    _get_row_value(row, "terminations", "termination"),
+                    _get_row_value(row, "truncations", "truncation"),
                 )
                 for row in loaded_dataset
                 if _is_step_row(row)
             )
             await recorder.replay(recorded_data, fps=fps, total=total, verify=True)
         else:
-            actions = (
-                row.get("actions", row.get("action")) for row in loaded_dataset if _is_step_row(row)
-            )
+            actions = (_get_row_action(row) for row in loaded_dataset if _is_step_row(row))
             await recorder.replay(actions, fps=fps, total=total)
     elif args.command == "video":
         loaded_dataset, source, total = load_recorded_dataset(env_id, streaming=False)
