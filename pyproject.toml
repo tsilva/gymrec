@@ -20,8 +20,7 @@ dependencies = [
     "rich",
     "huggingface-hub",
     "simple-term-menu",
-    "stable-retro; sys_platform != 'darwin' or platform_machine != 'arm64'",
-    "stable-retro-apple-silicon==0.9.9.post1; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "stable-retro-turbo==1.0.1.post9",
     "scipy>=1.17.0",
 ]
 
@@ -32,7 +31,7 @@ gymrec = "main:cli"
 minari = ["minari>=0.5.0"]
 
 [tool.hatch.build.targets.wheel]
-include = ["main.py"]
+include = ["main.py", "config.toml", "keymappings.toml"]
 
 [tool.ruff]
 line-length = 100
@@ -43,6 +42,7 @@ ignore = ["E501"]
 
 [tool.uv]
 exclude-newer = "7 days"
+exclude-newer-package = { stable-retro-turbo = false }
 constraint-dependencies = [
   "mistralai!=2.4.6",
   "guardrails-ai!=0.10.1",

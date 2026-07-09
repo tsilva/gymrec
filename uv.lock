@@ -12,6 +12,10 @@ resolution-markers = [
 exclude-newer = "0001-01-01T00:00:00Z" # This has no effect and is included for backwards compatibility when using relative exclude-newer values.
 exclude-newer-span = "P7D"
 
+[options.exclude-newer-package]
+supermariobrosnes-turbo = "2026-07-08T23:59:59Z"
+stable-retro-turbo = false
+
 [manifest]
 constraints = [
     { name = "guardrails-ai", specifier = "!=0.10.1" },
@@ -312,8 +316,7 @@ dependencies = [
     { name = "rich" },
     { name = "scipy" },
     { name = "simple-term-menu" },
-    { name = "stable-retro", marker = "platform_machine != 'arm64' or sys_platform != 'darwin'" },
-    { name = "stable-retro-apple-silicon", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'" },
+    { name = "stable-retro-turbo" },
     { name = "vizdoom" },
 ]
 
@@ -336,8 +339,7 @@ requires-dist = [
     { name = "rich" },
     { name = "scipy", specifier = ">=1.17.0" },
     { name = "simple-term-menu" },
-    { name = "stable-retro", marker = "platform_machine != 'arm64' or sys_platform != 'darwin'" },
-    { name = "stable-retro-apple-silicon", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'", specifier = "==0.9.9.post1" },
+    { name = "stable-retro-turbo", specifier = "==1.0.1.post9" },
     { name = "vizdoom" },
 ]
 provides-extras = ["minari"]
@@ -760,31 +762,17 @@ wheels = [
 ]
 
 [[package]]
-name = "stable-retro"
-version = "0.9.9"
+name = "stable-retro-turbo"
+version = "1.0.1.post9"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "farama-notifications" },
     { name = "gymnasium" },
     { name = "pyglet" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/4e/48/3c51a5c222b92f53e59932ce8d52a97d58f4287e558bce0d731e008b1a8b/stable_retro-0.9.9.tar.gz", hash = "sha256:a068422e9c8d98659b3239fe0243446b22ace2234da2e432a80f4d3bf393deb7", size = 152887293, upload-time = "2026-02-15T16:46:46.032Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/26/af/2f3d141134f68dcdb11060a0d7ef6ea86956a9b7d31f61dff7ab52fda77b/stable_retro-0.9.9-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:4bcd1de9adb95250ae49b30ed5eb2c755dd73e8c2f11efc32889c52fa9d6c7aa", size = 88106661, upload-time = "2026-02-15T16:46:19.365Z" },
-    { url = "https://files.pythonhosted.org/packages/4d/d0/22e239ade84abe501f2b566b77ba2886d4411fa8ee9297aa16569f0b91cc/stable_retro-0.9.9-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:f7cda69730d96bedfd74867f2ecc66d89655f7c3e4f7f4ad90ef08cffb96fef1", size = 121544185, upload-time = "2026-02-15T16:46:23.726Z" },
-]
-
-[[package]]
-name = "stable-retro-apple-silicon"
-version = "0.9.9.post1"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "farama-notifications", marker = "sys_platform == 'darwin'" },
-    { name = "gymnasium", marker = "sys_platform == 'darwin'" },
-    { name = "pyglet", marker = "sys_platform == 'darwin'" },
-]
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/6f/9b/d52f67286f1ef359ac4ee25187450e75751ced725a122d79d5f880d9944e/stable_retro_apple_silicon-0.9.9.post1-cp312-cp312-macosx_14_0_arm64.whl", hash = "sha256:fb143b9c5461e16e932878022fd68f00e2b4e34200443a84d248cf2cba0d4e3f", size = 101857292, upload-time = "2026-03-14T23:16:08.294Z" },
+    { url = "https://files.pythonhosted.org/packages/30/68/a99ff9b7ca2aaff050efbc7e7829da97c90b45b1cca6fb2930cb1758749e/stable_retro_turbo-1.0.1.post9-cp312-cp312-macosx_14_0_arm64.whl", hash = "sha256:bce3283f005d83b45fbf050adf31adf472a78eb824b408a4a2fa3b92c6d9b29b", size = 81562943, upload-time = "2026-07-08T17:18:09.163Z" },
+    { url = "https://files.pythonhosted.org/packages/20/ee/94b6d0cef7070125414144e7382236df8b43e0001f8833a3fba45fdecd50/stable_retro_turbo-1.0.1.post9-cp312-cp312-manylinux_2_26_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:7cfecb604e109ce857aaf3745255bed7e9cb736fae645953a854813f1f0bbb9a", size = 84498492, upload-time = "2026-07-08T17:18:14.062Z" },
 ]
 
 [[package]]

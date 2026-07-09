@@ -125,225 +125,37 @@ def _resolve_key(name, key_map):
 
 
 def _load_keymappings(pygame):
-    """Load keymappings from keymappings.toml, falling back to defaults."""
+    """Load keymappings from the bundled keymappings.toml file."""
     key_map = _build_key_name_map(pygame)
-
-    # Build defaults (same values as previously hardcoded)
-    default_start_key = pygame.K_SPACE
-
-    default_atari = {
-        pygame.K_SPACE: "FIRE",
-        pygame.K_UP: "UP",
-        pygame.K_RIGHT: "RIGHT",
-        pygame.K_LEFT: "LEFT",
-        pygame.K_DOWN: "DOWN",
-    }
-
-    default_vizdoom = {
-        pygame.K_UP: "MOVE_FORWARD",
-        pygame.K_DOWN: "MOVE_BACKWARD",
-        pygame.K_LEFT: "TURN_LEFT",
-        pygame.K_RIGHT: "TURN_RIGHT",
-        pygame.K_LSHIFT: "SPEED",
-        pygame.K_RSHIFT: "SPEED",
-        pygame.K_LCTRL: "ATTACK",
-        pygame.K_RCTRL: "ATTACK",
-        pygame.K_SPACE: "USE",
-    }
-    for i in range(1, 8):
-        default_vizdoom[getattr(pygame, f"K_{i}")] = f"SELECT_WEAPON{i}"
-
-    default_retro = {
-        "Nes": {
-            pygame.K_z: 0,
-            pygame.K_n: 2,
-            pygame.K_m: 3,
-            pygame.K_UP: 4,
-            pygame.K_DOWN: 5,
-            pygame.K_LEFT: 6,
-            pygame.K_RIGHT: 7,
-            pygame.K_x: 8,
-        },
-        "Atari2600": {
-            pygame.K_z: 0,
-            pygame.K_n: 2,
-            pygame.K_m: 3,
-            pygame.K_UP: 4,
-            pygame.K_DOWN: 5,
-            pygame.K_LEFT: 6,
-            pygame.K_RIGHT: 7,
-        },
-        "Snes": {
-            pygame.K_z: 0,
-            pygame.K_a: 1,
-            pygame.K_n: 2,
-            pygame.K_m: 3,
-            pygame.K_UP: 4,
-            pygame.K_DOWN: 5,
-            pygame.K_LEFT: 6,
-            pygame.K_RIGHT: 7,
-            pygame.K_x: 8,
-            pygame.K_s: 9,
-            pygame.K_q: 10,
-            pygame.K_w: 11,
-        },
-        "GbAdvance": {
-            pygame.K_z: 0,
-            pygame.K_n: 2,
-            pygame.K_m: 3,
-            pygame.K_UP: 4,
-            pygame.K_DOWN: 5,
-            pygame.K_LEFT: 6,
-            pygame.K_RIGHT: 7,
-            pygame.K_x: 8,
-            pygame.K_a: 10,
-            pygame.K_s: 11,
-        },
-        "GameBoy": {
-            pygame.K_z: 0,
-            pygame.K_n: 2,
-            pygame.K_m: 3,
-            pygame.K_UP: 4,
-            pygame.K_DOWN: 5,
-            pygame.K_LEFT: 6,
-            pygame.K_RIGHT: 7,
-            pygame.K_x: 8,
-        },
-        "GbColor": {
-            pygame.K_z: 0,
-            pygame.K_n: 2,
-            pygame.K_m: 3,
-            pygame.K_UP: 4,
-            pygame.K_DOWN: 5,
-            pygame.K_LEFT: 6,
-            pygame.K_RIGHT: 7,
-            pygame.K_x: 8,
-        },
-        "PCEngine": {
-            pygame.K_x: 0,
-            pygame.K_c: 1,
-            pygame.K_n: 2,
-            pygame.K_m: 3,
-            pygame.K_UP: 4,
-            pygame.K_DOWN: 5,
-            pygame.K_LEFT: 6,
-            pygame.K_RIGHT: 7,
-            pygame.K_z: 8,
-            pygame.K_a: 9,
-            pygame.K_s: 10,
-            pygame.K_d: 11,
-        },
-        "Saturn": {
-            pygame.K_x: 0,
-            pygame.K_z: 1,
-            pygame.K_n: 2,
-            pygame.K_m: 3,
-            pygame.K_UP: 4,
-            pygame.K_DOWN: 5,
-            pygame.K_LEFT: 6,
-            pygame.K_RIGHT: 7,
-            pygame.K_c: 8,
-            pygame.K_a: 9,
-            pygame.K_s: 10,
-            pygame.K_d: 11,
-        },
-        "32x": {
-            pygame.K_x: 0,
-            pygame.K_z: 1,
-            pygame.K_n: 2,
-            pygame.K_m: 3,
-            pygame.K_UP: 4,
-            pygame.K_DOWN: 5,
-            pygame.K_LEFT: 6,
-            pygame.K_RIGHT: 7,
-            pygame.K_c: 8,
-            pygame.K_a: 9,
-            pygame.K_s: 10,
-            pygame.K_d: 11,
-        },
-        "Genesis": {
-            pygame.K_x: 0,
-            pygame.K_z: 1,
-            pygame.K_n: 2,
-            pygame.K_m: 3,
-            pygame.K_UP: 4,
-            pygame.K_DOWN: 5,
-            pygame.K_LEFT: 6,
-            pygame.K_RIGHT: 7,
-            pygame.K_c: 8,
-            pygame.K_a: 9,
-            pygame.K_s: 10,
-            pygame.K_d: 11,
-        },
-        "Sms": {
-            pygame.K_z: 0,
-            pygame.K_m: 3,
-            pygame.K_UP: 4,
-            pygame.K_DOWN: 5,
-            pygame.K_LEFT: 6,
-            pygame.K_RIGHT: 7,
-            pygame.K_x: 8,
-        },
-        "GameGear": {
-            pygame.K_z: 0,
-            pygame.K_m: 3,
-            pygame.K_UP: 4,
-            pygame.K_DOWN: 5,
-            pygame.K_LEFT: 6,
-            pygame.K_RIGHT: 7,
-            pygame.K_x: 8,
-        },
-        "SCD": {
-            pygame.K_x: 0,
-            pygame.K_z: 1,
-            pygame.K_n: 2,
-            pygame.K_m: 3,
-            pygame.K_UP: 4,
-            pygame.K_DOWN: 5,
-            pygame.K_LEFT: 6,
-            pygame.K_RIGHT: 7,
-            pygame.K_c: 8,
-            pygame.K_a: 9,
-            pygame.K_s: 10,
-            pygame.K_d: 11,
-        },
-    }
-
-    # Try loading config file
     config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "keymappings.toml")
     if not os.path.exists(config_path):
-        return default_start_key, default_atari, default_vizdoom, default_retro
+        raise FileNotFoundError(
+            f"Missing bundled keymappings.toml at {config_path}. "
+            "Reinstall gymrec or restore the repository config file."
+        )
 
     with open(config_path, "rb") as f:
         config = tomllib.load(f)
 
-    # General section
-    start_key = default_start_key
-    if "general" in config and "start_key" in config["general"]:
-        start_key = _resolve_key(config["general"]["start_key"], key_map)
+    for section in ("atari", "vizdoom", "stable_retro"):
+        if section not in config:
+            raise ValueError(f"keymappings.toml is missing required [{section}] section")
 
-    # Atari section
-    atari = default_atari
-    if "atari" in config:
-        atari = {}
-        for key_name, action in config["atari"].items():
-            atari[_resolve_key(key_name, key_map)] = action
+    def parse_key_bindings(section):
+        return {
+            _resolve_key(key_name, key_map): action
+            for key_name, action in config.get(section, {}).items()
+        }
 
-    # VizDoom section
-    vizdoom = default_vizdoom
-    if "vizdoom" in config:
-        vizdoom = {}
-        for key_name, action in config["vizdoom"].items():
-            vizdoom[_resolve_key(key_name, key_map)] = action
-
-    # Stable-Retro section
-    retro = default_retro
-    if "stable_retro" in config:
-        retro = {}
-        for console, bindings in config["stable_retro"].items():
-            retro[console] = {}
-            for key_name, action in bindings.items():
-                retro[console][_resolve_key(key_name, key_map)] = action
+    start_key = _resolve_key(config.get("general", {}).get("start_key", "space"), key_map)
+    atari = parse_key_bindings("atari")
+    vizdoom = parse_key_bindings("vizdoom")
+    retro = {
+        console: {
+            _resolve_key(key_name, key_map): action for key_name, action in bindings.items()
+        }
+        for console, bindings in config["stable_retro"].items()
+    }
 
     return start_key, atari, vizdoom, retro
 
@@ -370,6 +182,48 @@ DEFAULT_CONFIG = {
 }
 
 CONFIG = None
+
+RETRO_PLATFORMS = frozenset(
+    {
+        "Nes",
+        "GameBoy",
+        "Snes",
+        "GbAdvance",
+        "GbColor",
+        "Genesis",
+        "PCEngine",
+        "Saturn",
+        "32x",
+        "Sms",
+        "GameGear",
+        "SCD",
+        "Atari2600",
+    }
+)
+
+BACKEND_LABELS = {
+    "atari": "Atari (ALE-py)",
+    "vizdoom": "VizDoom",
+    "stable-retro": "Stable-Retro",
+}
+
+
+def _env_id_has_retro_platform(env_id):
+    """Return True when an env id contains a known Stable-Retro platform token."""
+    return any(f"-{platform}" in env_id for platform in RETRO_PLATFORMS)
+
+
+def classify_env_id(env_id, stable_retro_envs=None):
+    """Classify an environment id as atari, vizdoom, or stable-retro."""
+    if env_id.startswith("ALE/"):
+        return "atari"
+    if env_id.startswith(("Vizdoom", "vizdoom")):
+        return "vizdoom"
+    if (stable_retro_envs is not None and env_id in stable_retro_envs) or _env_id_has_retro_platform(
+        env_id
+    ):
+        return "stable-retro"
+    return "atari"
 
 
 def _load_config():
@@ -1066,6 +920,21 @@ class BreakoutCatcherPolicy(BasePolicy):
         return x
 
 
+AGENT_POLICY_FACTORIES = {
+    "random": lambda env: RandomPolicy(env.action_space),
+    "mario": lambda env: MarioRightJumpPolicy(env.action_space),
+    "breakout": lambda env: BreakoutCatcherPolicy(env.action_space, env=env),
+}
+
+
+def create_agent_policy(agent_type, env):
+    """Create the configured agent policy for an environment."""
+    try:
+        return AGENT_POLICY_FACTORIES[agent_type](env)
+    except KeyError:
+        raise ValueError(f"Unknown agent type: {agent_type}") from None
+
+
 class DatasetRecorderWrapper(gym.Wrapper):
     """
     Gymnasium wrapper for recording and replaying Atari gameplay as Hugging Face datasets.
@@ -1089,11 +958,6 @@ class DatasetRecorderWrapper(gym.Wrapper):
 
         self.current_keys = set()
         self.key_lock = threading.Lock()
-        self.key_to_action = None  # Resolved lazily in _resolve_atari_key_mapping
-        self._atari_key_bindings_raw = ATARI_KEY_BINDINGS
-        self._vizdoom_buttons = None
-        self._vizdoom_vector_map = None
-        self.noop_action = 0
 
         self.episode_ids = []
         self.seeds = []
@@ -1226,211 +1090,6 @@ class DatasetRecorderWrapper(gym.Wrapper):
                     self.current_keys.discard(event.key)
         return True
 
-    def _init_vizdoom_key_mapping(self):
-        """Map important action names to their button indices."""
-        available = [b.name for b in self.env.unwrapped.game.get_available_buttons()]
-        offset = self.env.unwrapped.num_delta_buttons
-
-        def idx(name):
-            if name in available:
-                return available.index(name) - offset
-            return None
-
-        mapping = {
-            "ATTACK": idx("ATTACK"),
-            "USE": idx("USE"),
-            "MOVE_LEFT": idx("MOVE_LEFT"),
-            "MOVE_RIGHT": idx("MOVE_RIGHT"),
-            "MOVE_FORWARD": idx("MOVE_FORWARD"),
-            "MOVE_BACKWARD": idx("MOVE_BACKWARD"),
-            "TURN_LEFT": idx("TURN_LEFT"),
-            "TURN_RIGHT": idx("TURN_RIGHT"),
-            "SPEED": idx("SPEED"),
-        }
-
-        for i in range(1, 8):
-            mapping[f"SELECT_WEAPON{i}"] = idx(f"SELECT_WEAPON{i}")
-
-        # Precompute vector -> discrete action mapping for faster lookup
-        space = self.env.action_space
-        if isinstance(space, gym.spaces.Dict):
-            space = space.get("binary")
-        if isinstance(space, gym.spaces.Discrete):
-            self._vizdoom_vector_map = {
-                tuple(combo): i for i, combo in enumerate(self.env.unwrapped.button_map)
-            }
-        else:
-            self._vizdoom_vector_map = None
-
-        return {k: v for k, v in mapping.items() if v is not None}
-
-    def _resolve_atari_key_mapping(self):
-        """Resolve meaning-based Atari key bindings to action indices using the env's action meanings."""
-        # Standard fallback: meaning -> index for the default Atari action order
-        standard_meaning_to_idx = {
-            "NOOP": 0,
-            "FIRE": 1,
-            "UP": 2,
-            "RIGHT": 3,
-            "LEFT": 4,
-            "DOWN": 5,
-            "UPRIGHT": 6,
-            "UPLEFT": 7,
-            "DOWNRIGHT": 8,
-            "DOWNLEFT": 9,
-            "UPFIRE": 10,
-            "RIGHTFIRE": 11,
-            "LEFTFIRE": 12,
-            "DOWNFIRE": 13,
-            "UPRIGHTFIRE": 14,
-            "UPLEFTFIRE": 15,
-            "DOWNRIGHTFIRE": 16,
-            "DOWNLEFTFIRE": 17,
-        }
-
-        # Try to get actual meanings from the environment
-        meaning_to_idx = None
-        try:
-            meanings = self.env.unwrapped.get_action_meanings()
-            if meanings:
-                meaning_to_idx = {}
-                for idx, m in enumerate(meanings):
-                    meaning_to_idx[m.upper()] = idx
-        except (AttributeError, TypeError):
-            pass
-
-        if meaning_to_idx is None:
-            meaning_to_idx = standard_meaning_to_idx
-
-        resolved = {}
-        for key, value in self._atari_key_bindings_raw.items():
-            if isinstance(value, str):
-                idx = meaning_to_idx.get(value.upper())
-                if idx is not None:
-                    resolved[key] = idx
-
-        self.key_to_action = resolved
-        self._atari_meaning_to_idx = meaning_to_idx
-        # Reverse map: pygame key -> meaning string (for composite action lookup)
-        self._atari_key_to_meaning = {}
-        for key, value in self._atari_key_bindings_raw.items():
-            if isinstance(value, str):
-                self._atari_key_to_meaning[key] = value.upper()
-
-    def _get_atari_action(self):
-        """Return the Discrete action index for Atari environments."""
-        if self.key_to_action is None:
-            self._resolve_atari_key_mapping()
-
-        # Collect all pressed meaning strings
-        pressed_meanings = set()
-        for key in self.current_keys:
-            if key in self._atari_key_to_meaning:
-                pressed_meanings.add(self._atari_key_to_meaning[key])
-
-        if not pressed_meanings:
-            return self.noop_action
-
-        # Build composite name following ALE convention: [UP|DOWN][RIGHT|LEFT][FIRE]
-        composite = ""
-        if "UP" in pressed_meanings:
-            composite += "UP"
-        elif "DOWN" in pressed_meanings:
-            composite += "DOWN"
-        if "RIGHT" in pressed_meanings:
-            composite += "RIGHT"
-        elif "LEFT" in pressed_meanings:
-            composite += "LEFT"
-        if "FIRE" in pressed_meanings:
-            composite += "FIRE"
-
-        if not composite:
-            return self.noop_action
-
-        # Try composite first, fall back to single key
-        if composite in self._atari_meaning_to_idx:
-            return self._atari_meaning_to_idx[composite]
-
-        # Fallback: return first matching single key
-        for key in self.current_keys:
-            if key in self.key_to_action:
-                return self.key_to_action[key]
-        return self.noop_action
-
-    def _get_vizdoom_action(self):
-        """Return the MultiBinary action vector for VizDoom environments."""
-        if self._vizdoom_buttons is None:
-            self._vizdoom_buttons = self._init_vizdoom_key_mapping()
-        n_buttons = self.env.unwrapped.num_binary_buttons
-        action = np.zeros(n_buttons, dtype=np.int32)
-
-        pressed = self.current_keys
-        alt = pygame.K_LALT in pressed or pygame.K_RALT in pressed
-
-        def press(name):
-            idx = self._vizdoom_buttons.get(name)
-            if idx is not None and idx < n_buttons:
-                action[idx] = 1
-
-        for key, name in VIZDOOM_KEY_BINDINGS.items():
-            if key in pressed:
-                if key == pygame.K_LEFT:
-                    press("MOVE_LEFT" if alt else name)
-                elif key == pygame.K_RIGHT:
-                    press("MOVE_RIGHT" if alt else name)
-                else:
-                    press(name)
-
-        space = self.env.action_space
-        # When the action space contains both binary and continuous components
-        # (e.g. Dict["binary", "continuous"]), build the appropriate dict
-        if isinstance(space, gym.spaces.Dict):
-            binary_space = space.get("binary")
-            continuous_space = space.get("continuous")
-            if isinstance(binary_space, gym.spaces.Discrete):
-                if self._vizdoom_vector_map is None:
-                    self._vizdoom_vector_map = {
-                        tuple(c): i for i, c in enumerate(self.env.unwrapped.button_map)
-                    }
-                binary_action = self._vizdoom_vector_map.get(tuple(action), 0)
-            else:
-                binary_action = action
-
-            if continuous_space is not None:
-                cont_shape = continuous_space.shape
-                continuous_action = np.zeros(cont_shape, dtype=np.float32)
-                return {"binary": binary_action, "continuous": continuous_action}
-            return {"binary": binary_action}
-
-        if isinstance(space, gym.spaces.Discrete):
-            if self._vizdoom_vector_map is None:
-                self._vizdoom_vector_map = {
-                    tuple(c): i for i, c in enumerate(self.env.unwrapped.button_map)
-                }
-            return self._vizdoom_vector_map.get(tuple(action), 0)
-
-        return action
-
-    def _get_stable_retro_action(self):
-        """Return the MultiBinary action vector for stable-retro environments."""
-        action = np.zeros(self.env.action_space.n, dtype=np.int32)
-        platform = getattr(self.env.unwrapped, "system", None)
-        mapping = STABLE_RETRO_KEY_BINDINGS.get(platform, {})
-        for key in self.current_keys:
-            idx = mapping.get(key)
-            if idx is not None and idx < action.shape[0]:
-                action[idx] = 1
-        return action
-
-    def _get_user_action(self):
-        """Map pressed keys to actions for the current environment."""
-        with self.key_lock:
-            if hasattr(self.env, "_vizdoom") and self.env._vizdoom:
-                return self._get_vizdoom_action()
-            if hasattr(self.env, "_stable_retro") and self.env._stable_retro:
-                return self._get_stable_retro_action()
-            return self._get_atari_action()
-
     def _render_frame(self, frame):
         """
         Render a frame using pygame, scaled by the configured scale factor.
@@ -1538,17 +1197,21 @@ class DatasetRecorderWrapper(gym.Wrapper):
         table.add_column("Key", justify="right", style=STYLE_KEY)
         table.add_column("Action", style=STYLE_ACTION)
         table.add_column("Index", style=STYLE_PATH)
+        input_source = (
+            self.input_source
+            if isinstance(self.input_source, HumanInputSource)
+            else HumanInputSource(self.env, self.key_lock, self.current_keys)
+        )
 
         if hasattr(self.env, "_vizdoom") and self.env._vizdoom:
             env_type = "VizDoom"
-            if self._vizdoom_buttons is None:
-                self._vizdoom_buttons = self._init_vizdoom_key_mapping()
+            vizdoom_buttons = input_source._init_vizdoom_key_mapping()
             for key, action_name in VIZDOOM_KEY_BINDINGS.items():
-                btn_idx = self._vizdoom_buttons.get(action_name)
+                btn_idx = vizdoom_buttons.get(action_name)
                 idx_str = f"btn {btn_idx}" if btn_idx is not None else ""
                 table.add_row(pygame.key.name(key), action_name, idx_str)
-            ml_idx = self._vizdoom_buttons.get("MOVE_LEFT")
-            mr_idx = self._vizdoom_buttons.get("MOVE_RIGHT")
+            ml_idx = vizdoom_buttons.get("MOVE_LEFT")
+            mr_idx = vizdoom_buttons.get("MOVE_RIGHT")
             table.add_row("alt+left", "MOVE_LEFT", f"btn {ml_idx}" if ml_idx is not None else "")
             table.add_row("alt+right", "MOVE_RIGHT", f"btn {mr_idx}" if mr_idx is not None else "")
         elif hasattr(self.env, "_stable_retro") and self.env._stable_retro:
@@ -1583,13 +1246,13 @@ class DatasetRecorderWrapper(gym.Wrapper):
                 table.add_row(*row)
         else:
             env_type = "Atari"
-            if self.key_to_action is None:
-                self._resolve_atari_key_mapping()
+            if input_source.key_to_action is None:
+                input_source._resolve_atari_key_mapping()
             try:
                 meanings = self.env.unwrapped.get_action_meanings()
             except (AttributeError, TypeError):
                 meanings = None
-            for key, action_idx in self.key_to_action.items():
+            for key, action_idx in input_source.key_to_action.items():
                 label = (
                     meanings[action_idx]
                     if meanings and action_idx < len(meanings)
@@ -2252,6 +1915,43 @@ def load_local_dataset(env_id):
     return load_from_disk(path)
 
 
+def load_recorded_dataset(env_id, streaming=False):
+    """Load a recorded dataset from local disk first, then from the Hub."""
+    local_dataset = load_local_dataset(env_id)
+    if local_dataset is not None:
+        return local_dataset, "local", len(local_dataset)
+
+    try:
+        hf_repo_id = env_id_to_hf_repo_id(env_id)
+        api = HfApi()
+        api.dataset_info(hf_repo_id)
+        dataset = load_dataset(hf_repo_id, split="train", streaming=streaming)
+    except Exception:
+        return None, None, None
+
+    if streaming:
+        try:
+            builder = load_dataset_builder(hf_repo_id)
+            total = builder.info.splits["train"].num_examples if builder.info.splits else None
+        except Exception:
+            total = None
+    else:
+        total = len(dataset)
+    return dataset, "hub", total
+
+
+def _print_missing_dataset(env_id):
+    console.print(f"[{STYLE_FAIL}]No dataset found for {env_id}.[/]")
+    console.print(f"  Local path: [{STYLE_PATH}]{get_local_dataset_path(env_id)}[/]")
+    console.print(f"  Record a session first: [{STYLE_CMD}]uv run python main.py record {env_id}[/]")
+
+
+def _is_step_row(row):
+    """Filter out terminal observation rows."""
+    action = row.get("actions", row.get("action"))
+    return not (action is None or (isinstance(action, list) and len(action) == 0))
+
+
 def _get_default_fps_for_env_id(env_id, metadata=None):
     """Infer a sensible FPS without instantiating the environment."""
     if metadata and metadata.get("fps") is not None:
@@ -2260,24 +1960,10 @@ def _get_default_fps_for_env_id(env_id, metadata=None):
         except (TypeError, ValueError):
             pass
 
-    retro_platforms = {
-        "Nes",
-        "GameBoy",
-        "Snes",
-        "GbAdvance",
-        "GbColor",
-        "Genesis",
-        "PCEngine",
-        "Saturn",
-        "32x",
-        "Sms",
-        "GameGear",
-        "SCD",
-    }
-
-    if any(env_id.endswith(f"-{plat}") for plat in retro_platforms) or "Atari2600" in env_id:
+    backend = classify_env_id(env_id)
+    if backend == "stable-retro":
         return CONFIG["fps_defaults"]["retro"]
-    if "Vizdoom" in env_id or "vizdoom" in env_id:
+    if backend == "vizdoom":
         return CONFIG["fps_defaults"]["vizdoom"]
     return CONFIG["fps_defaults"]["atari"]
 
@@ -2877,12 +2563,7 @@ def minari_export(env_id, dataset_name=None, author=None):
 
 def _detect_backend(env_id):
     """Return backend name for metadata tags."""
-    if env_id in set(_get_stableretro_envs()):
-        return "stable-retro"
-    elif "Vizdoom" in env_id:
-        return "vizdoom"
-    else:
-        return "atari"
+    return classify_env_id(env_id)
 
 
 def _capture_env_metadata(env):
@@ -2976,36 +2657,109 @@ def _size_category(n):
     return "n>1M"
 
 
-_BACKEND_LABELS = {
-    "atari": "Atari (ALE-py)",
-    "vizdoom": "VizDoom",
-    "stable-retro": "Stable-Retro",
-}
-
-
-def generate_dataset_card(dataset, env_id, repo_id, metadata=None):
-    """Generate or update the dataset card for a given dataset repo."""
-
-    frames = len(dataset)
-    episodes = len(set(dataset["episode_id"]))
-    backend = _detect_backend(env_id)
-
+def _current_hf_username():
     user_info = whoami()
-    curator = user_info.get("name") or user_info.get("user") or "unknown"
+    return user_info.get("name") or user_info.get("user") or "unknown"
 
-    # Extract provenance info from dataset columns
+
+def _provenance_from_dataset(dataset):
     collectors = sorted(set(dataset["collector"])) if "collector" in dataset.column_names else []
-    gymrec_versions = (
-        sorted(set(dataset["gymrec_version"])) if "gymrec_version" in dataset.column_names else []
-    )
+    versions = sorted(set(dataset["gymrec_version"])) if "gymrec_version" in dataset.column_names else []
+    return collectors, versions
 
-    # Build dynamic intro based on collectors
+
+def _provenance_from_metadata(metadata):
+    collectors = set()
+    versions = set()
+    if metadata and "recordings" in metadata:
+        for recording in metadata["recordings"]:
+            collectors.update(recording.get("collectors", []))
+            versions.update(recording.get("gymrec_versions", []))
+    return sorted(collectors), sorted(versions)
+
+
+def _dataset_card_intro(env_id, collectors):
     if collectors and collectors != ["human"]:
         collector_str = ", ".join(f"`{c}`" for c in collectors)
-        intro = f"Gameplay recordings (collected by: {collector_str}) from the Gymnasium environment `{env_id}`,"
-    else:
-        intro = f"Human gameplay recordings from the Gymnasium environment `{env_id}`,"
+        return (
+            f"Gameplay recordings (collected by: {collector_str}) from the Gymnasium "
+            f"environment `{env_id}`,"
+        )
+    return f"Human gameplay recordings from the Gymnasium environment `{env_id}`,"
 
+
+def _dataset_card_environment_lines(metadata, backend):
+    if not metadata:
+        return []
+
+    lines = [
+        "## Environment Configuration",
+        "",
+        "| Setting | Value |",
+        "|---------|-------|",
+    ]
+
+    for key, label in (
+        ("frameskip", "Frameskip"),
+        ("fps", "Target FPS"),
+        ("sticky_actions", "Sticky Actions"),
+        ("max_episode_steps", "Max Episode Steps"),
+    ):
+        if key in metadata:
+            lines.append(f"| {label} | {metadata[key]} |")
+
+    if "observation_shape" in metadata:
+        shape = metadata["observation_shape"]
+        lines.append(f"| Observation Shape | {' x '.join(str(s) for s in shape)} |")
+    if "observation_dtype" in metadata:
+        lines.append(f"| Observation Dtype | {metadata['observation_dtype']} |")
+    if "action_space_type" in metadata:
+        lines.append(f"| Action Space | {metadata['action_space_type']} |")
+    if "n_actions" in metadata:
+        lines.append(f"| Number of Actions | {metadata['n_actions']} |")
+    if "reward_range" in metadata:
+        rmin, rmax = metadata["reward_range"]
+        lines.append(f"| Reward Range | [{rmin}, {rmax}] |")
+
+    if backend == "stable-retro":
+        if metadata.get("retro_platform"):
+            lines.append(f"| Platform | {metadata['retro_platform']} |")
+        if metadata.get("retro_game"):
+            lines.append(f"| Game | {metadata['retro_game']} |")
+        if metadata.get("retro_buttons"):
+            named = [b for b in metadata["retro_buttons"][:8] if b is not None]
+            buttons = ", ".join(named)
+            total_named = sum(1 for b in metadata["retro_buttons"] if b is not None)
+            if total_named > 8:
+                buttons += f" (+{total_named - 8} more)"
+            lines.append(f"| Buttons | {buttons} |")
+    elif backend == "vizdoom":
+        if metadata.get("vizdoom_scenario"):
+            lines.append(f"| Scenario | {metadata['vizdoom_scenario']} |")
+        if "vizdoom_num_binary_buttons" in metadata:
+            lines.append(f"| Binary Buttons | {metadata['vizdoom_num_binary_buttons']} |")
+        if "vizdoom_num_delta_buttons" in metadata:
+            lines.append(f"| Delta Buttons | {metadata['vizdoom_num_delta_buttons']} |")
+
+    lines.append("")
+    return lines
+
+
+def render_dataset_card_content(
+    env_id,
+    repo_id,
+    frames,
+    episodes,
+    metadata=None,
+    collectors=None,
+    gymrec_versions=None,
+    curator=None,
+):
+    """Render the shared Hugging Face dataset card Markdown."""
+    backend = _detect_backend(env_id)
+    collectors = collectors or []
+    gymrec_versions = gymrec_versions or []
+    curator = curator or _current_hf_username()
     card_data = DatasetCardData(
         language="en",
         license=CONFIG["dataset"]["license"],
@@ -3015,15 +2769,14 @@ def generate_dataset_card(dataset, env_id, repo_id, metadata=None):
         pretty_name=f"{env_id} Gameplay Dataset",
     )
 
-    header = card_data.to_yaml()
     content_lines = [
         "---",
-        header,
+        card_data.to_yaml(),
         "---",
         "",
         f"# {env_id} Gameplay Dataset",
         "",
-        intro,
+        _dataset_card_intro(env_id, collectors),
         "captured using [gymrec](https://github.com/tsilva/gymrec).",
         "",
         "## Dataset Summary",
@@ -3033,7 +2786,7 @@ def generate_dataset_card(dataset, env_id, repo_id, metadata=None):
         f"| Total frames | {frames:,} |",
         f"| Episodes | {episodes:,} |",
         f"| Environment | `{env_id}` |",
-        f"| Backend | {_BACKEND_LABELS.get(backend, backend)} |",
+        f"| Backend | {BACKEND_LABELS.get(backend, backend)} |",
     ]
     if collectors:
         content_lines.append(f"| Collector(s) | {', '.join(collectors)} |")
@@ -3041,71 +2794,7 @@ def generate_dataset_card(dataset, env_id, repo_id, metadata=None):
         content_lines.append(f"| gymrec version(s) | {', '.join(gymrec_versions)} |")
     content_lines.append("")
 
-    # Add Environment Configuration section if metadata is available
-    if metadata:
-        content_lines.extend(
-            [
-                "## Environment Configuration",
-                "",
-                "| Setting | Value |",
-                "|---------|-------|",
-            ]
-        )
-
-        # Core settings
-        if "frameskip" in metadata:
-            content_lines.append(f"| Frameskip | {metadata['frameskip']} |")
-        if "fps" in metadata:
-            content_lines.append(f"| Target FPS | {metadata['fps']} |")
-        if "sticky_actions" in metadata:
-            content_lines.append(f"| Sticky Actions | {metadata['sticky_actions']} |")
-        if "max_episode_steps" in metadata:
-            content_lines.append(f"| Max Episode Steps | {metadata['max_episode_steps']} |")
-
-        # Observation space
-        if "observation_shape" in metadata:
-            shape = metadata["observation_shape"]
-            content_lines.append(f"| Observation Shape | {' × '.join(str(s) for s in shape)} |")
-        if "observation_dtype" in metadata:
-            content_lines.append(f"| Observation Dtype | {metadata['observation_dtype']} |")
-
-        # Action space
-        if "action_space_type" in metadata:
-            content_lines.append(f"| Action Space | {metadata['action_space_type']} |")
-        if "n_actions" in metadata:
-            content_lines.append(f"| Number of Actions | {metadata['n_actions']} |")
-
-        # Reward range
-        if "reward_range" in metadata:
-            rmin, rmax = metadata["reward_range"]
-            content_lines.append(f"| Reward Range | [{rmin}, {rmax}] |")
-
-        # Backend-specific info
-        if backend == "stable-retro":
-            if "retro_platform" in metadata and metadata["retro_platform"]:
-                content_lines.append(f"| Platform | {metadata['retro_platform']} |")
-            if "retro_game" in metadata and metadata["retro_game"]:
-                content_lines.append(f"| Game | {metadata['retro_game']} |")
-            if "retro_buttons" in metadata and metadata["retro_buttons"]:
-                named = [b for b in metadata["retro_buttons"][:8] if b is not None]
-                buttons = ", ".join(named)
-                total_named = sum(1 for b in metadata["retro_buttons"] if b is not None)
-                if total_named > 8:
-                    buttons += f" (+{total_named - 8} more)"
-                content_lines.append(f"| Buttons | {buttons} |")
-
-        elif backend == "vizdoom":
-            if "vizdoom_scenario" in metadata and metadata["vizdoom_scenario"]:
-                content_lines.append(f"| Scenario | {metadata['vizdoom_scenario']} |")
-            if "vizdoom_num_binary_buttons" in metadata:
-                content_lines.append(
-                    f"| Binary Buttons | {metadata['vizdoom_num_binary_buttons']} |"
-                )
-            if "vizdoom_num_delta_buttons" in metadata:
-                content_lines.append(f"| Delta Buttons | {metadata['vizdoom_num_delta_buttons']} |")
-
-        content_lines.append("")
-
+    content_lines.extend(_dataset_card_environment_lines(metadata, backend))
     content_lines.extend(
         [
             "## Dataset Structure",
@@ -3113,192 +2802,7 @@ def generate_dataset_card(dataset, env_id, repo_id, metadata=None):
             "Minari-compatible flat table format. Use `minari-export` for native [Minari](https://minari.farama.org/) HDF5 format.",
             "",
             "Each episode has N step rows plus one terminal observation row (N+1 pattern).",
-            "The terminal observation is the final state after the last step — it has an empty action",
-            "and null values for rewards/terminations/truncations/infos.",
-            "",
-            "- **episode_id** (`binary(16)`): Unique UUID identifier for each episode (16 bytes, universally unique across all recordings)",
-            "- **seed** (`int` or `null`): RNG seed used for `env.reset()` (set on first row of each episode, `null` on other rows)",
-            "- **observations** (`Image`): RGB frame from the environment",
-            "- **actions** (`list`): Action taken at this step (`[]` for terminal observations)",
-            "- **rewards** (`float` or `null`): Reward received (`null` on terminal observation rows)",
-            "- **terminations** (`bool` or `null`): Whether the episode terminated naturally (`null` on terminal observation rows)",
-            "- **truncations** (`bool` or `null`): Whether the episode was truncated (`null` on terminal observation rows)",
-            "- **infos** (`str` or `null`): Additional environment info as JSON (`null` on terminal observation rows)",
-            "- **session_id** (`binary(16)`): UUID grouping all episodes from one `gymrec record` run",
-            '- **collector** (`string`): Who collected the data (`"human"`, `"random"`, or future agent names)',
-            '- **gymrec_version** (`string`): Version of gymrec used to record (e.g. `"0.1.0+abc1234"`)',
-            "",
-            "## Usage",
-            "",
-            "```python",
-            "from datasets import load_dataset",
-            f'ds = load_dataset("{repo_id}")',
-            "```",
-            "",
-            "## About",
-            "",
-            "Recorded with [gymrec](https://github.com/tsilva/gymrec).",
-            f"Curated by: {curator}",
-        ]
-    )
-    card = DatasetCard("\n".join(content_lines))
-
-    card.push_to_hub(
-        repo_id=repo_id,
-        repo_type="dataset",
-        commit_message=CONFIG["dataset"]["commit_message"],
-    )
-
-
-def _build_dataset_card_content(env_id, repo_id, api, new_frames, new_episodes, repo_exists):
-    """Build dataset card content string for an append-only upload.
-
-    If the repo exists, downloads the current README and parses existing frame/episode
-    counts to compute running totals. Otherwise starts from new_frames/new_episodes.
-    Returns the full card content string (does not push to Hub).
-    """
-    import re
-
-    total_frames = new_frames
-    total_episodes = new_episodes
-
-    if repo_exists:
-        try:
-            readme_path = hf_hub_download(
-                repo_id=repo_id,
-                repo_type="dataset",
-                filename="README.md",
-            )
-            with open(readme_path) as f:
-                readme_content = f.read()
-            frames_match = re.search(r"\|\s*Total frames\s*\|\s*([\d,]+)\s*\|", readme_content)
-            episodes_match = re.search(r"\|\s*Episodes\s*\|\s*([\d,]+)\s*\|", readme_content)
-            if frames_match:
-                total_frames += int(frames_match.group(1).replace(",", ""))
-            if episodes_match:
-                total_episodes += int(episodes_match.group(1).replace(",", ""))
-        except Exception:
-            pass
-
-    backend = _detect_backend(env_id)
-    user_info = whoami()
-    curator = user_info.get("name") or user_info.get("user") or "unknown"
-    metadata = load_local_metadata(env_id)
-
-    # Extract provenance info from local metadata recordings
-    all_collectors = set()
-    all_versions = set()
-    if metadata and "recordings" in metadata:
-        for rec in metadata["recordings"]:
-            for c in rec.get("collectors", []):
-                all_collectors.add(c)
-            for v in rec.get("gymrec_versions", []):
-                all_versions.add(v)
-    collectors = sorted(all_collectors)
-    gymrec_versions = sorted(all_versions)
-
-    # Build dynamic intro based on collectors
-    if collectors and collectors != ["human"]:
-        collector_str = ", ".join(f"`{c}`" for c in collectors)
-        intro = f"Gameplay recordings (collected by: {collector_str}) from the Gymnasium environment `{env_id}`,"
-    else:
-        intro = f"Human gameplay recordings from the Gymnasium environment `{env_id}`,"
-
-    card_data = DatasetCardData(
-        language="en",
-        license=CONFIG["dataset"]["license"],
-        task_categories=CONFIG["dataset"]["task_categories"],
-        tags=["gymnasium", backend, env_id],
-        size_categories=[_size_category(total_frames)],
-        pretty_name=f"{env_id} Gameplay Dataset",
-    )
-
-    header = card_data.to_yaml()
-    content_lines = [
-        "---",
-        header,
-        "---",
-        "",
-        f"# {env_id} Gameplay Dataset",
-        "",
-        intro,
-        "captured using [gymrec](https://github.com/tsilva/gymrec).",
-        "",
-        "## Dataset Summary",
-        "",
-        "| Stat | Value |",
-        "|------|-------|",
-        f"| Total frames | {total_frames:,} |",
-        f"| Episodes | {total_episodes:,} |",
-        f"| Environment | `{env_id}` |",
-        f"| Backend | {_BACKEND_LABELS.get(backend, backend)} |",
-    ]
-    if collectors:
-        content_lines.append(f"| Collector(s) | {', '.join(collectors)} |")
-    if gymrec_versions:
-        content_lines.append(f"| gymrec version(s) | {', '.join(gymrec_versions)} |")
-    content_lines.append("")
-
-    if metadata:
-        content_lines.extend(
-            [
-                "## Environment Configuration",
-                "",
-                "| Setting | Value |",
-                "|---------|-------|",
-            ]
-        )
-        if "frameskip" in metadata:
-            content_lines.append(f"| Frameskip | {metadata['frameskip']} |")
-        if "fps" in metadata:
-            content_lines.append(f"| Target FPS | {metadata['fps']} |")
-        if "sticky_actions" in metadata:
-            content_lines.append(f"| Sticky Actions | {metadata['sticky_actions']} |")
-        if "max_episode_steps" in metadata:
-            content_lines.append(f"| Max Episode Steps | {metadata['max_episode_steps']} |")
-        if "observation_shape" in metadata:
-            shape = metadata["observation_shape"]
-            content_lines.append(f"| Observation Shape | {' × '.join(str(s) for s in shape)} |")
-        if "observation_dtype" in metadata:
-            content_lines.append(f"| Observation Dtype | {metadata['observation_dtype']} |")
-        if "action_space_type" in metadata:
-            content_lines.append(f"| Action Space | {metadata['action_space_type']} |")
-        if "n_actions" in metadata:
-            content_lines.append(f"| Number of Actions | {metadata['n_actions']} |")
-        if "reward_range" in metadata:
-            rmin, rmax = metadata["reward_range"]
-            content_lines.append(f"| Reward Range | [{rmin}, {rmax}] |")
-        if backend == "stable-retro":
-            if "retro_platform" in metadata and metadata["retro_platform"]:
-                content_lines.append(f"| Platform | {metadata['retro_platform']} |")
-            if "retro_game" in metadata and metadata["retro_game"]:
-                content_lines.append(f"| Game | {metadata['retro_game']} |")
-            if "retro_buttons" in metadata and metadata["retro_buttons"]:
-                named = [b for b in metadata["retro_buttons"][:8] if b is not None]
-                buttons = ", ".join(named)
-                total_named = sum(1 for b in metadata["retro_buttons"] if b is not None)
-                if total_named > 8:
-                    buttons += f" (+{total_named - 8} more)"
-                content_lines.append(f"| Buttons | {buttons} |")
-        elif backend == "vizdoom":
-            if "vizdoom_scenario" in metadata and metadata["vizdoom_scenario"]:
-                content_lines.append(f"| Scenario | {metadata['vizdoom_scenario']} |")
-            if "vizdoom_num_binary_buttons" in metadata:
-                content_lines.append(
-                    f"| Binary Buttons | {metadata['vizdoom_num_binary_buttons']} |"
-                )
-            if "vizdoom_num_delta_buttons" in metadata:
-                content_lines.append(f"| Delta Buttons | {metadata['vizdoom_num_delta_buttons']} |")
-        content_lines.append("")
-
-    content_lines.extend(
-        [
-            "## Dataset Structure",
-            "",
-            "Minari-compatible flat table format. Use `minari-export` for native [Minari](https://minari.farama.org/) HDF5 format.",
-            "",
-            "Each episode has N step rows plus one terminal observation row (N+1 pattern).",
-            "The terminal observation is the final state after the last step — it has an empty action",
+            "The terminal observation is the final state after the last step - it has an empty action",
             "and null values for rewards/terminations/truncations/infos.",
             "",
             "- **episode_id** (`binary(16)`): Unique UUID identifier for each episode (16 bytes, universally unique across all recordings)",
@@ -3327,6 +2831,76 @@ def _build_dataset_card_content(env_id, repo_id, api, new_frames, new_episodes, 
         ]
     )
     return "\n".join(content_lines)
+
+
+def generate_dataset_card(dataset, env_id, repo_id, metadata=None):
+    """Generate or update the dataset card for a given dataset repo."""
+    collectors, gymrec_versions = _provenance_from_dataset(dataset)
+    card = DatasetCard(
+        render_dataset_card_content(
+            env_id,
+            repo_id,
+            frames=len(dataset),
+            episodes=len(set(dataset["episode_id"])),
+            metadata=metadata,
+            collectors=collectors,
+            gymrec_versions=gymrec_versions,
+        )
+    )
+    card.push_to_hub(
+        repo_id=repo_id,
+        repo_type="dataset",
+        commit_message=CONFIG["dataset"]["commit_message"],
+    )
+
+
+def _read_existing_dataset_card_counts(repo_id):
+    """Return frame and episode counts parsed from an existing Hub README."""
+    import re
+
+    try:
+        readme_path = hf_hub_download(
+            repo_id=repo_id,
+            repo_type="dataset",
+            filename="README.md",
+        )
+        with open(readme_path) as f:
+            readme_content = f.read()
+        frames_match = re.search(r"\|\s*Total frames\s*\|\s*([\d,]+)\s*\|", readme_content)
+        episodes_match = re.search(r"\|\s*Episodes\s*\|\s*([\d,]+)\s*\|", readme_content)
+        frames = int(frames_match.group(1).replace(",", "")) if frames_match else 0
+        episodes = int(episodes_match.group(1).replace(",", "")) if episodes_match else 0
+        return frames, episodes
+    except Exception:
+        return 0, 0
+
+
+def _build_dataset_card_content(env_id, repo_id, api, new_frames, new_episodes, repo_exists):
+    """Build dataset card content string for an append-only upload.
+
+    If the repo exists, downloads the current README and parses existing frame/episode
+    counts to compute running totals. Otherwise starts from new_frames/new_episodes.
+    Returns the full card content string (does not push to Hub).
+    """
+    total_frames = new_frames
+    total_episodes = new_episodes
+
+    if repo_exists:
+        existing_frames, existing_episodes = _read_existing_dataset_card_counts(repo_id)
+        total_frames += existing_frames
+        total_episodes += existing_episodes
+
+    metadata = load_local_metadata(env_id)
+    collectors, gymrec_versions = _provenance_from_metadata(metadata)
+    return render_dataset_card_content(
+        env_id,
+        repo_id,
+        frames=total_frames,
+        episodes=total_episodes,
+        metadata=metadata,
+        collectors=collectors,
+        gymrec_versions=gymrec_versions,
+    )
 
 
 def _create_env__stableretro(env_id):
@@ -3366,14 +2940,16 @@ def _create_env__alepy(env_id):
 def create_env(env_id):
     """Create a Gymnasium environment with the appropriate backend."""
 
-    if env_id in set(_get_stableretro_envs()):
+    stable_retro_envs = set(_get_stableretro_envs())
+    backend = classify_env_id(env_id, stable_retro_envs=stable_retro_envs)
+    if backend == "stable-retro":
         env = _create_env__stableretro(env_id)
-    elif "Vizdoom" in env_id:
+    elif backend == "vizdoom":
         env = _create_env__vizdoom(env_id)
     else:
         env = _create_env__alepy(env_id)
 
-    env._env_id = env_id.replace("-", "_")
+    env._env_id = env_id
     return env
 
 
@@ -3439,25 +3015,10 @@ def get_default_fps(env):
 
     if base_fps is None:
         env_id = getattr(env, "_env_id", "")
-
-        retro_platforms = {
-            "Nes",
-            "GameBoy",
-            "Snes",
-            "GbAdvance",
-            "GbColor",
-            "Genesis",
-            "PCEngine",
-            "Saturn",
-            "32x",
-            "Sms",
-            "GameGear",
-            "SCD",
-        }
-
-        if any(env_id.endswith(f"-{plat}") for plat in retro_platforms) or "Atari2600" in env_id:
+        backend = classify_env_id(env_id)
+        if backend == "stable-retro":
             base_fps = CONFIG["fps_defaults"]["retro"]
-        elif "Vizdoom" in env_id or "vizdoom" in env_id:
+        elif backend == "vizdoom":
             base_fps = CONFIG["fps_defaults"]["vizdoom"]
         else:
             base_fps = CONFIG["fps_defaults"]["atari"]
@@ -3518,30 +3079,11 @@ def _get_vizdoom_envs() -> list[str]:
 
 def _get_env_platform(env_id: str) -> str:
     """Determine the platform type for an env_id."""
-    retro_platforms = {
-        "Nes",
-        "GameBoy",
-        "Snes",
-        "GbAdvance",
-        "GbColor",
-        "Genesis",
-        "PCEngine",
-        "Saturn",
-        "32x",
-        "Sms",
-        "GameGear",
-        "SCD",
-        "Atari2600",
-    }
-
-    if env_id.startswith("ALE/"):
-        return "Atari"
-    elif env_id.startswith("Vizdoom") or env_id.startswith("vizdoom"):
-        return "VizDoom"
-    elif any(env_id.endswith(f"-{plat}") for plat in retro_platforms):
-        return "Stable-Retro"
-    else:
-        return "Atari"  # Default fallback
+    return {
+        "atari": "Atari",
+        "vizdoom": "VizDoom",
+        "stable-retro": "Stable-Retro",
+    }[classify_env_id(env_id)]
 
 
 def select_environment_interactive(available_recordings_only: bool = False) -> str:
@@ -3834,15 +3376,7 @@ def _worker_collect_episodes(
         if fps is None:
             fps = get_default_fps(env)
 
-        if agent_type == "random":
-            policy = RandomPolicy(env.action_space)
-        elif agent_type == "mario":
-            policy = MarioRightJumpPolicy(env.action_space)
-        elif agent_type == "breakout":
-            policy = BreakoutCatcherPolicy(env.action_space, env=env)
-        else:
-            raise ValueError(f"Unknown agent type: {agent_type}")
-
+        policy = create_agent_policy(agent_type, env)
         input_source = AgentInputSource(policy, headless=True)
         recorder = DatasetRecorderWrapper(
             env, input_source=input_source, headless=True, collector=agent_type
@@ -4100,7 +3634,7 @@ async def main():
         "--agent",
         type=str,
         default="human",
-        choices=["human", "random", "mario", "breakout"],
+        choices=["human", *AGENT_POLICY_FACTORIES.keys()],
         help=(
             "Input source: human, random, mario, or deterministic breakout policy (default: human)"
         ),
@@ -4311,7 +3845,7 @@ async def main():
             )
         else:
             # Agent mode
-            if args.agent not in ("random", "mario", "breakout"):
+            if args.agent not in AGENT_POLICY_FACTORIES:
                 console.print(f"[{STYLE_FAIL}]Error: Unknown agent type '{args.agent}'[/]")
                 return
 
@@ -4366,12 +3900,7 @@ async def main():
 
             else:
                 # Single-worker agent path with progress bar
-                if args.agent == "random":
-                    policy = RandomPolicy(env.action_space)
-                elif args.agent == "mario":
-                    policy = MarioRightJumpPolicy(env.action_space)
-                elif args.agent == "breakout":
-                    policy = BreakoutCatcherPolicy(env.action_space, env=env)
+                policy = create_agent_policy(args.agent, env)
                 input_source = AgentInputSource(policy, headless=args.headless)
 
                 recorder = DatasetRecorderWrapper(
@@ -4439,45 +3968,17 @@ async def main():
                     f"To upload later: [{STYLE_CMD}]uv run python main.py upload {env_id}[/]"
                 )
     elif args.command == "playback":
-        loaded_dataset = load_local_dataset(env_id)
-        if loaded_dataset is not None:
+        loaded_dataset, source, total = load_recorded_dataset(env_id, streaming=True)
+        if loaded_dataset is None:
+            _print_missing_dataset(env_id)
+            return
+        if source == "local":
             console.print(
                 f"[{STYLE_INFO}]Playing back from local dataset ({len(loaded_dataset)} frames)[/]"
             )
-            total = len(loaded_dataset)
         else:
-            console.print("[dim]No local dataset found, trying Hugging Face Hub...[/]")
-            try:
-                hf_repo_id = env_id_to_hf_repo_id(env_id)
-                api = HfApi()
-                api.dataset_info(hf_repo_id)
-                loaded_dataset = load_dataset(hf_repo_id, split="train", streaming=True)
-            except Exception:
-                loaded_dataset = None
-            if loaded_dataset is None:
-                console.print(f"[{STYLE_FAIL}]No dataset found for {env_id}.[/]")
-                console.print(f"  Local path: [{STYLE_PATH}]{get_local_dataset_path(env_id)}[/]")
-                console.print(
-                    f"  Record a session first: [{STYLE_CMD}]uv run python main.py record {env_id}[/]"
-                )
-                return
-            try:
-                builder = load_dataset_builder(hf_repo_id)
-                if builder.info.splits and "train" in builder.info.splits:
-                    total = builder.info.splits["train"].num_examples
-                else:
-                    total = None
-            except Exception:
-                total = None
             console.print(f"[{STYLE_INFO}]Playing back streaming from Hugging Face Hub[/]")
         recorder = DatasetRecorderWrapper(env)
-
-        def _is_step_row(row):
-            """Filter out terminal observation rows."""
-            action = row.get("actions", row.get("action"))
-            if action is None or (isinstance(action, list) and len(action) == 0):
-                return False
-            return True
 
         if args.verify:
             recorded_data = (
@@ -4498,33 +3999,20 @@ async def main():
             )
             await recorder.replay(actions, fps=fps, total=total)
     elif args.command == "video":
-        loaded_dataset = load_local_dataset(env_id)
-        if loaded_dataset is not None:
+        loaded_dataset, source, total = load_recorded_dataset(env_id, streaming=False)
+        if loaded_dataset is None:
+            _print_missing_dataset(env_id)
+            return
+        if source == "local":
             console.print(
                 f"[{STYLE_INFO}]Loading local dataset for video export "
-                f"({len(loaded_dataset)} frames)[/]"
+                f"({total} frames)[/]"
             )
         else:
-            console.print("[dim]No local dataset found, downloading from Hugging Face Hub...[/]")
-            try:
-                hf_repo_id = env_id_to_hf_repo_id(env_id)
-                api = HfApi()
-                api.dataset_info(hf_repo_id)
-                loaded_dataset = load_dataset(hf_repo_id, split="train")
-                console.print(
-                    f"[{STYLE_INFO}]Loaded dataset from Hugging Face Hub "
-                    f"({len(loaded_dataset)} frames)[/]"
-                )
-            except Exception:
-                loaded_dataset = None
-
-        if loaded_dataset is None:
-            console.print(f"[{STYLE_FAIL}]No dataset found for {env_id}.[/]")
-            console.print(f"  Local path: [{STYLE_PATH}]{get_local_dataset_path(env_id)}[/]")
             console.print(
-                f"  Record a session first: [{STYLE_CMD}]uv run python main.py record {env_id}[/]"
+                f"[{STYLE_INFO}]Loaded dataset from Hugging Face Hub "
+                f"({total} frames)[/]"
             )
-            return
 
         export_dataset_video(
             env_id,

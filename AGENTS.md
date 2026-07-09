@@ -17,35 +17,17 @@ cp .env.example .env
 # Edit .env and add your HF_TOKEN
 ```
 
-Dependencies are defined in `pyproject.toml` and include Python 3.12+, gymnasium, pygame, datasets, and platform-specific game engines (ale-py, vizdoom, stable-retro).
+Dependencies are defined in `pyproject.toml` and include Python 3.12+, gymnasium, pygame, datasets, and platform-specific game engines (ale-py, vizdoom, stable-retro-turbo).
 
-### stable-retro on Apple Silicon (IMPORTANT)
+### Stable-Retro Runtime
 
-The PyPI `stable-retro==0.9.9` arm64 wheel is **mislabeled** - it ships an x86_64 binary inside an arm64-tagged wheel. This is an upstream packaging bug.
+Use the PyPI `stable-retro-turbo` package for Stable-Retro support. It publishes native macOS arm64 wheels and keeps the upstream-compatible import name:
 
-**Current setup:** A pre-built native ARM64 wheel is committed in `wheels/` and wired via `[tool.uv.sources]` in pyproject.toml (macOS-only marker). Running `uv sync` installs the correct binary automatically - no manual steps needed.
+```python
+import stable_retro as retro
+```
 
-**If the wheel needs to be rebuilt** (e.g. new Python version, new stable-retro release):
-
-1. Clone with submodules: `git clone --recursive https://github.com/Farama-Foundation/stable-retro.git /tmp/stable-retro-build`
-2. Disable the `pce` core - in `CMakeLists.txt`, wrap `add_core(pce mednafen_pce_fast)` with `if(NOT APPLE) ... endif()` (its bundled zlib has a macro conflict with macOS SDK headers)
-3. Configure with **Clang** (Homebrew GCC uses `--exclude-libs` which Apple's ld rejects):
-   ```bash
-   cd /tmp/stable-retro-build
-   cmake . -G "Unix Makefiles" \
-     -DCMAKE_C_COMPILER=/usr/bin/cc \
-     -DCMAKE_CXX_COMPILER=/usr/bin/c++ \
-     -DPYEXT_SUFFIX=.cpython-312-darwin.so
-   ```
-4. Build: `make -j8 stable_retro`
-5. Build wheel: `.venv/bin/python -m pip wheel . --no-build-isolation -w /tmp/`
-6. Copy wheel to `wheels/` and update the path in `[tool.uv.sources]`
-
-**Key pitfalls:**
-- cmake auto-detects Homebrew GCC if installed (`/opt/homebrew/bin/gcc-13`) - always force Clang with `-DCMAKE_C_COMPILER=/usr/bin/cc`
-- The `pce` (PC Engine/mednafen) core fails on macOS due to `zutil.h` redefining `fdopen` as `NULL`, conflicting with system `_stdio.h`
-- `uv sync` will silently replace a manually-installed wheel with the broken PyPI one - always use `[tool.uv.sources]` to pin
-- The wheel is ~88MB and committed to git via a gitignore exception (`!wheels/stable_retro-*.whl`)
+`pyproject.toml` pins `stable-retro-turbo` and exempts only that package from the global `exclude-newer = "7 days"` policy because the Python 3.12 macOS arm64 wheels are from the current PyPI release line. Do not reintroduce the old committed-wheel or `stable-retro-apple-silicon` setup unless explicitly requested.
 
 ## Core Commands
 

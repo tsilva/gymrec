@@ -65,7 +65,7 @@ Playback uses the local dataset first, then falls back to the Hugging Face Hub d
 - Local datasets are stored under `~/.gymrec/datasets` by default.
 - `config.toml` controls display scale, FPS defaults, local storage, dataset metadata, and overlay defaults.
 - `keymappings.toml` controls Atari, VizDoom, and Stable-Retro keyboard bindings.
-- On Apple Silicon, `uv sync` installs the committed native Stable-Retro wheel through the project configuration.
+- Stable-Retro support uses `stable-retro-turbo`, which keeps the `stable_retro` import name and provides PyPI wheels for macOS arm64.
 - `ffmpeg` must be available on `PATH` for `video` exports.
 - `minari-export` requires Minari; install it with `uv sync --extra minari` or `uv pip install 'minari>=0.5.0'`.
 
