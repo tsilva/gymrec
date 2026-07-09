@@ -2364,21 +2364,22 @@ class DatasetRecorderWrapper(gym.Wrapper):
             return new_action
         return action
 
-    async def replay(self, actions, fps=None, total=None, verify=False):
+    async def replay(self, actions=None, fps=None, total=None, verify=False, episodes=None):
         if fps is None:
             fps = get_default_fps(self.env)
         self._fps = fps
         self._playback_frame_index = 0
         self._playback_total = total
-        obs, _ = self.env.reset()
-        self._ensure_screen(obs)
-        self._render_frame(obs)
-        self._print_keymappings()
 
         mse_threshold = 5.0
         verify_metrics = [] if verify else None
         reward_mismatches = 0
         terminal_mismatches = 0
+        if episodes is None:
+            episodes = [{"seed": None, "items": actions or []}]
+        printed_keymappings = False
+        frame_number = 0
+        stop_replay = False
 
         with Progress(
             TextColumn("[progress.description]{task.description}"),
@@ -2389,67 +2390,82 @@ class DatasetRecorderWrapper(gym.Wrapper):
         ) as progress:
             ptask = progress.add_task("Replaying", total=total)
             try:
-                for frame_number, item in enumerate(actions, start=1):
-                    frame_start = time.monotonic()
-                    if not self._input_loop():
+                for episode in episodes:
+                    if stop_replay:
                         break
-
-                    self._playback_frame_index = frame_number
-
-                    if verify:
-                        (
-                            action,
-                            recorded_image,
-                            recorded_reward,
-                            recorded_terminated,
-                            recorded_truncated,
-                        ) = item
-                    else:
-                        action = item
-
-                    action = self._convert_action(action)
-                    obs, reward, terminated, truncated, _ = self.env.step(action)
+                    seed = episode.get("seed")
+                    items = episode.get("items", [])
+                    reset_kwargs = {} if seed is None else {"seed": int(seed)}
+                    obs, _ = self.env.reset(**reset_kwargs)
+                    self._ensure_screen(obs)
                     self._render_frame(obs)
+                    if not printed_keymappings:
+                        self._print_keymappings()
+                        printed_keymappings = True
 
-                    if verify:
-                        obs_image = _extract_observation_image(obs)
-                        if obs_image.dtype != np.uint8:
-                            obs_image = obs_image.astype(np.uint8)
-                        recorded_array = np.array(recorded_image, dtype=np.uint8)
+                    for item in items:
+                        frame_start = time.monotonic()
+                        if not self._input_loop():
+                            stop_replay = True
+                            break
 
-                        if obs_image.shape == recorded_array.shape:
-                            mse = float(
-                                np.mean(
-                                    (
-                                        obs_image.astype(np.float32)
-                                        - recorded_array.astype(np.float32)
-                                    )
-                                    ** 2
-                                )
-                            )
+                        frame_number += 1
+                        self._playback_frame_index = frame_number
+
+                        if verify:
+                            (
+                                action,
+                                recorded_image,
+                                recorded_reward,
+                                recorded_terminated,
+                                recorded_truncated,
+                            ) = item
                         else:
-                            console.print(
-                                f"  [yellow]Warning:[/] shape mismatch at frame {len(verify_metrics)}: "
-                                f"obs={obs_image.shape} vs recorded={recorded_array.shape}, skipping comparison"
-                            )
-                            mse = None
+                            action = item
 
-                        if float(reward) != float(recorded_reward):
-                            reward_mismatches += 1
-                        if bool(terminated) != bool(recorded_terminated) or bool(truncated) != bool(
-                            recorded_truncated
-                        ):
-                            terminal_mismatches += 1
+                        action = self._convert_action(action)
+                        obs, reward, terminated, truncated, _ = self.env.step(action)
+                        self._render_frame(obs)
 
-                        verify_metrics.append(mse)
+                        if verify:
+                            obs_image = _extract_observation_image(obs)
+                            if obs_image.dtype != np.uint8:
+                                obs_image = obs_image.astype(np.uint8)
+                            recorded_array = np.array(recorded_image, dtype=np.uint8)
 
-                    elapsed = time.monotonic() - frame_start
-                    remaining = (1.0 / self._fps) - elapsed
-                    if remaining > 0:
-                        await asyncio.sleep(remaining)
-                    else:
-                        await asyncio.sleep(0)
-                    progress.advance(ptask)
+                            if obs_image.shape == recorded_array.shape:
+                                mse = float(
+                                    np.mean(
+                                        (
+                                            obs_image.astype(np.float32)
+                                            - recorded_array.astype(np.float32)
+                                        )
+                                        ** 2
+                                    )
+                                )
+                            else:
+                                console.print(
+                                    f"  [yellow]Warning:[/] shape mismatch at frame {len(verify_metrics)}: "
+                                    f"obs={obs_image.shape} vs recorded={recorded_array.shape}, skipping comparison"
+                                )
+                                mse = None
+
+                            if float(reward) != float(recorded_reward):
+                                reward_mismatches += 1
+                            if bool(terminated) != bool(recorded_terminated) or bool(
+                                truncated
+                            ) != bool(recorded_truncated):
+                                terminal_mismatches += 1
+
+                            verify_metrics.append(mse)
+
+                        elapsed = time.monotonic() - frame_start
+                        remaining = (1.0 / self._fps) - elapsed
+                        if remaining > 0:
+                            await asyncio.sleep(remaining)
+                        else:
+                            await asyncio.sleep(0)
+                        progress.advance(ptask)
             finally:
                 self._playback_frame_index = None
                 self._playback_total = None
@@ -2927,6 +2943,68 @@ def _ordered_episode_rows(dataset):
         row_indices_by_episode[key].append(row_index)
 
     return episode_keys, row_indices_by_episode
+
+
+def _episode_reset_seed(dataset, row_indices):
+    """Return the first usable reset seed recorded for an episode."""
+    for row_index in row_indices:
+        seed = _get_row_value(dataset[row_index], "seed")
+        if seed is not None:
+            try:
+                return int(seed)
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+def _iter_playback_items(dataset, row_indices, verify=False):
+    """Yield replay items for one episode, excluding terminal observation rows."""
+    for position, row_index in enumerate(row_indices):
+        row = dataset[row_index]
+        if not _is_step_row(row):
+            continue
+        if verify:
+            if position + 1 >= len(row_indices):
+                episode_key = _normalize_episode_id(_get_row_value(row, "episode_id"))
+                raise ValueError(
+                    f"Episode {episode_key} is missing the terminal observation row"
+                )
+            next_row = dataset[row_indices[position + 1]]
+            yield (
+                _get_row_action(row),
+                _get_row_observation(next_row),
+                _get_row_value(row, "rewards"),
+                _get_row_value(row, "terminations"),
+                _get_row_value(row, "truncations"),
+            )
+        else:
+            yield _get_row_action(row)
+
+
+def _dataset_playback_episodes(dataset, verify=False):
+    """Group a flat N+1 dataset into replayable episodes."""
+    episode_keys, row_indices_by_episode = _ordered_episode_rows(dataset)
+    episodes = []
+    total_steps = 0
+
+    for episode_key in episode_keys:
+        row_indices = tuple(row_indices_by_episode[episode_key])
+        step_count = 0
+        for row_index in row_indices:
+            if _is_step_row(dataset[row_index]):
+                step_count += 1
+        if step_count == 0:
+            continue
+
+        episodes.append(
+            {
+                "seed": _episode_reset_seed(dataset, row_indices),
+                "items": _iter_playback_items(dataset, row_indices, verify=verify),
+            }
+        )
+        total_steps += step_count
+
+    return episodes, total_steps
 
 
 def _parse_episode_range(value, total_episodes):
@@ -5136,22 +5214,15 @@ async def main():
             console.print(f"[{STYLE_INFO}]Playing back from Hugging Face Hub[/]")
         recorder = DatasetRecorderWrapper(env, storage_format=STORAGE_FORMAT_IMAGES)
 
-        if args.verify:
-            recorded_data = (
-                (
-                    _get_row_action(row),
-                    _get_row_observation(row),
-                    _get_row_value(row, "rewards"),
-                    _get_row_value(row, "terminations"),
-                    _get_row_value(row, "truncations"),
-                )
-                for row in loaded_dataset
-                if _is_step_row(row)
-            )
-            await recorder.replay(recorded_data, fps=fps, total=total, verify=True)
-        else:
-            actions = (_get_row_action(row) for row in loaded_dataset if _is_step_row(row))
-            await recorder.replay(actions, fps=fps, total=total)
+        playback_episodes, playback_total = _dataset_playback_episodes(
+            loaded_dataset, verify=args.verify
+        )
+        await recorder.replay(
+            fps=fps,
+            total=playback_total,
+            verify=args.verify,
+            episodes=playback_episodes,
+        )
     elif args.command == "video":
         loaded_dataset, source, total = load_recorded_dataset(env_id, streaming=False)
         if loaded_dataset is None:

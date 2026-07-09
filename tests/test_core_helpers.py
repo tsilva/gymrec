@@ -1,5 +1,9 @@
 import argparse
+import asyncio
+import uuid
 
+import gymnasium as gym
+import numpy as np
 import pytest
 
 import main
@@ -16,7 +20,31 @@ class DatasetLike:
         return len(next(iter(self._columns.values())))
 
     def __getitem__(self, key):
+        if isinstance(key, int):
+            return {name: values[key] for name, values in self._columns.items()}
         return self._columns[key]
+
+
+class OneStepTerminalEnv(gym.Env):
+    metadata = {}
+    action_space = gym.spaces.Discrete(1)
+    observation_space = gym.spaces.Box(0, 255, shape=(1, 1, 3), dtype=np.uint8)
+
+    def __init__(self):
+        self.done = False
+        self.reset_seeds = []
+
+    def reset(self, *, seed=None, options=None):
+        super().reset(seed=seed)
+        self.done = False
+        self.reset_seeds.append(seed)
+        return np.zeros((1, 1, 3), dtype=np.uint8), {}
+
+    def step(self, action):
+        if self.done:
+            raise RuntimeError("step called after terminal state without reset")
+        self.done = True
+        return np.ones((1, 1, 3), dtype=np.uint8), 0.0, True, False, {}
 
 
 def test_env_id_encoding_round_trips_special_characters():
@@ -52,6 +80,29 @@ def test_dataset_storage_format_uses_current_columns():
         main._dataset_storage_format(DatasetLike({"observations": ["frame.webp"]}))
         == main.STORAGE_FORMAT_IMAGES
     )
+
+
+def test_dataset_playback_episodes_verify_items_use_next_observation_row():
+    dataset = DatasetLike(
+        {
+            "episode_id": ["ep1", "ep1", "ep1"],
+            "observations": ["obs0", "obs1", "terminal_obs"],
+            "actions": [[1], [2], []],
+            "rewards": [0.0, 1.0, None],
+            "terminations": [False, True, None],
+            "truncations": [False, False, None],
+        }
+    )
+
+    episodes, total_steps = main._dataset_playback_episodes(dataset, verify=True)
+
+    assert total_steps == 2
+    assert [list(episode["items"]) for episode in episodes] == [
+        [
+            ([1], "obs1", 0.0, False, False),
+            ([2], "terminal_obs", 1.0, True, False),
+        ]
+    ]
 
 
 def test_remote_storage_conflict_message_allows_same_or_empty_remote():
@@ -172,3 +223,45 @@ def test_stable_retro_simple_action_masks_match_nes_button_indices():
     masks = main._stable_retro_action_masks("SuperMarioBros-Nes-v0", "simple")
 
     assert masks == ((), (7,), (7, 0), (7, 8), (7, 8, 0), (8,), (6,))
+
+
+def test_dataset_playback_episodes_preserve_episode_seeds_and_actions():
+    episode_1 = uuid.uuid4().bytes
+    episode_2 = uuid.uuid4().bytes
+    dataset = DatasetLike(
+        {
+            "episode_id": [episode_1, episode_1, episode_2, episode_2],
+            "seed": [111, 111, 222, 222],
+            "actions": [[0], [], [0], []],
+        }
+    )
+
+    episodes, total_steps = main._dataset_playback_episodes(dataset)
+
+    assert total_steps == 2
+    assert [episode["seed"] for episode in episodes] == [111, 222]
+    assert [list(episode["items"]) for episode in episodes] == [[[0]], [[0]]]
+
+
+def test_replay_resets_between_dataset_episodes():
+    async def run_replay():
+        env = OneStepTerminalEnv()
+        recorder = main.DatasetRecorderWrapper(
+            env, headless=True, storage_format=main.STORAGE_FORMAT_IMAGES
+        )
+        recorder._ensure_screen = lambda frame: None
+        recorder._render_frame = lambda frame: None
+        recorder._print_keymappings = lambda: None
+        recorder._input_loop = lambda: True
+        await recorder.replay(
+            fps=1000,
+            total=2,
+            episodes=[
+                {"seed": 111, "items": [[0]]},
+                {"seed": 222, "items": [[0]]},
+            ],
+        )
+        recorder.close()
+        return env.reset_seeds
+
+    assert asyncio.run(run_replay()) == [111, 222]
