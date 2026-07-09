@@ -16,6 +16,7 @@
 
 [storage]
 # local_dir = "~/.gymrec/datasets"
+# format = "lossless-video"  # "lossless-video" or "images"
 
 [overlay]
 # font_size = 48

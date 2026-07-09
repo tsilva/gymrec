@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import hashlib
 import json
 import multiprocessing
 import os
@@ -168,6 +169,7 @@ DEFAULT_CONFIG = {
     },
     "storage": {
         "local_dir": os.path.join(os.path.expanduser("~"), ".gymrec", "datasets"),
+        "format": "lossless-video",
     },
     "overlay": {
         "font_size": 48,
@@ -205,6 +207,13 @@ BACKEND_LABELS = {
 }
 
 OBSERVATION_IMAGE_KEYS = ("obs", "image", "screen")
+STORAGE_FORMAT_IMAGES = "images"
+STORAGE_FORMAT_LOSSLESS_VIDEO = "lossless-video"
+STORAGE_FORMATS = (STORAGE_FORMAT_IMAGES, STORAGE_FORMAT_LOSSLESS_VIDEO)
+VIDEO_ARTIFACT_DIR = "videos"
+RUNTIME_VIDEO_BASE_COLUMN = "_gymrec_video_base_path"
+RUNTIME_HF_REPO_COLUMN = "_gymrec_hf_repo_id"
+_VIDEO_DECODE_CACHE = {}
 
 
 def _extract_observation_image(observation):
@@ -214,6 +223,154 @@ def _extract_observation_image(observation):
             if key in observation:
                 return observation[key]
     return observation
+
+
+def _normalize_storage_format(value):
+    """Normalize and validate a configured storage format."""
+    value = str(value or STORAGE_FORMAT_IMAGES).strip().lower()
+    if value not in STORAGE_FORMATS:
+        raise ValueError(
+            f"Unknown storage format '{value}'. Expected one of: {', '.join(STORAGE_FORMATS)}"
+        )
+    return value
+
+
+def _observation_to_rgb_array(observation):
+    """Normalize an environment observation to contiguous HxWx3 uint8 RGB bytes."""
+    frame = _extract_observation_image(observation)
+    frame_array = np.array(frame, dtype=np.uint8)
+
+    if frame_array.ndim == 2:
+        frame_array = np.repeat(frame_array[:, :, None], 3, axis=2)
+    elif frame_array.ndim == 3 and frame_array.shape[2] == 1:
+        frame_array = np.repeat(frame_array, 3, axis=2)
+    elif frame_array.ndim == 3 and frame_array.shape[2] >= 3:
+        frame_array = frame_array[:, :, :3]
+    else:
+        raise ValueError(f"Unsupported frame shape: {frame_array.shape}")
+
+    return np.ascontiguousarray(frame_array)
+
+
+def _sha256_rgb(frame_array):
+    """Hash canonical RGB frame bytes."""
+    return hashlib.sha256(np.ascontiguousarray(frame_array).tobytes()).hexdigest()
+
+
+def _require_lossless_video_tools():
+    """Return ffmpeg/ffprobe paths or raise before starting a video-backed recording."""
+    ffmpeg_path = shutil.which("ffmpeg")
+    ffprobe_path = shutil.which("ffprobe")
+    missing = []
+    if ffmpeg_path is None:
+        missing.append("ffmpeg")
+    if ffprobe_path is None:
+        missing.append("ffprobe")
+    if missing:
+        raise RuntimeError(
+            f"{' and '.join(missing)} required for --storage {STORAGE_FORMAT_LOSSLESS_VIDEO}"
+        )
+    return ffmpeg_path, ffprobe_path
+
+
+def _encode_lossless_rgb_video(frames, output_path, fps, ffmpeg_path=None):
+    """Encode a sequence of RGB frames to a lossless RGB Matroska video."""
+    if not frames:
+        raise ValueError("Cannot encode an empty video")
+    ffmpeg_path = ffmpeg_path or _require_lossless_video_tools()[0]
+
+    first = frames[0]
+    height, width = first.shape[:2]
+    for frame in frames:
+        if frame.shape != first.shape:
+            raise ValueError(
+                f"All video frames must have shape {first.shape}; got {frame.shape}"
+            )
+
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    cmd = [
+        ffmpeg_path,
+        "-y",
+        "-loglevel",
+        "error",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "rgb24",
+        "-s",
+        f"{width}x{height}",
+        "-r",
+        str(max(int(round(float(fps))), 1)),
+        "-i",
+        "-",
+        "-an",
+        "-c:v",
+        "libx264rgb",
+        "-crf",
+        "0",
+        "-preset",
+        "veryslow",
+        "-pix_fmt",
+        "rgb24",
+        output_path,
+    ]
+    process = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        for frame in frames:
+            process.stdin.write(np.ascontiguousarray(frame).tobytes())
+        process.stdin.close()
+        stderr = process.stderr.read().decode("utf-8", errors="replace").strip()
+        return_code = process.wait()
+        if return_code != 0:
+            raise RuntimeError(stderr or f"ffmpeg exited with status {return_code}")
+    except Exception:
+        if process.stdin is not None and not process.stdin.closed:
+            process.stdin.close()
+        process.wait()
+        raise
+    finally:
+        if process.stderr is not None:
+            process.stderr.close()
+
+
+def _decode_lossless_rgb_video(video_path, width, height, cache=True):
+    """Decode a lossless RGB video into an NxHxWx3 uint8 array."""
+    abs_path = os.path.abspath(video_path)
+    stat = os.stat(abs_path)
+    cache_key = (abs_path, int(width), int(height), stat.st_mtime_ns, stat.st_size)
+    if cache and cache_key in _VIDEO_DECODE_CACHE:
+        return _VIDEO_DECODE_CACHE[cache_key]
+
+    ffmpeg_path = shutil.which("ffmpeg")
+    if ffmpeg_path is None:
+        raise RuntimeError("ffmpeg is required to decode video-backed observations")
+    cmd = [
+        ffmpeg_path,
+        "-v",
+        "error",
+        "-i",
+        abs_path,
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "rgb24",
+        "-",
+    ]
+    result = subprocess.run(cmd, capture_output=True)
+    if result.returncode != 0:
+        stderr = result.stderr.decode("utf-8", errors="replace").strip()
+        raise RuntimeError(stderr or f"ffmpeg exited with status {result.returncode}")
+
+    frame_size = int(width) * int(height) * 3
+    if frame_size <= 0 or len(result.stdout) % frame_size != 0:
+        raise RuntimeError(f"Decoded video byte count is invalid for {video_path}")
+    frame_count = len(result.stdout) // frame_size
+    frames = np.frombuffer(result.stdout, dtype=np.uint8).reshape(
+        (frame_count, int(height), int(width), 3)
+    )
+    if cache:
+        _VIDEO_DECODE_CACHE[cache_key] = frames
+    return frames
 
 
 def _episode_progress(transient=False):
@@ -1032,11 +1189,24 @@ class DatasetRecorderWrapper(gym.Wrapper):
     Gymnasium wrapper for recording and replaying Atari gameplay as Hugging Face datasets.
     """
 
-    def __init__(self, env, input_source=None, headless=False, collector="human"):
+    def __init__(
+        self,
+        env,
+        input_source=None,
+        headless=False,
+        collector="human",
+        storage_format=None,
+    ):
         _lazy_init()
         super().__init__(env)
 
         self.recording = False
+        self.storage_format = _normalize_storage_format(
+            storage_format or CONFIG["storage"].get("format", STORAGE_FORMAT_IMAGES)
+        )
+        self._ffmpeg_path = None
+        if self.storage_format == STORAGE_FORMAT_LOSSLESS_VIDEO:
+            self._ffmpeg_path, _ = _require_lossless_video_tools()
         self.frame_shape = None  # Delay initialization
         self.screen = None  # Delay initialization
         self.headless = headless
@@ -1060,11 +1230,20 @@ class DatasetRecorderWrapper(gym.Wrapper):
         self.truncations = []
         self.infos = []
         self.session_ids = []
+        self.video_paths = []
+        self.frame_indices = []
+        self.frame_sha256s = []
+        self.frame_widths = []
+        self.frame_heights = []
+        self.episode_num_observations = []
         self._current_episode_uuid = None
         self._current_episode_seed = None
         self._session_uuid = None
 
         self.temp_dir = tempfile.mkdtemp()
+        self.video_artifact_dir = os.path.join(self.temp_dir, VIDEO_ARTIFACT_DIR)
+        self._current_episode_video_frames = []
+        self._current_episode_video_hashes = []
 
         self._fps = None
         self._fps_changed_at = 0
@@ -1092,12 +1271,72 @@ class DatasetRecorderWrapper(gym.Wrapper):
 
     def _save_frame_image(self, frame):
         """Save a frame as lossless WebP and return the file path."""
-        frame = _extract_observation_image(frame)
-        frame_uint8 = frame.astype(np.uint8)
+        frame_uint8 = _observation_to_rgb_array(frame)
         path = os.path.join(self.temp_dir, f"frame_{len(self.frames):05d}.webp")
         img = PILImage.fromarray(frame_uint8)
         img.save(path, format="WEBP", lossless=True, method=6)
         return path
+
+    def _record_observation(self, episode_uuid, frame):
+        """Record an observation through the configured storage backend."""
+        if self.storage_format == STORAGE_FORMAT_IMAGES:
+            self.frames.append(self._save_frame_image(frame))
+            return
+
+        frame_array = _observation_to_rgb_array(frame)
+        frame_index = len(self._current_episode_video_frames)
+        frame_hash = _sha256_rgb(frame_array)
+        video_relpath = f"{VIDEO_ARTIFACT_DIR}/{episode_uuid.hex}.mkv"
+
+        self._current_episode_video_frames.append(frame_array.copy())
+        self._current_episode_video_hashes.append(frame_hash)
+        self.frames.append(None)
+        self.video_paths.append(video_relpath)
+        self.frame_indices.append(frame_index)
+        self.frame_sha256s.append(frame_hash)
+        self.frame_heights.append(int(frame_array.shape[0]))
+        self.frame_widths.append(int(frame_array.shape[1]))
+        self.episode_num_observations.append(None)
+
+    def _finalize_video_episode(self, episode_uuid):
+        """Encode and verify the current episode's canonical observation video."""
+        if self.storage_format != STORAGE_FORMAT_LOSSLESS_VIDEO:
+            return
+        if not self._current_episode_video_frames:
+            return
+
+        video_relpath = f"{VIDEO_ARTIFACT_DIR}/{episode_uuid.hex}.mkv"
+        video_path = os.path.join(self.temp_dir, video_relpath)
+        expected_hashes = list(self._current_episode_video_hashes)
+        frame_count = len(expected_hashes)
+
+        _encode_lossless_rgb_video(
+            self._current_episode_video_frames,
+            video_path,
+            self._fps or get_default_fps(self.env),
+            ffmpeg_path=self._ffmpeg_path,
+        )
+        height, width = self._current_episode_video_frames[0].shape[:2]
+        decoded_frames = _decode_lossless_rgb_video(video_path, width, height, cache=False)
+        if len(decoded_frames) != frame_count:
+            raise RuntimeError(
+                f"Video round-trip produced {len(decoded_frames)} frames; expected {frame_count}"
+            )
+        for frame_index, (decoded_frame, expected_hash) in enumerate(
+            zip(decoded_frames, expected_hashes)
+        ):
+            actual_hash = _sha256_rgb(decoded_frame)
+            if actual_hash != expected_hash:
+                raise RuntimeError(
+                    "Lossless video verification failed for "
+                    f"{video_relpath} frame {frame_index}: {actual_hash} != {expected_hash}"
+                )
+
+        start_index = len(self.episode_num_observations) - frame_count
+        for row_index in range(start_index, len(self.episode_num_observations)):
+            self.episode_num_observations[row_index] = frame_count
+        self._current_episode_video_frames.clear()
+        self._current_episode_video_hashes.clear()
 
     @staticmethod
     def _normalize_action(action):
@@ -1114,10 +1353,9 @@ class DatasetRecorderWrapper(gym.Wrapper):
         if not self.recording:
             return
 
-        path = self._save_frame_image(frame)
         self.episode_ids.append(episode_uuid.bytes)
         self.seeds.append(self._current_episode_seed)
-        self.frames.append(path)
+        self._record_observation(episode_uuid, frame)
         self.actions.append(self._normalize_action(action))
         self.session_ids.append(self._session_uuid.bytes)
 
@@ -1131,16 +1369,16 @@ class DatasetRecorderWrapper(gym.Wrapper):
         if not self.recording:
             return
 
-        path = self._save_frame_image(frame)
         self.episode_ids.append(episode_uuid.bytes)
         self.seeds.append(self._current_episode_seed)
-        self.frames.append(path)
+        self._record_observation(episode_uuid, frame)
         self.actions.append([])
         self.rewards.append(None)
         self.terminations.append(None)
         self.truncations.append(None)
         self.infos.append(None)
         self.session_ids.append(self._session_uuid.bytes)
+        self._finalize_video_episode(episode_uuid)
 
     def _input_loop(self):
         """
@@ -1439,6 +1677,14 @@ class DatasetRecorderWrapper(gym.Wrapper):
         self.truncations.clear()
         self.infos.clear()
         self.session_ids.clear()
+        self.video_paths.clear()
+        self.frame_indices.clear()
+        self.frame_sha256s.clear()
+        self.frame_widths.clear()
+        self.frame_heights.clear()
+        self.episode_num_observations.clear()
+        self._current_episode_video_frames.clear()
+        self._current_episode_video_hashes.clear()
 
         # Capture environment metadata for dataset card
         self._env_metadata = _capture_env_metadata(self.env)
@@ -1520,6 +1766,8 @@ class DatasetRecorderWrapper(gym.Wrapper):
                 and not truncated
             ):
                 truncated = True
+                if self.recording and self.truncations:
+                    self.truncations[-1] = True
 
             if terminated or truncated:
                 self._record_terminal_observation(self._current_episode_uuid, obs)
@@ -1553,7 +1801,6 @@ class DatasetRecorderWrapper(gym.Wrapper):
             data = {
                 "episode_id": self.episode_ids,
                 "seed": self.seeds,
-                "observations": self.frames,
                 "actions": self.actions,
                 "rewards": self.rewards,
                 "terminations": self.terminations,
@@ -1562,9 +1809,26 @@ class DatasetRecorderWrapper(gym.Wrapper):
                 "session_id": self.session_ids,
                 "collector": [self.collector] * len(self.frames),
                 "gymrec_version": [self._gymrec_version] * len(self.frames),
+                "storage_format": [self.storage_format] * len(self.frames),
             }
+            if self.storage_format == STORAGE_FORMAT_IMAGES:
+                data["observations"] = self.frames
+            else:
+                data.update(
+                    {
+                        "video_path": self.video_paths,
+                        "frame_index": self.frame_indices,
+                        "frame_sha256": self.frame_sha256s,
+                        "frame_width": self.frame_widths,
+                        "frame_height": self.frame_heights,
+                        "episode_num_observations": self.episode_num_observations,
+                    }
+                )
             self._recorded_dataset = Dataset.from_dict(data)
-            self._recorded_dataset = self._recorded_dataset.cast_column("observations", HFImage())
+            if self.storage_format == STORAGE_FORMAT_IMAGES:
+                self._recorded_dataset = self._recorded_dataset.cast_column(
+                    "observations", HFImage()
+                )
             # Cast episode_id and session_id to binary for efficient UUID storage
             self._recorded_dataset = self._recorded_dataset.cast_column(
                 "episode_id", Value("binary")
@@ -1883,14 +2147,35 @@ def _save_uploaded_episode_ids(env_id, episode_ids: set):
         json.dump(list(episode_ids), f)
 
 
-def save_dataset_locally(dataset, env_id, metadata=None):
+def _copy_video_artifacts(src_dir, dst_root):
+    """Copy canonical video artifacts into a saved local dataset directory."""
+    if not src_dir or not os.path.exists(src_dir):
+        return
+    dst_dir = os.path.join(dst_root, VIDEO_ARTIFACT_DIR)
+    os.makedirs(dst_dir, exist_ok=True)
+    for name in os.listdir(src_dir):
+        if name.endswith(".mkv"):
+            shutil.copy2(os.path.join(src_dir, name), os.path.join(dst_dir, name))
+
+
+def save_dataset_locally(dataset, env_id, metadata=None, video_artifact_dir=None):
     """Save dataset to local disk, appending to any existing data."""
     path = get_local_dataset_path(env_id)
     metadata_path = _get_metadata_path(env_id)
+    dataset = _strip_runtime_columns(dataset)
+    new_storage_format = _dataset_storage_format(dataset)
 
+    existing_video_dir = os.path.join(path, VIDEO_ARTIFACT_DIR)
     if os.path.exists(path):
         # Load existing dataset - UUIDs are already unique, no offsetting needed
         existing_dataset = load_from_disk(path, keep_in_memory=True)
+        existing_storage_format = _dataset_storage_format(existing_dataset)
+        if existing_storage_format != new_storage_format:
+            raise ValueError(
+                "Cannot append "
+                f"{new_storage_format} recordings to existing {existing_storage_format} dataset "
+                f"at {path}. Use a different [storage].local_dir or migrate explicitly."
+            )
 
         # Backward-compatible: add missing provenance columns with sentinel values
         _SENTINEL_STR = "unknown"
@@ -1909,17 +2194,31 @@ def save_dataset_locally(dataset, env_id, metadata=None):
             existing_dataset = existing_dataset.add_column(
                 "gymrec_version", [_SENTINEL_STR] * n_existing
             )
+        if "storage_format" not in existing_dataset.column_names:
+            existing_dataset = existing_dataset.add_column(
+                "storage_format", [existing_storage_format] * n_existing
+            )
+        if "storage_format" not in dataset.column_names:
+            dataset = dataset.add_column("storage_format", [new_storage_format] * len(dataset))
 
         # Concatenate datasets
         from datasets import concatenate_datasets
 
         dataset = concatenate_datasets([existing_dataset, dataset])
 
-        # Remove old dataset directory
-        shutil.rmtree(path)
-
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    dataset.save_to_disk(path)
+    tmp_path = f"{path}.tmp-{uuid.uuid4().hex}"
+    try:
+        dataset.save_to_disk(tmp_path)
+        if os.path.exists(existing_video_dir):
+            _copy_video_artifacts(existing_video_dir, tmp_path)
+        _copy_video_artifacts(video_artifact_dir, tmp_path)
+        if os.path.exists(path):
+            shutil.rmtree(path)
+        os.replace(tmp_path, path)
+    except Exception:
+        shutil.rmtree(tmp_path, ignore_errors=True)
+        raise
 
     # Save/update metadata
     if metadata is not None:
@@ -1929,6 +2228,7 @@ def save_dataset_locally(dataset, env_id, metadata=None):
                 existing_metadata = json.load(f)
         # Update with new metadata (newer values take precedence)
         existing_metadata.update(metadata)
+        existing_metadata["storage_format"] = new_storage_format
         # Add recording timestamp
         if "recordings" not in existing_metadata:
             existing_metadata["recordings"] = []
@@ -1941,6 +2241,7 @@ def save_dataset_locally(dataset, env_id, metadata=None):
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
             "episodes": len(set(dataset["episode_id"])),
             "frames": len(dataset),
+            "storage_format": new_storage_format,
         }
         if _collectors:
             recording_entry["collectors"] = sorted(_collectors)
@@ -1963,12 +2264,15 @@ def load_local_metadata(env_id):
         return json.load(f)
 
 
-def load_local_dataset(env_id):
+def load_local_dataset(env_id, attach_runtime=True):
     """Load dataset from local disk. Returns None if not found."""
     path = get_local_dataset_path(env_id)
     if not os.path.exists(path):
         return None
-    return load_from_disk(path)
+    dataset = load_from_disk(path)
+    if attach_runtime:
+        dataset = _attach_video_runtime_source(dataset, local_base_path=path)
+    return dataset
 
 
 def load_recorded_dataset(env_id, streaming=False):
@@ -1992,6 +2296,7 @@ def load_recorded_dataset(env_id, streaming=False):
         except Exception:
             total = None
     else:
+        dataset = _attach_video_runtime_source(dataset, hf_repo_id=hf_repo_id)
         total = len(dataset)
     return dataset, "hub", total
 
@@ -2014,6 +2319,45 @@ def _get_row_value(row, current_name, legacy_name=None):
     if legacy_name is not None:
         return row.get(legacy_name)
     return None
+
+
+def _dataset_storage_format(dataset):
+    """Infer a dataset's observation storage format from columns and values."""
+    column_names = getattr(dataset, "column_names", None) or []
+    if "storage_format" in column_names and len(dataset) > 0:
+        for value in dataset["storage_format"]:
+            if value:
+                return _normalize_storage_format(value)
+    if "video_path" in column_names:
+        return STORAGE_FORMAT_LOSSLESS_VIDEO
+    return STORAGE_FORMAT_IMAGES
+
+
+def _is_video_row(row):
+    return _get_row_value(row, "video_path") not in (None, "")
+
+
+def _attach_video_runtime_source(dataset, local_base_path=None, hf_repo_id=None):
+    """Attach runtime-only source columns needed to resolve relative video files."""
+    if "video_path" not in dataset.column_names:
+        return dataset
+    if local_base_path is not None and RUNTIME_VIDEO_BASE_COLUMN not in dataset.column_names:
+        dataset = dataset.add_column(RUNTIME_VIDEO_BASE_COLUMN, [local_base_path] * len(dataset))
+    if hf_repo_id is not None and RUNTIME_HF_REPO_COLUMN not in dataset.column_names:
+        dataset = dataset.add_column(RUNTIME_HF_REPO_COLUMN, [hf_repo_id] * len(dataset))
+    return dataset
+
+
+def _strip_runtime_columns(dataset):
+    """Remove local-only resolver columns before writing/uploading datasets."""
+    runtime_columns = [
+        column
+        for column in (RUNTIME_VIDEO_BASE_COLUMN, RUNTIME_HF_REPO_COLUMN)
+        if column in dataset.column_names
+    ]
+    if runtime_columns:
+        dataset = dataset.remove_columns(runtime_columns)
+    return dataset
 
 
 def _get_row_action(row):
@@ -2128,26 +2472,58 @@ def _select_episode_numbers(total_episodes, episode_range=None, first=None, last
 
 def _get_row_observation(row):
     """Return the observation image from a dataset row."""
+    if _is_video_row(row):
+        return _get_video_row_observation(row)
     observation = _get_row_value(row, "observations", "observation")
     if observation is None:
         raise ValueError("Dataset row is missing observations")
     return observation
 
 
+def _resolve_video_path(row):
+    """Resolve a row's relative video path to a local file path."""
+    video_path = _get_row_value(row, "video_path")
+    if os.path.isabs(video_path) and os.path.exists(video_path):
+        return video_path
+
+    local_base_path = _get_row_value(row, RUNTIME_VIDEO_BASE_COLUMN)
+    if local_base_path:
+        candidate = os.path.join(local_base_path, video_path)
+        if os.path.exists(candidate):
+            return candidate
+
+    hf_repo_id = _get_row_value(row, RUNTIME_HF_REPO_COLUMN)
+    if hf_repo_id:
+        return hf_hub_download(repo_id=hf_repo_id, filename=video_path, repo_type="dataset")
+
+    if os.path.exists(video_path):
+        return video_path
+    raise FileNotFoundError(f"Could not resolve video-backed observation: {video_path}")
+
+
+def _get_video_row_observation(row):
+    """Decode and verify one video-backed observation row."""
+    video_path = _resolve_video_path(row)
+    width = int(_get_row_value(row, "frame_width"))
+    height = int(_get_row_value(row, "frame_height"))
+    frame_index = int(_get_row_value(row, "frame_index"))
+    frames = _decode_lossless_rgb_video(video_path, width, height)
+    if frame_index < 0 or frame_index >= len(frames):
+        raise IndexError(
+            f"Frame index {frame_index} out of range for {video_path} ({len(frames)} frames)"
+        )
+    frame = np.array(frames[frame_index], copy=True)
+    expected_hash = _get_row_value(row, "frame_sha256")
+    if expected_hash and _sha256_rgb(frame) != expected_hash:
+        raise RuntimeError(
+            f"Decoded frame hash mismatch for {video_path} frame {frame_index}"
+        )
+    return frame
+
+
 def _frame_to_rgb_array(frame):
     """Normalize a dataset frame to an HxWx3 uint8 RGB array."""
-    frame_array = np.array(frame, dtype=np.uint8)
-
-    if frame_array.ndim == 2:
-        frame_array = np.repeat(frame_array[:, :, None], 3, axis=2)
-    elif frame_array.ndim == 3 and frame_array.shape[2] == 1:
-        frame_array = np.repeat(frame_array, 3, axis=2)
-    elif frame_array.ndim == 3 and frame_array.shape[2] >= 3:
-        frame_array = frame_array[:, :, :3]
-    else:
-        raise ValueError(f"Unsupported frame shape: {frame_array.shape}")
-
-    return np.ascontiguousarray(frame_array)
+    return _observation_to_rgb_array(frame)
 
 
 def _overlay_episode_number(frame_array, episode_number):
@@ -2334,11 +2710,12 @@ def upload_local_dataset(env_id, max_retries=5, base_wait=1.0):
     if not ensure_hf_login():
         return False
 
-    local_dataset = load_local_dataset(env_id)
+    local_dataset = load_local_dataset(env_id, attach_runtime=False)
     if local_dataset is None:
         console.print(f"[{STYLE_FAIL}]No local dataset found for {env_id}[/]")
         console.print(f"  Expected at: [{STYLE_PATH}]{get_local_dataset_path(env_id)}[/]")
         return False
+    storage_format = _dataset_storage_format(local_dataset)
 
     # Filter to episodes not yet uploaded
     already_uploaded = _load_uploaded_episode_ids(env_id)
@@ -2402,6 +2779,7 @@ def upload_local_dataset(env_id, max_retries=5, base_wait=1.0):
             operations = []
             with tempfile.TemporaryDirectory() as tmpdir:
                 shard_path = os.path.join(tmpdir, "shard.parquet")
+                new_dataset = _strip_runtime_columns(new_dataset)
                 new_dataset.to_parquet(shard_path)
                 shard_name = f"data/train-{next_shard_idx:05d}-of-{next_shard_idx + 1:05d}.parquet"
                 operations.append(
@@ -2410,6 +2788,28 @@ def upload_local_dataset(env_id, max_retries=5, base_wait=1.0):
                         path_or_fileobj=shard_path,
                     )
                 )
+
+                if storage_format == STORAGE_FORMAT_LOSSLESS_VIDEO:
+                    local_root = get_local_dataset_path(env_id)
+                    video_paths = sorted(
+                        {
+                            row["video_path"]
+                            for row in new_dataset
+                            if "video_path" in row and row["video_path"]
+                        }
+                    )
+                    for video_relpath in video_paths:
+                        video_path = os.path.join(local_root, video_relpath)
+                        if not os.path.exists(video_path):
+                            raise FileNotFoundError(
+                                f"Missing video artifact for upload: {video_path}"
+                            )
+                        operations.append(
+                            CommitOperationAdd(
+                                path_in_repo=video_relpath,
+                                path_or_fileobj=video_path,
+                            )
+                        )
 
                 # 4. Build updated dataset card
                 card_content = _build_dataset_card_content(
@@ -2805,6 +3205,11 @@ def render_dataset_card_content(
     collectors = collectors or []
     gymrec_versions = gymrec_versions or []
     curator = curator or _current_hf_username()
+    storage_format = (
+        _normalize_storage_format(metadata.get("storage_format"))
+        if metadata and metadata.get("storage_format")
+        else STORAGE_FORMAT_IMAGES
+    )
     card_data = DatasetCardData(
         language="en",
         license=CONFIG["dataset"]["license"],
@@ -2832,12 +3237,26 @@ def render_dataset_card_content(
         f"| Episodes | {episodes:,} |",
         f"| Environment | `{env_id}` |",
         f"| Backend | {BACKEND_LABELS.get(backend, backend)} |",
+        f"| Storage format | `{storage_format}` |",
     ]
     if collectors:
         content_lines.append(f"| Collector(s) | {', '.join(collectors)} |")
     if gymrec_versions:
         content_lines.append(f"| gymrec version(s) | {', '.join(gymrec_versions)} |")
     content_lines.append("")
+
+    if storage_format == STORAGE_FORMAT_LOSSLESS_VIDEO:
+        observation_lines = [
+            "- **video_path** (`string`): Relative path to the canonical lossless RGB episode video",
+            "- **frame_index** (`int`): Observation frame index within `video_path`",
+            "- **frame_sha256** (`string`): SHA-256 of the raw RGB frame bytes, verified after video encode/decode",
+            "- **frame_width** / **frame_height** (`int`): Decoded RGB frame dimensions",
+            "- **episode_num_observations** (`int`): Number of observations in the episode video",
+        ]
+    else:
+        observation_lines = [
+            "- **observations** (`Image`): RGB frame from the environment",
+        ]
 
     content_lines.extend(_dataset_card_environment_lines(metadata, backend))
     content_lines.extend(
@@ -2852,7 +3271,7 @@ def render_dataset_card_content(
             "",
             "- **episode_id** (`binary(16)`): Unique UUID identifier for each episode (16 bytes, universally unique across all recordings)",
             "- **seed** (`int` or `null`): RNG seed used for `env.reset()` (set on first row of each episode, `null` on other rows)",
-            "- **observations** (`Image`): RGB frame from the environment",
+            *observation_lines,
             "- **actions** (`list`): Action taken at this step (`[]` for terminal observations)",
             "- **rewards** (`float` or `null`): Reward received (`null` on terminal observation rows)",
             "- **terminations** (`bool` or `null`): Whether the episode terminated naturally (`null` on terminal observation rows)",
@@ -3877,6 +4296,13 @@ async def main():
         default=1,
         help="Number of parallel worker processes for agent data collection (default: 1)",
     )
+    parser_record.add_argument(
+        "--storage",
+        type=str,
+        default=None,
+        choices=STORAGE_FORMATS,
+        help="Observation storage backend: images or lossless-video (default: config.toml)",
+    )
 
     parser_playback = subparsers.add_parser("playback", help="Replay a dataset")
     _add_roms_path_arg(parser_playback, default=argparse.SUPPRESS)
@@ -3977,6 +4403,7 @@ async def main():
             ("episodes", None),
             ("max_steps", None),
             ("workers", 1),
+            ("storage", None),
         ]:
             if not hasattr(args, attr):
                 setattr(args, attr, default)
@@ -4019,6 +4446,9 @@ async def main():
 
     if hasattr(args, "scale") and args.scale is not None:
         CONFIG["display"]["scale_factor"] = args.scale
+    storage_format = _normalize_storage_format(
+        getattr(args, "storage", None) or CONFIG["storage"].get("format", STORAGE_FORMAT_IMAGES)
+    )
 
     env = None
     fps = args.fps
@@ -4047,7 +4477,11 @@ async def main():
             max_episodes = args.episodes  # None = unlimited for human
             max_steps = getattr(args, "max_steps", None)
             recorder = DatasetRecorderWrapper(
-                env, input_source=input_source, headless=False, collector="human"
+                env,
+                input_source=input_source,
+                headless=False,
+                collector="human",
+                storage_format=storage_format,
             )
             recorded_dataset = await recorder.record(
                 fps=fps, max_episodes=max_episodes, max_steps=max_steps
@@ -4058,6 +4492,12 @@ async def main():
             workers = getattr(args, "workers", 1)
             if workers > 1:
                 args.headless = True  # Force headless for parallel workers
+                if storage_format == STORAGE_FORMAT_LOSSLESS_VIDEO:
+                    console.print(
+                        f"[{STYLE_FAIL}]Error: --storage {STORAGE_FORMAT_LOSSLESS_VIDEO} "
+                        "does not support --workers > 1 yet[/]"
+                    )
+                    return
 
             # Don't allow headless mode without specifying episodes
             if args.headless and args.episodes is None:
@@ -4106,6 +4546,7 @@ async def main():
                     input_source=input_source,
                     headless=args.headless,
                     collector=args.agent,
+                    storage_format=storage_format,
                 )
 
                 total_steps_counter = [0]
@@ -4136,7 +4577,16 @@ async def main():
             return
 
         if recorder is not None:
-            save_dataset_locally(recorded_dataset, env_id, metadata=recorder._env_metadata)
+            save_dataset_locally(
+                recorded_dataset,
+                env_id,
+                metadata=recorder._env_metadata,
+                video_artifact_dir=(
+                    recorder.video_artifact_dir
+                    if recorder.storage_format == STORAGE_FORMAT_LOSSLESS_VIDEO
+                    else None
+                ),
+            )
             recorder.close()  # cleanup temp files after dataset is saved
         console.print(f"To play back: [{STYLE_CMD}]{_gymrec_cmd('playback', env_id)}[/]")
 
@@ -4157,7 +4607,7 @@ async def main():
                     f"To upload later: [{STYLE_CMD}]{_gymrec_cmd('upload', env_id)}[/]"
                 )
     elif args.command == "playback":
-        loaded_dataset, source, total = load_recorded_dataset(env_id, streaming=True)
+        loaded_dataset, source, total = load_recorded_dataset(env_id, streaming=False)
         if loaded_dataset is None:
             _print_missing_dataset(env_id)
             return
@@ -4166,8 +4616,8 @@ async def main():
                 f"[{STYLE_INFO}]Playing back from local dataset ({len(loaded_dataset)} frames)[/]"
             )
         else:
-            console.print(f"[{STYLE_INFO}]Playing back streaming from Hugging Face Hub[/]")
-        recorder = DatasetRecorderWrapper(env)
+            console.print(f"[{STYLE_INFO}]Playing back from Hugging Face Hub[/]")
+        recorder = DatasetRecorderWrapper(env, storage_format=STORAGE_FORMAT_IMAGES)
 
         if args.verify:
             recorded_data = (

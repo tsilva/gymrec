@@ -49,6 +49,7 @@ gymrec reindex_games                             # re-scan ROMS_PATH and refresh
 
 gymrec record BreakoutNoFrameskip-v4             # record human gameplay
 gymrec record BreakoutNoFrameskip-v4 --dry-run   # save locally without upload prompt
+gymrec record BreakoutNoFrameskip-v4 --storage lossless-video --dry-run
 gymrec record SuperMarioBros-Nes --agent random --headless --episodes 100
 gymrec record BreakoutNoFrameskip-v4 --agent breakout --headless --episodes 50
 gymrec record BreakoutNoFrameskip-v4 --agent random --headless --episodes 100 --workers 5
@@ -72,6 +73,8 @@ Human recording opens a pygame window. Press `Space` to start recording, use the
 
 Agent recording supports `human`, `random`, `mario`, and `breakout`. `--headless` is for agent mode only and requires `--episodes`; `--workers` runs parallel headless collection and cannot exceed the requested episode count.
 
+Observation storage defaults to `lossless-video`, which stores canonical observations as per-episode lossless RGB `.mkv` files plus table rows containing `video_path`, `frame_index`, and `frame_sha256`; each video is decoded and hash-verified before the recording is accepted. Lossless video storage requires `ffmpeg` and `ffprobe` on `PATH` and currently does not support `--workers > 1`. Use `--storage images` to store one lossless WebP-backed HF `Image` row per observation instead.
+
 The interactive recording menu only shows Atari and Stable-Retro environments whose ROMs are installed in the active Python environment. It uses a full-screen terminal menu by default and falls back to a plain text search prompt when the terminal cannot support it. Set `GYMREC_TEXT_MENU=1` to force the text selector. `list_environments` also shows missing ROMs for backends that register games separately from installed game files.
 
 Playback uses the local dataset first, then falls back to the Hugging Face Hub dataset repo. Video export requires `ffmpeg` and writes MP4 files from local data or downloaded Hub data.
@@ -81,10 +84,10 @@ Playback uses the local dataset first, then falls back to the Hugging Face Hub d
 - Requires Python `>=3.12,<3.13` and `uv`.
 - Hugging Face uploads use dataset repos named `{username}/gymrec__{encoded_env_id}` by default.
 - Local datasets are stored under `~/.gymrec/datasets` by default.
-- `config.toml` controls display scale, FPS defaults, local storage, dataset metadata, and overlay defaults.
+- `config.toml` controls display scale, FPS defaults, local storage path/format, dataset metadata, and overlay defaults.
 - `keymappings.toml` controls Atari, VizDoom, and Stable-Retro keyboard bindings.
 - Stable-Retro support uses the latest resolvable `stable-retro-turbo`, which keeps the `stable_retro` import name and provides PyPI wheels for macOS arm64.
-- `ffmpeg` must be available on `PATH` for `video` exports.
+- `ffmpeg` must be available on `PATH` for `video` exports; `ffmpeg` and `ffprobe` are required for `--storage lossless-video`.
 - `minari-export` requires Minari; install it with `uv sync --extra minari` or `uv pip install 'minari>=0.5.0'`.
 
 ## Architecture
