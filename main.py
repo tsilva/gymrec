@@ -3043,6 +3043,33 @@ def _save_uploaded_episode_ids(env_id, episode_ids: set):
         json.dump(list(episode_ids), f)
 
 
+def _remote_dataset_episode_ids(env_id):
+    """Return episode ids currently present on the Hub, or None if unavailable."""
+    hf_repo_id = env_id_to_hf_repo_id(env_id)
+    api = HfApi()
+    try:
+        repo_exists, _, remote_files = _hf_repo_state(api, hf_repo_id, create=False)
+    except Exception:
+        return None
+    if not repo_exists:
+        return set()
+    has_data_shard = any(
+        path.startswith("data/") and path.endswith(".parquet") for path in remote_files
+    )
+    if not has_data_shard:
+        return set()
+
+    try:
+        dataset = load_dataset(hf_repo_id, split="train", streaming=True)
+        return {
+            _normalize_episode_id(row["episode_id"])
+            for row in dataset
+            if row.get("episode_id") is not None
+        }
+    except Exception:
+        return None
+
+
 def _get_live_upload_queue_dir(env_id):
     """Return the local resumable live-upload queue directory."""
     encoded_env_id = _encode_env_id_for_hf(env_id)
@@ -3142,6 +3169,12 @@ def save_dataset_locally(dataset, env_id, metadata=None, video_artifact_dir=None
     metadata_path = _get_metadata_path(env_id)
     dataset = _strip_runtime_columns(dataset)
     new_storage_format = _dataset_storage_format(dataset)
+    new_episode_count = len(set(dataset["episode_id"])) if "episode_id" in dataset.column_names else 0
+    new_frame_count = len(dataset)
+    new_collectors = set(dataset["collector"]) if "collector" in dataset.column_names else set()
+    new_versions = (
+        set(dataset["gymrec_version"]) if "gymrec_version" in dataset.column_names else set()
+    )
 
     existing_video_dir = path
     if os.path.exists(path):
@@ -3210,21 +3243,16 @@ def save_dataset_locally(dataset, env_id, metadata=None, video_artifact_dir=None
         # Add recording timestamp
         if "recordings" not in existing_metadata:
             existing_metadata["recordings"] = []
-        # Extract provenance info from dataset columns if available
-        _collectors = set(dataset["collector"]) if "collector" in dataset.column_names else set()
-        _versions = (
-            set(dataset["gymrec_version"]) if "gymrec_version" in dataset.column_names else set()
-        )
         recording_entry = {
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
-            "episodes": len(set(dataset["episode_id"])),
-            "frames": len(dataset),
+            "episodes": new_episode_count,
+            "frames": new_frame_count,
             "storage_format": new_storage_format,
         }
-        if _collectors:
-            recording_entry["collectors"] = sorted(_collectors)
-        if _versions:
-            recording_entry["gymrec_versions"] = sorted(_versions)
+        if new_collectors:
+            recording_entry["collectors"] = sorted(new_collectors)
+        if new_versions:
+            recording_entry["gymrec_versions"] = sorted(new_versions)
         existing_metadata["recordings"].append(recording_entry)
         with open(metadata_path, "w") as f:
             json.dump(existing_metadata, f, indent=2, default=_json_default)
@@ -3421,6 +3449,18 @@ def _env_make_kwargs_from_metadata(env_id, metadata, backend=None):
             kwargs["sticky_action_prob"] = sticky
 
     return kwargs
+
+
+def _stable_retro_state_from_metadata(metadata):
+    if not metadata:
+        return None
+    return _metadata_str(
+        metadata,
+        ("stable_retro_state",),
+        ("retro_state",),
+        ("state",),
+        default=None,
+    )
 
 
 def _normalize_episode_id(eid):
@@ -4287,7 +4327,9 @@ def drain_live_upload_queue(env_id, max_retries=5, base_wait=1.0):
 
     console.print(f"[{STYLE_INFO}]Draining {len(entries)} pending live-upload episode(s)...[/]")
     ok = True
-    already_uploaded = _load_uploaded_episode_ids(env_id)
+    already_uploaded = _remote_dataset_episode_ids(env_id)
+    if already_uploaded is None:
+        already_uploaded = _load_uploaded_episode_ids(env_id)
     for episode_id, entry in entries:
         package_dir = entry["package_dir"]
         if episode_id in already_uploaded:
@@ -4415,7 +4457,9 @@ def upload_local_dataset(env_id, max_retries=5, base_wait=1.0, replace=False):
         return pending_ok
     storage_format = _dataset_storage_format(local_dataset)
 
-    already_uploaded = _load_uploaded_episode_ids(env_id)
+    already_uploaded = _remote_dataset_episode_ids(env_id)
+    if already_uploaded is None:
+        already_uploaded = _load_uploaded_episode_ids(env_id)
     new_indices = []
     new_episode_ids = set()
     for i, row in enumerate(local_dataset):
@@ -4675,6 +4719,9 @@ def _capture_env_metadata(env):
 
     # Stable-Retro specific
     if hasattr(env, "_stable_retro") and env._stable_retro:
+        stable_retro_state = getattr(env, "_gymrec_stable_retro_state", None)
+        if stable_retro_state:
+            metadata["stable_retro_state"] = stable_retro_state
         unwrapped = getattr(env, "unwrapped", None)
         if unwrapped is not None:
             metadata["retro_platform"] = getattr(unwrapped, "system", None)
@@ -4991,6 +5038,7 @@ def _create_env__stableretro(env_id, state=None, env_make_kwargs=None):
         env = retro.make(env_id, **make_kwargs)
         env._gymrec_make_kwargs = {}
     env._stable_retro = True
+    env._gymrec_stable_retro_state = state
     return env
 
 
@@ -5066,6 +5114,8 @@ def create_env(
         env_make_kwargs = _human_record_env_make_kwargs(backend)
     else:
         env_make_kwargs = _env_make_kwargs_from_metadata(env_id, metadata, backend=backend)
+    if backend == "stable-retro" and stable_retro_state is None:
+        stable_retro_state = _stable_retro_state_from_metadata(metadata)
 
     if backend == "stable-retro":
         env = _create_env__stableretro(

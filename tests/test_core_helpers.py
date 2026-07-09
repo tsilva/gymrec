@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import json
 import shutil
 import uuid
 
@@ -98,6 +99,43 @@ class DummyVizDoomDictObservationEnv:
     reward_range = (-float("inf"), float("inf"))
 
 
+class DummyStableRetroEnv:
+    _env_id = "SuperMarioBros-Nes-v0"
+    _stable_retro = True
+    _gymrec_stable_retro_state = "Level1-1"
+    _gymrec_make_kwargs = {"frame_skip": 4}
+    spec = None
+    unwrapped = None
+    metadata = {}
+    action_space = gym.spaces.MultiBinary(8)
+    observation_space = gym.spaces.Box(0, 255, shape=(1, 1, 3), dtype=np.uint8)
+    reward_range = (-float("inf"), float("inf"))
+
+
+def make_minimal_dataset(episode_uuid=None, collector="random"):
+    main._lazy_init()
+    episode_uuid = episode_uuid or uuid.uuid4()
+    session_uuid = uuid.uuid4()
+    dataset = main.Dataset.from_dict(
+        {
+            "episode_id": [episode_uuid.bytes, episode_uuid.bytes],
+            "seed": [123, 123],
+            "actions": [[0], []],
+            "rewards": [1.0, None],
+            "terminations": [True, None],
+            "truncations": [False, None],
+            "infos": ["{}", None],
+            "session_id": [session_uuid.bytes, session_uuid.bytes],
+            "collector": [collector, collector],
+            "gymrec_version": ["0.1.0+test", "0.1.0+test"],
+            "storage_format": [main.STORAGE_FORMAT_IMAGES, main.STORAGE_FORMAT_IMAGES],
+        }
+    )
+    dataset = dataset.cast_column("episode_id", main.Value("binary"))
+    dataset = dataset.cast_column("session_id", main.Value("binary"))
+    return dataset
+
+
 def test_env_id_encoding_round_trips_special_characters():
     env_id = "ALE/Breakout-v5_custom"
     encoded = main._encode_env_id_for_hf(env_id)
@@ -144,6 +182,43 @@ def test_env_make_kwargs_from_metadata_prefers_saved_make_kwargs():
         "frameskip": 1,
         "repeat_action_probability": 0.0,
     }
+
+
+def test_stable_retro_state_is_recovered_from_recording_metadata(monkeypatch):
+    captured = {}
+
+    class CreatedEnv:
+        pass
+
+    def fake_create(env_id, state=None, env_make_kwargs=None):
+        captured["env_id"] = env_id
+        captured["state"] = state
+        captured["env_make_kwargs"] = env_make_kwargs
+        return CreatedEnv()
+
+    monkeypatch.setattr(main, "_get_stableretro_envs", lambda: ["SuperMarioBros-Nes-v0"])
+    monkeypatch.setattr(main, "_create_env__stableretro", fake_create)
+
+    env = main.create_env(
+        "SuperMarioBros-Nes-v0",
+        metadata={"stable_retro_state": "Level1-1", "env_make_kwargs": {"frame_skip": 4}},
+    )
+
+    assert env._env_id == "SuperMarioBros-Nes-v0"
+    assert captured == {
+        "env_id": "SuperMarioBros-Nes-v0",
+        "state": "Level1-1",
+        "env_make_kwargs": {"frame_skip": 4},
+    }
+
+
+def test_capture_env_metadata_preserves_stable_retro_state():
+    if main.CONFIG is None:
+        main.CONFIG = main._load_config()
+
+    metadata = main._capture_env_metadata(DummyStableRetroEnv())
+
+    assert metadata["stable_retro_state"] == "Level1-1"
 
 
 def test_get_frameskip_and_metadata_prefer_actual_make_kwargs():
@@ -590,6 +665,34 @@ def test_live_episode_manager_packages_shard_without_previews(tmp_path, monkeypa
         main.CONFIG["storage"]["local_dir"] = old_local_dir
 
 
+def test_upload_uses_remote_episode_ids_when_local_marker_is_stale(tmp_path, monkeypatch):
+    if main.CONFIG is None:
+        main.CONFIG = main._load_config()
+    old_local_dir = main.CONFIG["storage"]["local_dir"]
+    main.CONFIG["storage"]["local_dir"] = str(tmp_path)
+    episode_uuid = uuid.uuid4()
+    dataset = make_minimal_dataset(episode_uuid=episode_uuid)
+    calls = []
+
+    def fake_upload(env_id, shard, **kwargs):
+        calls.append((env_id, list(shard["episode_id"]), kwargs))
+        return True
+
+    monkeypatch.setattr(main, "ensure_hf_login", lambda: True)
+    monkeypatch.setattr(main, "drain_live_upload_queue", lambda *args, **kwargs: True)
+    monkeypatch.setattr(main, "_remote_dataset_episode_ids", lambda env_id: set())
+    monkeypatch.setattr(main, "_upload_dataset_shard_to_hub", fake_upload)
+    try:
+        dataset.save_to_disk(main.get_local_dataset_path("BreakoutNoFrameskip-v4"))
+        main._save_uploaded_episode_ids("BreakoutNoFrameskip-v4", {episode_uuid.hex})
+
+        assert main.upload_local_dataset("BreakoutNoFrameskip-v4") is True
+        assert len(calls) == 1
+        assert calls[0][2]["episode_ids"] == {episode_uuid.hex}
+    finally:
+        main.CONFIG["storage"]["local_dir"] = old_local_dir
+
+
 def test_upload_local_dataset_fails_without_local_dataset_or_pending_queue(tmp_path, monkeypatch):
     if main.CONFIG is None:
         main.CONFIG = main._load_config()
@@ -598,6 +701,33 @@ def test_upload_local_dataset_fails_without_local_dataset_or_pending_queue(tmp_p
     monkeypatch.setattr(main, "ensure_hf_login", lambda: True)
     try:
         assert main.upload_local_dataset("BreakoutNoFrameskip-v4") is False
+    finally:
+        main.CONFIG["storage"]["local_dir"] = old_local_dir
+
+
+def test_save_dataset_metadata_recordings_count_only_new_batch(tmp_path):
+    if main.CONFIG is None:
+        main.CONFIG = main._load_config()
+    old_local_dir = main.CONFIG["storage"]["local_dir"]
+    main.CONFIG["storage"]["local_dir"] = str(tmp_path)
+    try:
+        main.save_dataset_locally(
+            make_minimal_dataset(collector="random"),
+            "BreakoutNoFrameskip-v4",
+            metadata={"env_id": "BreakoutNoFrameskip-v4"},
+        )
+        main.save_dataset_locally(
+            make_minimal_dataset(collector="human"),
+            "BreakoutNoFrameskip-v4",
+            metadata={"env_id": "BreakoutNoFrameskip-v4"},
+        )
+
+        with open(main._get_metadata_path("BreakoutNoFrameskip-v4")) as f:
+            metadata = json.load(f)
+
+        assert [entry["episodes"] for entry in metadata["recordings"]] == [1, 1]
+        assert [entry["frames"] for entry in metadata["recordings"]] == [2, 2]
+        assert metadata["recordings"][1]["collectors"] == ["human"]
     finally:
         main.CONFIG["storage"]["local_dir"] = old_local_dir
 
