@@ -1317,7 +1317,7 @@ class HFPolicySource:
     frame_stack: int
     observation_size: int
     obs_crop: tuple[int, int, int, int] | None
-    deterministic: bool = True
+    deterministic: bool = False
     device: str = "auto"
 
     @property
@@ -1571,7 +1571,7 @@ def resolve_huggingface_policy_source(
     filename=None,
     revision=None,
     device="auto",
-    deterministic=True,
+    deterministic=False,
 ):
     _lazy_init()
     try:
@@ -4905,11 +4905,18 @@ async def main():
         default="auto",
         help="SB3 policy device for Hugging Face model refs: auto, cpu, cuda, or mps",
     )
-    parser_record.add_argument(
-        "--stochastic",
+    hf_policy_mode = parser_record.add_mutually_exclusive_group()
+    hf_policy_mode.add_argument(
+        "--deterministic",
         action="store_true",
         default=False,
-        help="Sample stochastic SB3 actions for Hugging Face model refs (default: deterministic)",
+        help="Use deterministic argmax SB3 actions for Hugging Face model refs (default: stochastic sampling)",
+    )
+    hf_policy_mode.add_argument(
+        "--stochastic",
+        action="store_false",
+        dest="deterministic",
+        help=argparse.SUPPRESS,
     )
 
     parser_playback = subparsers.add_parser("playback", help="Replay a dataset")
@@ -5018,7 +5025,7 @@ async def main():
             ("hf_file", None),
             ("hf_revision", None),
             ("device", "auto"),
-            ("stochastic", False),
+            ("deterministic", False),
         ]:
             if not hasattr(args, attr):
                 setattr(args, attr, default)
@@ -5064,7 +5071,7 @@ async def main():
             filename=getattr(args, "hf_file", None),
             revision=getattr(args, "hf_revision", None),
             device=getattr(args, "device", "auto"),
-            deterministic=not bool(getattr(args, "stochastic", False)),
+            deterministic=bool(getattr(args, "deterministic", False)),
         )
         env_id = hf_policy_source.env_id
         args.env_id = env_id
@@ -5074,7 +5081,8 @@ async def main():
             f"{env_id}"
             f"{' state=' + hf_policy_source.state if hf_policy_source.state else ''}, "
             f"action_set={hf_policy_source.action_set}, "
-            f"frame_skip={hf_policy_source.frame_skip}[/]"
+            f"frame_skip={hf_policy_source.frame_skip}, "
+            f"mode={'deterministic' if hf_policy_source.deterministic else 'stochastic'}[/]"
         )
 
     if args.command == "upload":

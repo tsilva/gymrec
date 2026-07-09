@@ -219,6 +219,26 @@ def test_huggingface_metadata_extracts_policy_contract():
     assert main._metadata_obs_crop(metadata) == (32, 0, 0, 0)
 
 
+def test_huggingface_policy_source_defaults_to_stochastic_actions():
+    source = main.HFPolicySource(
+        ref="hf://tsilva/SuperMarioBros-Nes-v0_Level1-1",
+        repo_id="tsilva/SuperMarioBros-Nes-v0_Level1-1",
+        revision="main",
+        checkpoint_filename="model.zip",
+        model_path="/tmp/model.zip",
+        metadata={},
+        env_id="SuperMarioBros-Nes-v0",
+        state="Level1-1",
+        action_set="simple",
+        frame_skip=4,
+        frame_stack=4,
+        observation_size=84,
+        obs_crop=(32, 0, 0, 0),
+    )
+
+    assert source.deterministic is False
+
+
 def test_stable_retro_simple_action_masks_match_nes_button_indices():
     masks = main._stable_retro_action_masks("SuperMarioBros-Nes-v0", "simple")
 
