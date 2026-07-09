@@ -210,7 +210,10 @@ OBSERVATION_IMAGE_KEYS = ("obs", "image", "screen")
 STORAGE_FORMAT_IMAGES = "images"
 STORAGE_FORMAT_LOSSLESS_VIDEO = "lossless-video"
 STORAGE_FORMATS = (STORAGE_FORMAT_IMAGES, STORAGE_FORMAT_LOSSLESS_VIDEO)
-VIDEO_ARTIFACT_DIR = "videos"
+VIDEO_ARTIFACT_DIR = "observation_videos"
+PREVIEW_VIDEO_ARTIFACT_DIR = "videos"
+CANONICAL_VIDEO_SUFFIX = ".rgb.mkv.bin"
+PREVIEW_VIDEO_SUFFIX = ".mp4"
 RUNTIME_VIDEO_BASE_COLUMN = "_gymrec_video_base_path"
 RUNTIME_HF_REPO_COLUMN = "_gymrec_hf_repo_id"
 _VIDEO_DECODE_CACHE = {}
@@ -274,7 +277,7 @@ def _require_lossless_video_tools():
 
 
 def _encode_lossless_rgb_video(frames, output_path, fps, ffmpeg_path=None):
-    """Encode a sequence of RGB frames to a lossless RGB Matroska video."""
+    """Encode a sequence of RGB frames to a canonical lossless RGB Matroska stream."""
     if not frames:
         raise ValueError("Cannot encode an empty video")
     ffmpeg_path = ffmpeg_path or _require_lossless_video_tools()[0]
@@ -312,6 +315,68 @@ def _encode_lossless_rgb_video(frames, output_path, fps, ffmpeg_path=None):
         "veryslow",
         "-pix_fmt",
         "rgb24",
+        "-f",
+        "matroska",
+        output_path,
+    ]
+    process = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        for frame in frames:
+            process.stdin.write(np.ascontiguousarray(frame).tobytes())
+        process.stdin.close()
+        stderr = process.stderr.read().decode("utf-8", errors="replace").strip()
+        return_code = process.wait()
+        if return_code != 0:
+            raise RuntimeError(stderr or f"ffmpeg exited with status {return_code}")
+    except Exception:
+        if process.stdin is not None and not process.stdin.closed:
+            process.stdin.close()
+        process.wait()
+        raise
+    finally:
+        if process.stderr is not None:
+            process.stderr.close()
+
+
+def _encode_browser_preview_video(frames, output_path, fps, ffmpeg_path=None):
+    """Encode a lossy browser-safe preview MP4. This is never canonical data."""
+    if not frames:
+        raise ValueError("Cannot encode an empty preview video")
+    ffmpeg_path = ffmpeg_path or _require_lossless_video_tools()[0]
+
+    first = frames[0]
+    height, width = first.shape[:2]
+    for frame in frames:
+        if frame.shape != first.shape:
+            raise ValueError(
+                f"All preview frames must have shape {first.shape}; got {frame.shape}"
+            )
+
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    cmd = [
+        ffmpeg_path,
+        "-y",
+        "-loglevel",
+        "error",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "rgb24",
+        "-s",
+        f"{width}x{height}",
+        "-r",
+        str(max(int(round(float(fps))), 1)),
+        "-i",
+        "-",
+        "-an",
+        "-c:v",
+        "libx264",
+        "-vf",
+        "pad=ceil(iw/2)*2:ceil(ih/2)*2",
+        "-pix_fmt",
+        "yuv420p",
+        "-movflags",
+        "+faststart",
         output_path,
     ]
     process = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -1329,7 +1394,7 @@ class DatasetRecorderWrapper(gym.Wrapper):
         frame_array = _observation_to_rgb_array(frame)
         frame_index = len(self._current_episode_video_frames)
         frame_hash = _sha256_rgb(frame_array)
-        video_relpath = f"{VIDEO_ARTIFACT_DIR}/{episode_uuid.hex}.mkv"
+        video_relpath = f"{VIDEO_ARTIFACT_DIR}/{episode_uuid.hex}{CANONICAL_VIDEO_SUFFIX}"
 
         self._current_episode_video_frames.append(frame_array.copy())
         self._current_episode_video_hashes.append(frame_hash)
@@ -1348,8 +1413,10 @@ class DatasetRecorderWrapper(gym.Wrapper):
         if not self._current_episode_video_frames:
             return
 
-        video_relpath = f"{VIDEO_ARTIFACT_DIR}/{episode_uuid.hex}.mkv"
+        video_relpath = f"{VIDEO_ARTIFACT_DIR}/{episode_uuid.hex}{CANONICAL_VIDEO_SUFFIX}"
         video_path = os.path.join(self.temp_dir, video_relpath)
+        preview_relpath = f"{PREVIEW_VIDEO_ARTIFACT_DIR}/{episode_uuid.hex}{PREVIEW_VIDEO_SUFFIX}"
+        preview_path = os.path.join(self.temp_dir, preview_relpath)
         expected_hashes = list(self._current_episode_video_hashes)
         frame_count = len(expected_hashes)
 
@@ -1378,6 +1445,12 @@ class DatasetRecorderWrapper(gym.Wrapper):
         start_index = len(self.episode_num_observations) - frame_count
         for row_index in range(start_index, len(self.episode_num_observations)):
             self.episode_num_observations[row_index] = frame_count
+        _encode_browser_preview_video(
+            self._current_episode_video_frames,
+            preview_path,
+            self._fps or get_default_fps(self.env),
+            ffmpeg_path=self._ffmpeg_path,
+        )
         self._current_episode_video_frames.clear()
         self._current_episode_video_hashes.clear()
 
@@ -2190,15 +2263,25 @@ def _save_uploaded_episode_ids(env_id, episode_ids: set):
         json.dump(list(episode_ids), f)
 
 
-def _copy_video_artifacts(src_dir, dst_root):
-    """Copy canonical video artifacts into a saved local dataset directory."""
-    if not src_dir or not os.path.exists(src_dir):
+def _copy_artifact_tree(src_root, dst_root, relative_dir):
+    """Copy an artifact subdirectory into a saved local dataset directory."""
+    if not src_root:
         return
-    dst_dir = os.path.join(dst_root, VIDEO_ARTIFACT_DIR)
+    src_dir = os.path.join(src_root, relative_dir)
+    if not os.path.exists(src_dir):
+        return
+    dst_dir = os.path.join(dst_root, relative_dir)
     os.makedirs(dst_dir, exist_ok=True)
     for name in os.listdir(src_dir):
-        if name.endswith(".mkv"):
-            shutil.copy2(os.path.join(src_dir, name), os.path.join(dst_dir, name))
+        src_path = os.path.join(src_dir, name)
+        if os.path.isfile(src_path):
+            shutil.copy2(src_path, os.path.join(dst_dir, name))
+
+
+def _copy_video_artifacts(src_root, dst_root):
+    """Copy canonical and preview video artifacts into a saved local dataset directory."""
+    _copy_artifact_tree(src_root, dst_root, VIDEO_ARTIFACT_DIR)
+    _copy_artifact_tree(src_root, dst_root, PREVIEW_VIDEO_ARTIFACT_DIR)
 
 
 def save_dataset_locally(dataset, env_id, metadata=None, video_artifact_dir=None):
@@ -2208,7 +2291,7 @@ def save_dataset_locally(dataset, env_id, metadata=None, video_artifact_dir=None
     dataset = _strip_runtime_columns(dataset)
     new_storage_format = _dataset_storage_format(dataset)
 
-    existing_video_dir = os.path.join(path, VIDEO_ARTIFACT_DIR)
+    existing_video_dir = path
     if os.path.exists(path):
         # Load existing dataset - UUIDs are already unique, no offsetting needed
         existing_dataset = load_from_disk(path, keep_in_memory=True)
@@ -2853,6 +2936,21 @@ def upload_local_dataset(env_id, max_retries=5, base_wait=1.0):
                                 path_or_fileobj=video_path,
                             )
                         )
+                        video_name = os.path.basename(video_relpath)
+                        if video_name.endswith(CANONICAL_VIDEO_SUFFIX):
+                            episode_stem = video_name[: -len(CANONICAL_VIDEO_SUFFIX)]
+                            preview_relpath = (
+                                f"{PREVIEW_VIDEO_ARTIFACT_DIR}/"
+                                f"{episode_stem}{PREVIEW_VIDEO_SUFFIX}"
+                            )
+                            preview_path = os.path.join(local_root, preview_relpath)
+                            if os.path.exists(preview_path):
+                                operations.append(
+                                    CommitOperationAdd(
+                                        path_in_repo=preview_relpath,
+                                        path_or_fileobj=preview_path,
+                                    )
+                                )
 
                 # 4. Build updated dataset card
                 card_content = _build_dataset_card_content(
@@ -3290,11 +3388,12 @@ def render_dataset_card_content(
 
     if storage_format == STORAGE_FORMAT_LOSSLESS_VIDEO:
         observation_lines = [
-            "- **video_path** (`string`): Relative path to the canonical lossless RGB episode video",
+            "- **video_path** (`string`): Relative path to the canonical lossless RGB observation stream under `observation_videos/`",
             "- **frame_index** (`int`): Observation frame index within `video_path`",
             "- **frame_sha256** (`string`): SHA-256 of the raw RGB frame bytes, verified after video encode/decode",
             "- **frame_width** / **frame_height** (`int`): Decoded RGB frame dimensions",
             "- **episode_num_observations** (`int`): Number of observations in the episode video",
+            "- Browser-friendly files under `videos/` are lossy previews only and are not used for trajectory replay/training",
         ]
     else:
         observation_lines = [
@@ -4634,7 +4733,7 @@ async def main():
                 env_id,
                 metadata=recorder._env_metadata,
                 video_artifact_dir=(
-                    recorder.video_artifact_dir
+                    recorder.temp_dir
                     if recorder.storage_format == STORAGE_FORMAT_LOSSLESS_VIDEO
                     else None
                 ),
