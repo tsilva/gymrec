@@ -107,6 +107,16 @@ def test_record_plan_defaults_agent_to_one_episode():
     assert plan.max_steps == 50
 
 
+@pytest.mark.parametrize("episodes", [0, -1])
+def test_record_plan_rejects_non_positive_episode_counts(episodes):
+    plan, error = main._make_record_plan(
+        argparse.Namespace(agent="random", headless=False, episodes=episodes, max_steps=None)
+    )
+
+    assert plan is None
+    assert "--episodes must be >= 1" in error
+
+
 def test_record_plan_requires_episodes_for_headless_agent():
     plan, error = main._make_record_plan(
         argparse.Namespace(agent="random", headless=True, episodes=None, max_steps=None)

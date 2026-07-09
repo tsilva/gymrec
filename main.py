@@ -4736,6 +4736,9 @@ def _make_record_plan(args):
     episodes = getattr(args, "episodes", None)
     max_steps = getattr(args, "max_steps", None)
 
+    if episodes is not None and episodes < 1:
+        return None, "--episodes must be >= 1"
+
     if agent == "human":
         if headless:
             return None, "--headless can only be used with --agent (not human mode)"
