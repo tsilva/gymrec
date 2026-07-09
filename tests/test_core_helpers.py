@@ -136,6 +136,18 @@ def make_minimal_dataset(episode_uuid=None, collector="random"):
     return dataset
 
 
+@pytest.fixture
+def temp_storage_dir(tmp_path):
+    if main.CONFIG is None:
+        main.CONFIG = main._load_config()
+    previous_local_dir = main.CONFIG["storage"]["local_dir"]
+    main.CONFIG["storage"]["local_dir"] = str(tmp_path)
+    try:
+        yield tmp_path
+    finally:
+        main.CONFIG["storage"]["local_dir"] = previous_local_dir
+
+
 def test_env_id_encoding_round_trips_special_characters():
     env_id = "ALE/Breakout-v5_custom"
     encoded = main._encode_env_id_for_hf(env_id)
@@ -277,7 +289,7 @@ def test_dataset_storage_format_uses_current_columns():
         == main.STORAGE_FORMAT_LOSSLESS_VIDEO
     )
     assert (
-        main._dataset_storage_format(DatasetLike({"video_path": ["observation_videos/a"]}))
+        main._dataset_storage_format(DatasetLike({"video_path": ["videos/e.rgb.mkv.bin"]}))
         == main.STORAGE_FORMAT_LOSSLESS_VIDEO
     )
     assert (
@@ -330,15 +342,15 @@ def test_remote_storage_conflict_message_allows_same_or_empty_remote():
     )
 
 
-def test_remote_storage_conflict_message_rejects_legacy_video_remote():
+def test_remote_storage_conflict_message_rejects_unsupported_remote_layout():
     message = main._remote_storage_conflict_message(
         "BreakoutNoFrameskip-v4",
         "user/gymrec__BreakoutNoFrameskip_dash_v4",
         main.STORAGE_FORMAT_LOSSLESS_VIDEO,
-        main.REMOTE_STORAGE_FORMAT_LEGACY_VIDEO,
+        main.REMOTE_STORAGE_FORMAT_UNSUPPORTED,
     )
 
-    assert "legacy lossless-video" in message
+    assert "unsupported" in message
     assert "--replace" in message
 
 
@@ -414,8 +426,8 @@ def test_record_plan_preserves_live_upload_flag():
     assert plan.upload_live is True
 
 
-def test_agent_input_source_does_not_own_headless_state():
-    source = main.AgentInputSource(lambda observation: "action", headless=True)
+def test_agent_input_source_wraps_policy_only():
+    source = main.AgentInputSource(lambda observation: "action")
 
     assert not hasattr(source, "headless")
     assert source.get_action(None) == "action"
@@ -524,50 +536,43 @@ def test_replay_resets_between_dataset_episodes():
     assert asyncio.run(run_replay()) == [111, 222]
 
 
-def test_live_upload_manifest_tracks_pending_failed_and_uploaded(tmp_path):
-    if main.CONFIG is None:
-        main.CONFIG = main._load_config()
-    old_local_dir = main.CONFIG["storage"]["local_dir"]
-    main.CONFIG["storage"]["local_dir"] = str(tmp_path)
-    package_dir = tmp_path / "episode"
+def test_live_upload_manifest_tracks_pending_failed_and_uploaded(temp_storage_dir):
+    package_dir = temp_storage_dir / "episode"
     package_dir.mkdir()
-    try:
-        main._set_live_upload_manifest_entry(
-            "BreakoutNoFrameskip-v4",
-            "episode1",
-            state="pending",
-            package_dir=str(package_dir),
-            storage_format=main.STORAGE_FORMAT_LOSSLESS_VIDEO,
-            frames=3,
-        )
-        entries = list(main._pending_live_upload_entries("BreakoutNoFrameskip-v4"))
-        assert entries[0][0] == "episode1"
-        assert entries[0][1]["state"] == "pending"
+    main._set_live_upload_manifest_entry(
+        "BreakoutNoFrameskip-v4",
+        "episode1",
+        state="pending",
+        package_dir=str(package_dir),
+        storage_format=main.STORAGE_FORMAT_LOSSLESS_VIDEO,
+        frames=3,
+    )
+    entries = list(main._pending_live_upload_entries("BreakoutNoFrameskip-v4"))
+    assert entries[0][0] == "episode1"
+    assert entries[0][1]["state"] == "pending"
 
-        main._set_live_upload_manifest_entry(
-            "BreakoutNoFrameskip-v4",
-            "episode1",
-            state="failed",
-            package_dir=str(package_dir),
-            storage_format=main.STORAGE_FORMAT_LOSSLESS_VIDEO,
-            frames=3,
-            error="network",
-        )
-        manifest = main._load_live_upload_manifest("BreakoutNoFrameskip-v4")
-        assert manifest["episodes"]["episode1"]["state"] == "failed"
-        assert manifest["episodes"]["episode1"]["error"] == "network"
+    main._set_live_upload_manifest_entry(
+        "BreakoutNoFrameskip-v4",
+        "episode1",
+        state="failed",
+        package_dir=str(package_dir),
+        storage_format=main.STORAGE_FORMAT_LOSSLESS_VIDEO,
+        frames=3,
+        error="network",
+    )
+    manifest = main._load_live_upload_manifest("BreakoutNoFrameskip-v4")
+    assert manifest["episodes"]["episode1"]["state"] == "failed"
+    assert manifest["episodes"]["episode1"]["error"] == "network"
 
-        main._set_live_upload_manifest_entry(
-            "BreakoutNoFrameskip-v4",
-            "episode1",
-            state="uploaded",
-            package_dir=str(package_dir),
-            storage_format=main.STORAGE_FORMAT_LOSSLESS_VIDEO,
-            frames=3,
-        )
-        assert list(main._pending_live_upload_entries("BreakoutNoFrameskip-v4")) == []
-    finally:
-        main.CONFIG["storage"]["local_dir"] = old_local_dir
+    main._set_live_upload_manifest_entry(
+        "BreakoutNoFrameskip-v4",
+        "episode1",
+        state="uploaded",
+        package_dir=str(package_dir),
+        storage_format=main.STORAGE_FORMAT_LOSSLESS_VIDEO,
+        frames=3,
+    )
+    assert list(main._pending_live_upload_entries("BreakoutNoFrameskip-v4")) == []
 
 
 def test_build_recorded_dataset_includes_video_episode_metadata():
@@ -603,12 +608,8 @@ def test_build_recorded_dataset_includes_video_episode_metadata():
     assert dataset["storage_format"] == [main.STORAGE_FORMAT_LOSSLESS_VIDEO] * 2
 
 
-def test_live_episode_manager_packages_shard_without_previews(tmp_path, monkeypatch):
-    if main.CONFIG is None:
-        main.CONFIG = main._load_config()
+def test_live_episode_manager_packages_shard_without_previews(temp_storage_dir, monkeypatch):
     main._lazy_init()
-    old_local_dir = main.CONFIG["storage"]["local_dir"]
-    main.CONFIG["storage"]["local_dir"] = str(tmp_path)
     episode_uuid = uuid.uuid4()
     episode_id = episode_uuid.hex
     video_relpath = f"videos/{episode_id}.rgb.mkv.bin"
@@ -646,30 +647,25 @@ def test_live_episode_manager_packages_shard_without_previews(tmp_path, monkeypa
         return True
 
     monkeypatch.setattr(main, "_upload_dataset_shard_to_hub", fake_upload)
-    try:
-        manager = main.LiveEpisodeUploadManager(
-            "BreakoutNoFrameskip-v4", main.STORAGE_FORMAT_LOSSLESS_VIDEO
-        )
-        package = manager.begin_episode(episode_uuid)
-        package_path = tmp_path / "BreakoutNoFrameskip_dash_v4_live_pending" / episode_id
-        video_path = package_path / video_relpath
-        video_path.parent.mkdir(parents=True)
-        video_path.write_bytes(b"video")
+    manager = main.LiveEpisodeUploadManager(
+        "BreakoutNoFrameskip-v4", main.STORAGE_FORMAT_LOSSLESS_VIDEO
+    )
+    package = manager.begin_episode(episode_uuid)
+    package_path = temp_storage_dir / "BreakoutNoFrameskip_dash_v4_live_pending" / episode_id
+    video_path = package_path / video_relpath
+    video_path.parent.mkdir(parents=True)
+    video_path.write_bytes(b"video")
 
-        assert manager.upload_episode(package, dataset) is True
-        assert calls
-        assert not package_path.exists()
-        manifest = main._load_live_upload_manifest("BreakoutNoFrameskip-v4")
-        assert manifest["episodes"][episode_id]["state"] == "uploaded"
-    finally:
-        main.CONFIG["storage"]["local_dir"] = old_local_dir
+    assert manager.upload_episode(package, dataset) is True
+    assert calls
+    assert not package_path.exists()
+    manifest = main._load_live_upload_manifest("BreakoutNoFrameskip-v4")
+    assert manifest["episodes"][episode_id]["state"] == "uploaded"
 
 
-def test_upload_uses_remote_episode_ids_when_local_marker_is_stale(tmp_path, monkeypatch):
-    if main.CONFIG is None:
-        main.CONFIG = main._load_config()
-    old_local_dir = main.CONFIG["storage"]["local_dir"]
-    main.CONFIG["storage"]["local_dir"] = str(tmp_path)
+def test_upload_uses_remote_episode_ids_when_local_marker_is_stale(
+    temp_storage_dir, monkeypatch
+):
     episode_uuid = uuid.uuid4()
     dataset = make_minimal_dataset(episode_uuid=episode_uuid)
     calls = []
@@ -682,54 +678,39 @@ def test_upload_uses_remote_episode_ids_when_local_marker_is_stale(tmp_path, mon
     monkeypatch.setattr(main, "drain_live_upload_queue", lambda *args, **kwargs: True)
     monkeypatch.setattr(main, "_remote_dataset_episode_ids", lambda env_id: set())
     monkeypatch.setattr(main, "_upload_dataset_shard_to_hub", fake_upload)
-    try:
-        dataset.save_to_disk(main.get_local_dataset_path("BreakoutNoFrameskip-v4"))
-        main._save_uploaded_episode_ids("BreakoutNoFrameskip-v4", {episode_uuid.hex})
+    dataset.save_to_disk(main.get_local_dataset_path("BreakoutNoFrameskip-v4"))
+    main._save_uploaded_episode_ids("BreakoutNoFrameskip-v4", {episode_uuid.hex})
 
-        assert main.upload_local_dataset("BreakoutNoFrameskip-v4") is True
-        assert len(calls) == 1
-        assert calls[0][2]["episode_ids"] == {episode_uuid.hex}
-    finally:
-        main.CONFIG["storage"]["local_dir"] = old_local_dir
+    assert main.upload_local_dataset("BreakoutNoFrameskip-v4") is True
+    assert len(calls) == 1
+    assert calls[0][2]["episode_ids"] == {episode_uuid.hex}
 
 
-def test_upload_local_dataset_fails_without_local_dataset_or_pending_queue(tmp_path, monkeypatch):
-    if main.CONFIG is None:
-        main.CONFIG = main._load_config()
-    old_local_dir = main.CONFIG["storage"]["local_dir"]
-    main.CONFIG["storage"]["local_dir"] = str(tmp_path)
+def test_upload_local_dataset_fails_without_local_dataset_or_pending_queue(
+    temp_storage_dir, monkeypatch
+):
     monkeypatch.setattr(main, "ensure_hf_login", lambda: True)
-    try:
-        assert main.upload_local_dataset("BreakoutNoFrameskip-v4") is False
-    finally:
-        main.CONFIG["storage"]["local_dir"] = old_local_dir
+    assert main.upload_local_dataset("BreakoutNoFrameskip-v4") is False
 
 
-def test_save_dataset_metadata_recordings_count_only_new_batch(tmp_path):
-    if main.CONFIG is None:
-        main.CONFIG = main._load_config()
-    old_local_dir = main.CONFIG["storage"]["local_dir"]
-    main.CONFIG["storage"]["local_dir"] = str(tmp_path)
-    try:
-        main.save_dataset_locally(
-            make_minimal_dataset(collector="random"),
-            "BreakoutNoFrameskip-v4",
-            metadata={"env_id": "BreakoutNoFrameskip-v4"},
-        )
-        main.save_dataset_locally(
-            make_minimal_dataset(collector="human"),
-            "BreakoutNoFrameskip-v4",
-            metadata={"env_id": "BreakoutNoFrameskip-v4"},
-        )
+def test_save_dataset_metadata_recordings_count_only_new_batch(temp_storage_dir):
+    main.save_dataset_locally(
+        make_minimal_dataset(collector="random"),
+        "BreakoutNoFrameskip-v4",
+        metadata={"env_id": "BreakoutNoFrameskip-v4"},
+    )
+    main.save_dataset_locally(
+        make_minimal_dataset(collector="human"),
+        "BreakoutNoFrameskip-v4",
+        metadata={"env_id": "BreakoutNoFrameskip-v4"},
+    )
 
-        with open(main._get_metadata_path("BreakoutNoFrameskip-v4")) as f:
-            metadata = json.load(f)
+    with open(main._get_metadata_path("BreakoutNoFrameskip-v4")) as f:
+        metadata = json.load(f)
 
-        assert [entry["episodes"] for entry in metadata["recordings"]] == [1, 1]
-        assert [entry["frames"] for entry in metadata["recordings"]] == [2, 2]
-        assert metadata["recordings"][1]["collectors"] == ["human"]
-    finally:
-        main.CONFIG["storage"]["local_dir"] = old_local_dir
+    assert [entry["episodes"] for entry in metadata["recordings"]] == [1, 1]
+    assert [entry["frames"] for entry in metadata["recordings"]] == [2, 2]
+    assert metadata["recordings"][1]["collectors"] == ["human"]
 
 
 def test_recover_live_image_journal_adds_truncated_terminal_row(tmp_path):

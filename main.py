@@ -217,7 +217,6 @@ STORAGE_FORMAT_IMAGES = "images"
 STORAGE_FORMAT_LOSSLESS_VIDEO = "lossless-video"
 STORAGE_FORMATS = (STORAGE_FORMAT_IMAGES, STORAGE_FORMAT_LOSSLESS_VIDEO)
 VIDEO_ARTIFACT_DIR = "videos"
-LEGACY_VIDEO_ARTIFACT_DIR = "observation_videos"
 PREVIEW_VIDEO_ARTIFACT_DIR = "videos"
 CANONICAL_VIDEO_SUFFIX = ".rgb.mkv.bin"
 PREVIEW_VIDEO_SUFFIX = ".preview.mp4"
@@ -809,7 +808,7 @@ def _lazy_init():
         CommitOperationAdd, \
         CommitOperationDelete, \
         hf_hub_download
-    global Dataset, HFImage, Value, load_dataset, load_from_disk, load_dataset_builder
+    global Dataset, HFImage, Value, load_dataset, load_from_disk
     global START_KEY, ATARI_KEY_BINDINGS, VIZDOOM_KEY_BINDINGS, STABLE_RETRO_KEY_BINDINGS
 
     import numpy as np
@@ -818,7 +817,6 @@ def _lazy_init():
         Dataset,
         Value,
         load_dataset,
-        load_dataset_builder,
         load_from_disk,
     )
     from datasets import (
@@ -1120,7 +1118,7 @@ class HumanInputSource(InputSource):
 class AgentInputSource(InputSource):
     """Agent input via policy function."""
 
-    def __init__(self, policy, headless=None):
+    def __init__(self, policy):
         self.policy = policy
 
     def reset(self, **kwargs):
@@ -1647,30 +1645,41 @@ def _select_huggingface_checkpoint(repo_id, revision, filename=None):
     return checkpoints[0]
 
 
+def _metadata_value(metadata, path):
+    value = metadata
+    for key in path:
+        if isinstance(value, dict) and key in value:
+            value = value[key]
+        elif isinstance(value, (list, tuple)) and isinstance(key, int) and key < len(value):
+            value = value[key]
+        else:
+            return None
+    return value
+
+
 def _metadata_int(metadata, *paths, default):
     for path in paths:
-        value = metadata
-        for key in path:
-            if isinstance(value, dict) and key in value:
-                value = value[key]
-            elif isinstance(value, (list, tuple)) and isinstance(key, int) and key < len(value):
-                value = value[key]
-            else:
-                value = None
-                break
+        value = _metadata_value(metadata, path)
         if value is not None:
             return int(value)
+    if default is None:
+        return None
     return int(default)
+
+
+def _metadata_float(metadata, *paths, default):
+    for path in paths:
+        value = _metadata_value(metadata, path)
+        if value is not None:
+            return float(value)
+    if default is None:
+        return None
+    return float(default)
 
 
 def _metadata_str(metadata, *paths, default=None):
     for path in paths:
-        value = metadata
-        for key in path:
-            if not isinstance(value, dict) or key not in value:
-                value = None
-                break
-            value = value[key]
+        value = _metadata_value(metadata, path)
         if value:
             return str(value)
     return default
@@ -1918,6 +1927,16 @@ def create_agent_policy(agent_type, env):
         raise ValueError(f"Unknown agent type: {agent_type}") from None
 
 
+def _recording_dataset_from_dict(data, storage_format):
+    """Build a Dataset with the canonical gymrec recording feature casts."""
+    dataset = Dataset.from_dict(data)
+    if storage_format == STORAGE_FORMAT_IMAGES:
+        dataset = dataset.cast_column("observations", HFImage())
+    dataset = dataset.cast_column("episode_id", Value("binary"))
+    dataset = dataset.cast_column("session_id", Value("binary"))
+    return dataset
+
+
 class DatasetRecorderWrapper(gym.Wrapper):
     """
     Gymnasium wrapper for recording and replaying Atari gameplay as Hugging Face datasets.
@@ -2044,12 +2063,7 @@ class DatasetRecorderWrapper(gym.Wrapper):
                     "episode_num_observations": self.episode_num_observations,
                 }
             )
-        dataset = Dataset.from_dict(data)
-        if self.storage_format == STORAGE_FORMAT_IMAGES:
-            dataset = dataset.cast_column("observations", HFImage())
-        dataset = dataset.cast_column("episode_id", Value("binary"))
-        dataset = dataset.cast_column("session_id", Value("binary"))
-        return dataset
+        return _recording_dataset_from_dict(data, self.storage_format)
 
     def _start_live_episode(self, episode_uuid):
         if not self._live_upload_enabled:
@@ -2981,8 +2995,8 @@ def _get_available_envs_from_local():
             # Check if this is a valid dataset directory
             if os.path.exists(os.path.join(entry_path, "dataset_info.json")):
                 env_id = _decode_hf_repo_name(entry)
-                # Skip old-format directories that do not round-trip through
-                # the current reversible encoding scheme.
+                # Skip directories that do not round-trip through the current
+                # reversible encoding scheme.
                 if _encode_env_id_for_hf(env_id) != entry:
                     continue
                 available.append(env_id)
@@ -3158,7 +3172,6 @@ def _copy_video_artifacts(src_root, dst_root):
     for relative_dir in {
         VIDEO_ARTIFACT_DIR,
         PREVIEW_VIDEO_ARTIFACT_DIR,
-        LEGACY_VIDEO_ARTIFACT_DIR,
     }:
         _copy_artifact_tree(src_root, dst_root, relative_dir)
 
@@ -3187,30 +3200,6 @@ def save_dataset_locally(dataset, env_id, metadata=None, video_artifact_dir=None
                 f"{new_storage_format} recordings to existing {existing_storage_format} dataset "
                 f"at {path}. Use a different [storage].local_dir or migrate explicitly."
             )
-
-        # Backward-compatible: add missing provenance columns with sentinel values
-        _SENTINEL_STR = "unknown"
-        _SENTINEL_BYTES = b"\x00" * 16
-        n_existing = len(existing_dataset)
-        if "session_id" not in existing_dataset.column_names:
-            existing_dataset = existing_dataset.add_column(
-                "session_id", [_SENTINEL_BYTES] * n_existing
-            )
-            existing_dataset = existing_dataset.cast_column("session_id", Value("binary"))
-        if "collector" not in existing_dataset.column_names:
-            existing_dataset = existing_dataset.add_column(
-                "collector", [_SENTINEL_STR] * n_existing
-            )
-        if "gymrec_version" not in existing_dataset.column_names:
-            existing_dataset = existing_dataset.add_column(
-                "gymrec_version", [_SENTINEL_STR] * n_existing
-            )
-        if "storage_format" not in existing_dataset.column_names:
-            existing_dataset = existing_dataset.add_column(
-                "storage_format", [existing_storage_format] * n_existing
-            )
-        if "storage_format" not in dataset.column_names:
-            dataset = dataset.add_column("storage_format", [new_storage_format] * len(dataset))
 
         # Concatenate datasets
         from datasets import concatenate_datasets
@@ -3281,7 +3270,7 @@ def load_local_dataset(env_id, attach_runtime=True):
     return dataset
 
 
-def load_recorded_dataset(env_id, streaming=False):
+def load_recorded_dataset(env_id):
     """Load a recorded dataset from local disk first, then from the Hub."""
     local_dataset = load_local_dataset(env_id)
     if local_dataset is not None:
@@ -3291,19 +3280,12 @@ def load_recorded_dataset(env_id, streaming=False):
         hf_repo_id = env_id_to_hf_repo_id(env_id)
         api = HfApi()
         api.dataset_info(hf_repo_id)
-        dataset = load_dataset(hf_repo_id, split="train", streaming=streaming)
+        dataset = load_dataset(hf_repo_id, split="train")
     except Exception:
         return None, None, None
 
-    if streaming:
-        try:
-            builder = load_dataset_builder(hf_repo_id)
-            total = builder.info.splits["train"].num_examples if builder.info.splits else None
-        except Exception:
-            total = None
-    else:
-        dataset = _attach_video_runtime_source(dataset, hf_repo_id=hf_repo_id)
-        total = len(dataset)
+    dataset = _attach_video_runtime_source(dataset, hf_repo_id=hf_repo_id)
+    total = len(dataset)
     return dataset, "hub", total
 
 
@@ -3405,24 +3387,6 @@ def _human_record_env_make_kwargs(backend):
     return {}
 
 
-def _coerce_metadata_int(metadata, key):
-    if not metadata or metadata.get(key) is None:
-        return None
-    try:
-        return int(metadata[key])
-    except (TypeError, ValueError):
-        return None
-
-
-def _coerce_metadata_float(metadata, key):
-    if not metadata or metadata.get(key) is None:
-        return None
-    try:
-        return float(metadata[key])
-    except (TypeError, ValueError):
-        return None
-
-
 def _env_make_kwargs_from_metadata(env_id, metadata, backend=None):
     """Rebuild environment creation kwargs from saved recording metadata."""
     if not metadata:
@@ -3433,8 +3397,14 @@ def _env_make_kwargs_from_metadata(env_id, metadata, backend=None):
         return dict(saved_kwargs)
 
     backend = backend or metadata.get("backend") or classify_env_id(env_id)
-    frameskip = _coerce_metadata_int(metadata, "frameskip")
-    sticky = _coerce_metadata_float(metadata, "sticky_actions")
+    try:
+        frameskip = _metadata_int(metadata, ("frameskip",), default=None)
+    except (TypeError, ValueError):
+        frameskip = None
+    try:
+        sticky = _metadata_float(metadata, ("sticky_actions",), default=None)
+    except (TypeError, ValueError):
+        sticky = None
     kwargs = {}
 
     if backend == "atari":
@@ -3833,56 +3803,11 @@ def export_dataset_video(
     return True
 
 
-REMOTE_STORAGE_FORMAT_LEGACY_VIDEO = "legacy-lossless-video"
-
-
-def _upload_canonical_video_relpath(video_relpath):
-    """Return the current Hub path for a canonical video artifact."""
-    if not video_relpath:
-        return video_relpath
-    if video_relpath.startswith(f"{LEGACY_VIDEO_ARTIFACT_DIR}/"):
-        video_name = os.path.basename(video_relpath)
-        if video_name.endswith(".mkv") and not video_name.endswith(CANONICAL_VIDEO_SUFFIX):
-            video_name = f"{video_name[:-4]}{CANONICAL_VIDEO_SUFFIX}"
-        return f"{VIDEO_ARTIFACT_DIR}/{video_name}"
-    if (
-        video_relpath.startswith(f"{VIDEO_ARTIFACT_DIR}/")
-        and video_relpath.endswith(".mkv")
-        and not video_relpath.endswith(CANONICAL_VIDEO_SUFFIX)
-    ):
-        return f"{VIDEO_ARTIFACT_DIR}/{os.path.basename(video_relpath)[:-4]}{CANONICAL_VIDEO_SUFFIX}"
-    return video_relpath
-
-
-def _rewrite_video_paths_for_upload(dataset):
-    """Normalize legacy local video paths before writing Hub parquet shards."""
-    if "video_path" not in dataset.column_names:
-        return dataset
-    video_paths = list(dataset["video_path"])
-    rewritten_paths = [_upload_canonical_video_relpath(path) for path in video_paths]
-    if rewritten_paths == video_paths:
-        return dataset
-    data = {
-        column_name: rewritten_paths if column_name == "video_path" else dataset[column_name]
-        for column_name in dataset.column_names
-    }
-    return Dataset.from_dict(data, features=dataset.features)
+REMOTE_STORAGE_FORMAT_UNSUPPORTED = "unsupported"
 
 
 def _local_canonical_video_path(local_root, upload_relpath):
     """Find the local source file for a canonical video uploaded at upload_relpath."""
-    candidates = [upload_relpath]
-    if upload_relpath.startswith(f"{VIDEO_ARTIFACT_DIR}/"):
-        video_name = os.path.basename(upload_relpath)
-        candidates.append(f"{LEGACY_VIDEO_ARTIFACT_DIR}/{video_name}")
-        if video_name.endswith(CANONICAL_VIDEO_SUFFIX):
-            episode_stem = video_name[: -len(CANONICAL_VIDEO_SUFFIX)]
-            candidates.append(f"{VIDEO_ARTIFACT_DIR}/{episode_stem}.mkv")
-            candidates.append(f"{LEGACY_VIDEO_ARTIFACT_DIR}/{episode_stem}.mkv")
-    for relpath in candidates:
-        path = os.path.join(local_root, relpath)
-        if os.path.exists(path):
-            return path
     return os.path.join(local_root, upload_relpath)
 
 
@@ -3891,16 +3816,9 @@ def _preview_video_relpath(episode_stem):
 
 
 def _local_preview_video_path(local_root, episode_stem):
-    """Find a current or legacy local preview source file."""
-    candidates = [
-        _preview_video_relpath(episode_stem),
-        f"{PREVIEW_VIDEO_ARTIFACT_DIR}/{episode_stem}.mp4",
-    ]
-    for relpath in candidates:
-        path = os.path.join(local_root, relpath)
-        if os.path.exists(path):
-            return path
-    return None
+    """Find a current local preview source file."""
+    path = os.path.join(local_root, _preview_video_relpath(episode_stem))
+    return path if os.path.exists(path) else None
 
 
 def _remote_storage_format_from_files(file_paths):
@@ -3912,19 +3830,16 @@ def _remote_storage_format_from_files(file_paths):
         path.startswith(f"{VIDEO_ARTIFACT_DIR}/") and path.endswith(CANONICAL_VIDEO_SUFFIX)
         for path in file_paths
     )
-    has_legacy_canonical_video = any(
-        path.startswith(f"{LEGACY_VIDEO_ARTIFACT_DIR}/") and path.endswith(CANONICAL_VIDEO_SUFFIX)
-        for path in file_paths
-    )
-    has_legacy_mkv = any(
-        path.startswith(f"{PREVIEW_VIDEO_ARTIFACT_DIR}/") and path.endswith(".mkv")
+    has_unsupported_video = any(
+        path.startswith(f"{VIDEO_ARTIFACT_DIR}/")
+        and not (path.endswith(CANONICAL_VIDEO_SUFFIX) or path.endswith(PREVIEW_VIDEO_SUFFIX))
         for path in file_paths
     )
 
     if has_canonical_video:
         return STORAGE_FORMAT_LOSSLESS_VIDEO
-    if has_legacy_canonical_video or has_legacy_mkv:
-        return REMOTE_STORAGE_FORMAT_LEGACY_VIDEO
+    if has_unsupported_video:
+        return REMOTE_STORAGE_FORMAT_UNSUPPORTED
     if has_data_shard:
         return STORAGE_FORMAT_IMAGES
     return None
@@ -3933,16 +3848,8 @@ def _remote_storage_format_from_files(file_paths):
 def _remote_storage_conflict_message(env_id, hf_repo_id, local_format, remote_format):
     if remote_format is None or remote_format == local_format:
         return None
-    if remote_format == REMOTE_STORAGE_FORMAT_LEGACY_VIDEO:
-        remote_label = "legacy lossless-video"
-        detail = (
-            "It contains old video artifact names rather than canonical "
-            f"`{VIDEO_ARTIFACT_DIR}/*{CANONICAL_VIDEO_SUFFIX}` streams with "
-            f"`{VIDEO_ARTIFACT_DIR}/*{PREVIEW_VIDEO_SUFFIX}` previews."
-        )
-    else:
-        remote_label = remote_format
-        detail = "Its parquet shards use a different observation schema."
+    remote_label = remote_format
+    detail = "Its files do not match the current local observation schema."
 
     return (
         f"Remote dataset {hf_repo_id} already contains {remote_label} data, "
@@ -4033,8 +3940,6 @@ def _upload_dataset_shard_to_hub(
             with tempfile.TemporaryDirectory() as tmpdir:
                 shard_path = os.path.join(tmpdir, "shard.parquet")
                 upload_dataset = _strip_runtime_columns(dataset)
-                if storage_format == STORAGE_FORMAT_LOSSLESS_VIDEO:
-                    upload_dataset = _rewrite_video_paths_for_upload(upload_dataset)
                 upload_dataset.to_parquet(shard_path)
                 shard_name = (
                     "data/train-00000-of-00001.parquet"
@@ -4294,12 +4199,7 @@ def _dataset_from_recovered_live_records(package_dir, episode_id, records):
     for key, value in terminal_record.items():
         data[key].append(value)
 
-    dataset = Dataset.from_dict(data)
-    if storage_format == STORAGE_FORMAT_IMAGES:
-        dataset = dataset.cast_column("observations", HFImage())
-    dataset = dataset.cast_column("episode_id", Value("binary"))
-    dataset = dataset.cast_column("session_id", Value("binary"))
-    return dataset
+    return _recording_dataset_from_dict(data, storage_format)
 
 
 def _recover_live_recording_package(env_id, episode_id, entry):
@@ -6197,7 +6097,7 @@ async def main():
                     f"To upload later: [{STYLE_CMD}]{_gymrec_cmd('upload', env_id)}[/]"
                 )
     elif args.command == "playback":
-        loaded_dataset, source, total = load_recorded_dataset(env_id, streaming=False)
+        loaded_dataset, source, total = load_recorded_dataset(env_id)
         if loaded_dataset is None:
             _print_missing_dataset(env_id)
             return
@@ -6219,7 +6119,7 @@ async def main():
             episodes=playback_episodes,
         )
     elif args.command == "video":
-        loaded_dataset, source, total = load_recorded_dataset(env_id, streaming=False)
+        loaded_dataset, source, total = load_recorded_dataset(env_id)
         if loaded_dataset is None:
             _print_missing_dataset(env_id)
             return

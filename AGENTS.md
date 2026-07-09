@@ -59,9 +59,6 @@ uv run python main.py list_environments
 
 ## Architecture
 
-### Single-File Design
-All code is in `main.py`. The project prioritizes simplicity over modularization.
-
 ### Key Components
 
 **InputSource Abstraction**
@@ -102,7 +99,6 @@ All code is in `main.py`. The project prioritizes simplicity over modularization
   - `session_id` (`binary(16)`): UUID grouping all episodes from one `gymrec record` run
   - `collector` (`string`): Who collected the data (`"human"`, `"random"`, `"mario"`, `"breakout"`, or future agent names)
   - `gymrec_version` (`string`): Version string like `"0.1.0+abc1234"` from `_get_gymrec_version()`
-- Backward-compatible concatenation: old datasets missing provenance columns get sentinel values (`"unknown"` / `b'\x00'*16`)
 
 **FPS Handling**
 - Attempts to read from environment metadata first
@@ -161,7 +157,7 @@ if isinstance(frame, dict):
 - **Async design**: Main loop uses `asyncio` with `await asyncio.sleep()` for frame pacing.
 - **Environment variables**: Requires `HF_TOKEN` in `.env` for dataset uploads.
 - **Headless mode**: Only available with `--agent` flag (not human mode).
-- README.md must be kept up to date with any significant project changes using the readme-generator skill.
+- README.md must be kept up to date with significant project changes.
 
 ## Creating Custom Policies
 
