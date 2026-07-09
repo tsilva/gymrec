@@ -50,6 +50,7 @@ gymrec reindex_games                             # re-scan ROMS_PATH and refresh
 gymrec record BreakoutNoFrameskip-v4             # record human gameplay
 gymrec record BreakoutNoFrameskip-v4 --dry-run   # save locally without upload prompt
 gymrec record BreakoutNoFrameskip-v4 --storage lossless-video --dry-run
+gymrec record BreakoutNoFrameskip-v4 --upload-live
 gymrec record SuperMarioBros-Nes-v0 --agent random --headless --episodes 100
 gymrec record BreakoutNoFrameskip-v4 --agent breakout --headless --episodes 50
 gymrec record hf://tsilva/SuperMarioBros-Nes-v0_Level1-1 --headless --episodes 10 --dry-run
@@ -78,6 +79,8 @@ Agent recording supports `human`, `random`, `mario`, and `breakout`. `--headless
 `record` also accepts Hugging Face SB3 policy model refs such as `hf://tsilva/SuperMarioBros-Nes-v0_Level1-1` or `https://huggingface.co/tsilva/SuperMarioBros-Nes-v0_Level1-1`. gymrec downloads the repo's `.zip` checkpoint and `model_metadata.json`, infers the Stable-Retro environment, state, action set, frame skip, frame stack, and preprocessing contract, then records the policy's native environment actions as a normal gymrec dataset. HF policy recording samples stochastic actions by default; pass `--deterministic` to use argmax actions. Use `--hf-file` when a model repo contains more than one `.zip`; use `--device cpu`, `--device mps`, or `--device cuda` to override SB3 device selection.
 
 Observation storage defaults to `lossless-video`, which stores canonical observations as per-episode lossless RGB streams under `videos/<episode>.rgb.mkv.bin` plus table rows containing `video_path`, `frame_index`, and `frame_sha256`; each canonical stream is decoded and hash-verified before the recording is accepted. Browser-friendly `videos/<episode>.preview.mp4` files are preview-only and are not used for replay/training. Lossless video storage requires `ffmpeg` and `ffprobe` on `PATH`. Use `--storage images` to store one lossless WebP-backed HF `Image` row per observation instead.
+
+Use `--upload-live` to preflight Hugging Face access before gameplay and upload each completed episode as its own shard while recording. In live mode, `lossless-video` streams frames directly into ffmpeg instead of buffering the whole episode in memory; verified episodes are uploaded immediately, failed uploads are left in a resumable local queue, and `gymrec upload <env_id>` retries that queue. Live upload is incompatible with `--dry-run` and skips preview MP4 generation.
 
 Hub uploads append new parquet shards only when the existing remote dataset has the same storage layout as the local dataset. If an older Hub repo still contains image-backed `observations` shards, legacy `observation_videos/` artifacts, or legacy `videos/*.mkv` files, `gymrec upload` refuses to append so the Dataset Viewer does not show a mixed/stale schema; use `gymrec upload <env_id> --replace` to intentionally rewrite the remote repo from the current local dataset.
 

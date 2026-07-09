@@ -362,6 +362,83 @@ def _encode_lossless_rgb_video(frames, output_path, fps, ffmpeg_path=None):
             process.stderr.close()
 
 
+class _StreamingLosslessVideoWriter:
+    """Write canonical RGB frames to ffmpeg without buffering an episode in memory."""
+
+    def __init__(self, output_path, fps, ffmpeg_path=None):
+        self.output_path = output_path
+        self.fps = fps
+        self.ffmpeg_path = ffmpeg_path or _require_lossless_video_tools()[0]
+        self.process = None
+        self.shape = None
+        self.frames_written = 0
+
+    def _start(self, frame):
+        self.shape = tuple(frame.shape)
+        height, width = frame.shape[:2]
+        os.makedirs(os.path.dirname(self.output_path), exist_ok=True)
+        cmd = [
+            self.ffmpeg_path,
+            "-y",
+            "-loglevel",
+            "error",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgb24",
+            "-s",
+            f"{width}x{height}",
+            "-r",
+            str(max(int(round(float(self.fps))), 1)),
+            "-i",
+            "-",
+            "-an",
+            "-c:v",
+            "libx264rgb",
+            "-crf",
+            "0",
+            "-preset",
+            "veryslow",
+            "-pix_fmt",
+            "rgb24",
+            "-f",
+            "matroska",
+            self.output_path,
+        ]
+        self.process = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    def write(self, frame):
+        frame = np.ascontiguousarray(frame)
+        if self.process is None:
+            self._start(frame)
+        elif tuple(frame.shape) != self.shape:
+            raise ValueError(f"All video frames must have shape {self.shape}; got {frame.shape}")
+        self.process.stdin.write(frame.tobytes())
+        self.frames_written += 1
+
+    def close(self):
+        if self.process is None:
+            raise ValueError("Cannot encode an empty video")
+        try:
+            self.process.stdin.close()
+            stderr = self.process.stderr.read().decode("utf-8", errors="replace").strip()
+            return_code = self.process.wait()
+            if return_code != 0:
+                raise RuntimeError(stderr or f"ffmpeg exited with status {return_code}")
+        finally:
+            if self.process.stderr is not None:
+                self.process.stderr.close()
+
+    def abort(self):
+        if self.process is None:
+            return
+        if self.process.stdin is not None and not self.process.stdin.closed:
+            self.process.stdin.close()
+        self.process.wait()
+        if self.process.stderr is not None:
+            self.process.stderr.close()
+
+
 def _encode_browser_preview_video(frames, output_path, fps, ffmpeg_path=None):
     """Encode a lossy browser-safe preview MP4. This is never canonical data."""
     if not frames:
@@ -460,6 +537,62 @@ def _decode_lossless_rgb_video(video_path, width, height, cache=True):
     if cache:
         _VIDEO_DECODE_CACHE[cache_key] = frames
     return frames
+
+
+def _verify_lossless_rgb_video_stream(video_path, width, height, expected_hashes, ffmpeg_path=None):
+    """Verify a canonical video by streaming decoded RGB frames and comparing hashes."""
+    ffmpeg_path = ffmpeg_path or shutil.which("ffmpeg")
+    if ffmpeg_path is None:
+        raise RuntimeError("ffmpeg is required to verify video-backed observations")
+
+    frame_size = int(width) * int(height) * 3
+    if frame_size <= 0:
+        raise RuntimeError(f"Decoded video dimensions are invalid for {video_path}")
+
+    cmd = [
+        ffmpeg_path,
+        "-v",
+        "error",
+        "-i",
+        os.path.abspath(video_path),
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "rgb24",
+        "-",
+    ]
+    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        for frame_index, expected_hash in enumerate(expected_hashes):
+            chunk = process.stdout.read(frame_size)
+            if len(chunk) != frame_size:
+                raise RuntimeError(
+                    f"Decoded video ended at frame {frame_index}; expected {len(expected_hashes)} frames"
+                )
+            decoded_frame = np.frombuffer(chunk, dtype=np.uint8).reshape(
+                (int(height), int(width), 3)
+            )
+            actual_hash = _sha256_rgb(decoded_frame)
+            if actual_hash != expected_hash:
+                raise RuntimeError(
+                    "Lossless video verification failed for "
+                    f"{video_path} frame {frame_index}: {actual_hash} != {expected_hash}"
+                )
+
+        extra = process.stdout.read(1)
+        if extra:
+            raise RuntimeError(
+                f"Decoded video has more than {len(expected_hashes)} frames: {video_path}"
+            )
+        stderr = process.stderr.read().decode("utf-8", errors="replace").strip()
+        return_code = process.wait()
+        if return_code != 0:
+            raise RuntimeError(stderr or f"ffmpeg exited with status {return_code}")
+    finally:
+        if process.stdout is not None:
+            process.stdout.close()
+        if process.stderr is not None:
+            process.stderr.close()
 
 
 def _episode_progress(transient=False):
@@ -1675,6 +1808,89 @@ AGENT_POLICY_FACTORIES = {
 }
 
 
+@dataclass(frozen=True)
+class LiveEpisodePackage:
+    episode_id: str
+    package_dir: str
+
+    @property
+    def video_root(self):
+        return self.package_dir
+
+    @property
+    def frame_dir(self):
+        return os.path.join(self.package_dir, "frames")
+
+    @property
+    def parquet_path(self):
+        return os.path.join(self.package_dir, "episode.parquet")
+
+
+class LiveEpisodeUploadManager:
+    """Materialize, upload, and track one verified episode at a time."""
+
+    def __init__(self, env_id, storage_format, max_retries=5, base_wait=1.0):
+        self.env_id = env_id
+        self.storage_format = storage_format
+        self.max_retries = max_retries
+        self.base_wait = base_wait
+        self.queue_dir = _get_live_upload_queue_dir(env_id)
+
+    def begin_episode(self, episode_uuid):
+        episode_id = episode_uuid.hex
+        package_dir = os.path.join(self.queue_dir, episode_id)
+        if os.path.exists(package_dir):
+            shutil.rmtree(package_dir)
+        os.makedirs(package_dir, exist_ok=True)
+        return LiveEpisodePackage(episode_id=episode_id, package_dir=package_dir)
+
+    def upload_episode(self, package, dataset):
+        os.makedirs(package.package_dir, exist_ok=True)
+        dataset = _strip_runtime_columns(dataset)
+        dataset.to_parquet(package.parquet_path)
+        _set_live_upload_manifest_entry(
+            self.env_id,
+            package.episode_id,
+            state="pending",
+            package_dir=package.package_dir,
+            storage_format=self.storage_format,
+            frames=len(dataset),
+        )
+        success = _upload_dataset_shard_to_hub(
+            self.env_id,
+            dataset,
+            storage_format=self.storage_format,
+            local_root=package.package_dir,
+            episode_ids={package.episode_id},
+            replace=False,
+            include_previews=False,
+            max_retries=self.max_retries,
+            base_wait=self.base_wait,
+        )
+        if success:
+            _set_live_upload_manifest_entry(
+                self.env_id,
+                package.episode_id,
+                state="uploaded",
+                package_dir=package.package_dir,
+                storage_format=self.storage_format,
+                frames=len(dataset),
+            )
+            shutil.rmtree(package.package_dir, ignore_errors=True)
+            return True
+
+        _set_live_upload_manifest_entry(
+            self.env_id,
+            package.episode_id,
+            state="failed",
+            package_dir=package.package_dir,
+            storage_format=self.storage_format,
+            frames=len(dataset),
+            error="upload failed",
+        )
+        return False
+
+
 def create_agent_policy(agent_type, env):
     """Create the configured agent policy for an environment."""
     try:
@@ -1695,6 +1911,7 @@ class DatasetRecorderWrapper(gym.Wrapper):
         headless=False,
         collector="human",
         storage_format=None,
+        live_upload_manager=None,
     ):
         _lazy_init()
         super().__init__(env)
@@ -1711,6 +1928,7 @@ class DatasetRecorderWrapper(gym.Wrapper):
         self.headless = headless
         self.input_source = input_source
         self.collector = collector
+        self.live_upload_manager = live_upload_manager
         self._gymrec_version = _get_gymrec_version()
 
         if not headless:
@@ -1743,6 +1961,8 @@ class DatasetRecorderWrapper(gym.Wrapper):
         self.video_artifact_dir = os.path.join(self.temp_dir, VIDEO_ARTIFACT_DIR)
         self._current_episode_video_frames = []
         self._current_episode_video_hashes = []
+        self._live_episode = None
+        self._live_video_writer = None
 
         self._fps = None
         self._fps_changed_at = 0
@@ -1754,6 +1974,69 @@ class DatasetRecorderWrapper(gym.Wrapper):
         self._recorded_dataset = None
         self._env_metadata = None
         self._max_episodes = None  # None means unlimited
+
+    @property
+    def _live_upload_enabled(self):
+        return self.live_upload_manager is not None
+
+    def _clear_recording_buffers(self):
+        self.episode_ids.clear()
+        self.seeds.clear()
+        self.frames.clear()
+        self.actions.clear()
+        self.rewards.clear()
+        self.terminations.clear()
+        self.truncations.clear()
+        self.infos.clear()
+        self.session_ids.clear()
+        self.video_paths.clear()
+        self.frame_indices.clear()
+        self.frame_sha256s.clear()
+        self.frame_widths.clear()
+        self.frame_heights.clear()
+        self.episode_num_observations.clear()
+        self._current_episode_video_frames.clear()
+        self._current_episode_video_hashes.clear()
+
+    def _build_recorded_dataset(self):
+        data = {
+            "episode_id": self.episode_ids,
+            "seed": self.seeds,
+            "actions": self.actions,
+            "rewards": self.rewards,
+            "terminations": self.terminations,
+            "truncations": self.truncations,
+            "infos": self.infos,
+            "session_id": self.session_ids,
+            "collector": [self.collector] * len(self.frames),
+            "gymrec_version": [self._gymrec_version] * len(self.frames),
+            "storage_format": [self.storage_format] * len(self.frames),
+        }
+        if self.storage_format == STORAGE_FORMAT_IMAGES:
+            data["observations"] = self.frames
+        else:
+            data.update(
+                {
+                    "video_path": self.video_paths,
+                    "frame_index": self.frame_indices,
+                    "frame_sha256": self.frame_sha256s,
+                    "frame_width": self.frame_widths,
+                    "frame_height": self.frame_heights,
+                    "episode_num_observations": self.episode_num_observations,
+                }
+            )
+        dataset = Dataset.from_dict(data)
+        if self.storage_format == STORAGE_FORMAT_IMAGES:
+            dataset = dataset.cast_column("observations", HFImage())
+        dataset = dataset.cast_column("episode_id", Value("binary"))
+        dataset = dataset.cast_column("session_id", Value("binary"))
+        return dataset
+
+    def _start_live_episode(self, episode_uuid):
+        if not self._live_upload_enabled:
+            return
+        self._live_episode = self.live_upload_manager.begin_episode(episode_uuid)
+        self._live_video_writer = None
 
     def _ensure_screen(self, frame):
         """
@@ -1771,7 +2054,11 @@ class DatasetRecorderWrapper(gym.Wrapper):
     def _save_frame_image(self, frame):
         """Save a frame as lossless WebP and return the file path."""
         frame_uint8 = _observation_to_rgb_array(frame)
-        path = os.path.join(self.temp_dir, f"frame_{len(self.frames):05d}.webp")
+        base_dir = self.temp_dir
+        if self._live_upload_enabled and self._live_episode is not None:
+            base_dir = self._live_episode.frame_dir
+        os.makedirs(base_dir, exist_ok=True)
+        path = os.path.join(base_dir, f"frame_{len(self.frames):05d}.webp")
         img = PILImage.fromarray(frame_uint8)
         img.save(path, format="WEBP", lossless=True, method=6)
         return path
@@ -1783,11 +2070,23 @@ class DatasetRecorderWrapper(gym.Wrapper):
             return
 
         frame_array = _observation_to_rgb_array(frame)
-        frame_index = len(self._current_episode_video_frames)
+        frame_index = len(self._current_episode_video_hashes)
         frame_hash = _sha256_rgb(frame_array)
         video_relpath = f"{VIDEO_ARTIFACT_DIR}/{episode_uuid.hex}{CANONICAL_VIDEO_SUFFIX}"
 
-        self._current_episode_video_frames.append(frame_array.copy())
+        if self._live_upload_enabled:
+            if self._live_episode is None:
+                self._start_live_episode(episode_uuid)
+            video_path = os.path.join(self._live_episode.video_root, video_relpath)
+            if self._live_video_writer is None:
+                self._live_video_writer = _StreamingLosslessVideoWriter(
+                    video_path,
+                    self._fps or get_default_fps(self.env),
+                    ffmpeg_path=self._ffmpeg_path,
+                )
+            self._live_video_writer.write(frame_array)
+        else:
+            self._current_episode_video_frames.append(frame_array.copy())
         self._current_episode_video_hashes.append(frame_hash)
         self.frames.append(None)
         self.video_paths.append(video_relpath)
@@ -1801,16 +2100,37 @@ class DatasetRecorderWrapper(gym.Wrapper):
         """Encode and verify the current episode's canonical observation video."""
         if self.storage_format != STORAGE_FORMAT_LOSSLESS_VIDEO:
             return
-        if not self._current_episode_video_frames:
+        if not self._current_episode_video_hashes:
             return
 
         video_relpath = f"{VIDEO_ARTIFACT_DIR}/{episode_uuid.hex}{CANONICAL_VIDEO_SUFFIX}"
-        video_path = os.path.join(self.temp_dir, video_relpath)
-        preview_relpath = f"{PREVIEW_VIDEO_ARTIFACT_DIR}/{episode_uuid.hex}{PREVIEW_VIDEO_SUFFIX}"
-        preview_path = os.path.join(self.temp_dir, preview_relpath)
         expected_hashes = list(self._current_episode_video_hashes)
         frame_count = len(expected_hashes)
 
+        if self._live_upload_enabled:
+            if self._live_video_writer is None:
+                raise RuntimeError("Live video episode has no active ffmpeg writer")
+            video_path = self._live_video_writer.output_path
+            width = self.frame_widths[-1]
+            height = self.frame_heights[-1]
+            self._live_video_writer.close()
+            self._live_video_writer = None
+            _verify_lossless_rgb_video_stream(
+                video_path,
+                width,
+                height,
+                expected_hashes,
+                ffmpeg_path=self._ffmpeg_path,
+            )
+            start_index = len(self.episode_num_observations) - frame_count
+            for row_index in range(start_index, len(self.episode_num_observations)):
+                self.episode_num_observations[row_index] = frame_count
+            self._current_episode_video_hashes.clear()
+            return
+
+        video_path = os.path.join(self.temp_dir, video_relpath)
+        preview_relpath = f"{PREVIEW_VIDEO_ARTIFACT_DIR}/{episode_uuid.hex}{PREVIEW_VIDEO_SUFFIX}"
+        preview_path = os.path.join(self.temp_dir, preview_relpath)
         _encode_lossless_rgb_video(
             self._current_episode_video_frames,
             video_path,
@@ -1886,6 +2206,23 @@ class DatasetRecorderWrapper(gym.Wrapper):
         self.infos.append(None)
         self.session_ids.append(self._session_uuid.bytes)
         self._finalize_video_episode(episode_uuid)
+        self._finish_live_episode()
+
+    def _finish_live_episode(self):
+        if not self._live_upload_enabled or not self.frames:
+            return
+        package = self._live_episode
+        if package is None:
+            raise RuntimeError("Live upload episode was not initialized")
+        dataset = self._build_recorded_dataset()
+        success = self.live_upload_manager.upload_episode(package, dataset)
+        if not success:
+            console.print(
+                f"[{STYLE_INFO}]Episode {package.episode_id} kept for retry: "
+                f"[{STYLE_CMD}]{_gymrec_cmd('upload', self.live_upload_manager.env_id)}[/]"
+            )
+        self._clear_recording_buffers()
+        self._live_episode = None
 
     def _input_loop(self):
         """
@@ -2160,6 +2497,9 @@ class DatasetRecorderWrapper(gym.Wrapper):
             return self._recorded_dataset
         finally:
             self.recording = False
+            if self._live_video_writer is not None:
+                self._live_video_writer.abort()
+                self._live_video_writer = None
             # Don't delete temp_dir here - dataset.save_to_disk() needs the image files
             # temp_dir cleanup happens in main() after save_dataset_locally()
             if not self.headless:
@@ -2175,23 +2515,7 @@ class DatasetRecorderWrapper(gym.Wrapper):
             fps = get_default_fps(self.env)
         self._fps = fps
 
-        self.episode_ids.clear()
-        self.seeds.clear()
-        self.frames.clear()
-        self.actions.clear()
-        self.rewards.clear()
-        self.terminations.clear()
-        self.truncations.clear()
-        self.infos.clear()
-        self.session_ids.clear()
-        self.video_paths.clear()
-        self.frame_indices.clear()
-        self.frame_sha256s.clear()
-        self.frame_widths.clear()
-        self.frame_heights.clear()
-        self.episode_num_observations.clear()
-        self._current_episode_video_frames.clear()
-        self._current_episode_video_hashes.clear()
+        self._clear_recording_buffers()
 
         # Capture environment metadata for dataset card
         self._env_metadata = _capture_env_metadata(self.env)
@@ -2202,6 +2526,7 @@ class DatasetRecorderWrapper(gym.Wrapper):
         seed = self._current_episode_seed
         self._episode_count = 1
         self._cumulative_reward = 0.0
+        self._start_live_episode(self._current_episode_uuid)
         obs, _ = self.env.reset(seed=seed)
 
         # Setup input source
@@ -2289,6 +2614,7 @@ class DatasetRecorderWrapper(gym.Wrapper):
                 self._current_episode_uuid = uuid.uuid4()
                 self._current_episode_seed = int(time.time())
                 seed = self._current_episode_seed
+                self._start_live_episode(self._current_episode_uuid)
                 obs, _ = self.env.reset(seed=seed)
                 if hasattr(self.input_source, "reset"):
                     self.input_source.reset(seed=seed, observation=obs)
@@ -2305,44 +2631,7 @@ class DatasetRecorderWrapper(gym.Wrapper):
             self._record_terminal_observation(self._current_episode_uuid, obs)
 
         if self.recording and self.frames:
-            data = {
-                "episode_id": self.episode_ids,
-                "seed": self.seeds,
-                "actions": self.actions,
-                "rewards": self.rewards,
-                "terminations": self.terminations,
-                "truncations": self.truncations,
-                "infos": self.infos,
-                "session_id": self.session_ids,
-                "collector": [self.collector] * len(self.frames),
-                "gymrec_version": [self._gymrec_version] * len(self.frames),
-                "storage_format": [self.storage_format] * len(self.frames),
-            }
-            if self.storage_format == STORAGE_FORMAT_IMAGES:
-                data["observations"] = self.frames
-            else:
-                data.update(
-                    {
-                        "video_path": self.video_paths,
-                        "frame_index": self.frame_indices,
-                        "frame_sha256": self.frame_sha256s,
-                        "frame_width": self.frame_widths,
-                        "frame_height": self.frame_heights,
-                        "episode_num_observations": self.episode_num_observations,
-                    }
-                )
-            self._recorded_dataset = Dataset.from_dict(data)
-            if self.storage_format == STORAGE_FORMAT_IMAGES:
-                self._recorded_dataset = self._recorded_dataset.cast_column(
-                    "observations", HFImage()
-                )
-            # Cast episode_id and session_id to binary for efficient UUID storage
-            self._recorded_dataset = self._recorded_dataset.cast_column(
-                "episode_id", Value("binary")
-            )
-            self._recorded_dataset = self._recorded_dataset.cast_column(
-                "session_id", Value("binary")
-            )
+            self._recorded_dataset = self._build_recorded_dataset()
 
     def _convert_action(self, action):
         """Convert stored action back to the environment's expected format."""
@@ -2668,6 +2957,74 @@ def _save_uploaded_episode_ids(env_id, episode_ids: set):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w") as f:
         json.dump(list(episode_ids), f)
+
+
+def _get_live_upload_queue_dir(env_id):
+    """Return the local resumable live-upload queue directory."""
+    encoded_env_id = _encode_env_id_for_hf(env_id)
+    return os.path.join(CONFIG["storage"]["local_dir"], f"{encoded_env_id}_live_pending")
+
+
+def _get_live_upload_manifest_path(env_id):
+    return os.path.join(_get_live_upload_queue_dir(env_id), "manifest.json")
+
+
+def _load_live_upload_manifest(env_id):
+    path = _get_live_upload_manifest_path(env_id)
+    if not os.path.exists(path):
+        return {"version": 1, "episodes": {}}
+    with open(path, "r") as f:
+        manifest = json.load(f)
+    manifest.setdefault("version", 1)
+    manifest.setdefault("episodes", {})
+    return manifest
+
+
+def _save_live_upload_manifest(env_id, manifest):
+    path = _get_live_upload_manifest_path(env_id)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(manifest, f, indent=2, default=_json_default)
+
+
+def _set_live_upload_manifest_entry(
+    env_id,
+    episode_id,
+    *,
+    state,
+    package_dir,
+    storage_format,
+    frames,
+    error=None,
+):
+    manifest = _load_live_upload_manifest(env_id)
+    now = time.strftime("%Y-%m-%dT%H:%M:%S")
+    entry = manifest["episodes"].get(episode_id, {})
+    entry.update(
+        {
+            "state": state,
+            "package_dir": package_dir,
+            "storage_format": storage_format,
+            "frames": int(frames),
+            "updated_at": now,
+        }
+    )
+    entry.setdefault("created_at", now)
+    if error:
+        entry["error"] = str(error)
+    elif "error" in entry:
+        del entry["error"]
+    manifest["episodes"][episode_id] = entry
+    _save_live_upload_manifest(env_id, manifest)
+
+
+def _pending_live_upload_entries(env_id):
+    manifest = _load_live_upload_manifest(env_id)
+    for episode_id, entry in sorted(manifest.get("episodes", {}).items()):
+        if entry.get("state") in {"pending", "failed"}:
+            package_dir = entry.get("package_dir")
+            if package_dir and os.path.exists(package_dir):
+                yield episode_id, entry
 
 
 def _copy_artifact_tree(src_root, dst_root, relative_dir):
@@ -3472,90 +3829,66 @@ def _remote_storage_conflict_message(env_id, hf_repo_id, local_format, remote_fo
     )
 
 
-def upload_local_dataset(env_id, max_retries=5, base_wait=1.0, replace=False):
-    """Upload new episodes to HF Hub using append-only shard uploads.
+def _hf_repo_state(api, hf_repo_id, create=False):
+    """Return repo existence, parent commit, and file list, optionally creating the repo."""
+    repo_exists = False
+    parent_commit = None
+    remote_files = []
+    try:
+        repo_info = api.repo_info(repo_id=hf_repo_id, repo_type="dataset")
+        repo_exists = True
+        parent_commit = repo_info.sha
+        remote_files = list(api.list_repo_files(repo_id=hf_repo_id, repo_type="dataset"))
+    except Exception:
+        if not create:
+            return repo_exists, parent_commit, remote_files
 
-    Only uploads episodes that have not been uploaded before (tracked in a local
-    JSON file). Uploads new data as a parquet shard alongside existing shards —
-    no remote data is downloaded or replaced. Uses optimistic locking via
-    parent_commit in create_commit() to handle concurrent uploads safely.
+    if not repo_exists and create:
+        api.create_repo(repo_id=hf_repo_id, repo_type="dataset", exist_ok=True)
+        repo_info = api.repo_info(repo_id=hf_repo_id, repo_type="dataset")
+        repo_exists = True
+        parent_commit = repo_info.sha
+        remote_files = list(api.list_repo_files(repo_id=hf_repo_id, repo_type="dataset"))
+    return repo_exists, parent_commit, remote_files
 
-    Args:
-        env_id: The environment ID to upload
-        max_retries: Maximum number of retry attempts on conflict (default: 5)
-        base_wait: Base wait time between retries in seconds (default: 1.0)
-        replace: Replace all remote dataset files with the local dataset.
-    """
-    if not ensure_hf_login():
-        return False
 
-    local_dataset = load_local_dataset(env_id, attach_runtime=False)
-    if local_dataset is None:
-        console.print(f"[{STYLE_FAIL}]No local dataset found for {env_id}[/]")
-        console.print(f"  Expected at: [{STYLE_PATH}]{get_local_dataset_path(env_id)}[/]")
-        return False
-    storage_format = _dataset_storage_format(local_dataset)
+def _next_hf_shard_index(api, hf_repo_id, repo_exists, replace=False):
+    if not repo_exists or replace:
+        return 0
+    next_shard_idx = 0
+    try:
+        for item in api.list_repo_tree(hf_repo_id, repo_type="dataset", path_in_repo="data"):
+            name = item.rfilename if hasattr(item, "rfilename") else str(item)
+            if name.startswith("data/train-") and name.endswith(".parquet"):
+                next_shard_idx += 1
+    except Exception:
+        pass
+    return next_shard_idx
 
-    # Filter to episodes not yet uploaded
-    already_uploaded = _load_uploaded_episode_ids(env_id)
-    new_indices = []
-    new_episode_ids = set()
-    for i, row in enumerate(local_dataset):
-        eid = _normalize_episode_id(row["episode_id"])
-        if replace or eid not in already_uploaded:
-            new_indices.append(i)
-            new_episode_ids.add(eid)
 
+def _upload_dataset_shard_to_hub(
+    env_id,
+    dataset,
+    *,
+    storage_format,
+    local_root,
+    episode_ids,
+    replace=False,
+    include_previews=True,
+    max_retries=5,
+    base_wait=1.0,
+):
+    """Upload an already-materialized dataset shard and its artifacts to the Hub."""
     hf_repo_id = env_id_to_hf_repo_id(env_id)
     api = HfApi()
-
-    if not new_indices:
-        if not replace:
-            try:
-                api.repo_info(repo_id=hf_repo_id, repo_type="dataset")
-                remote_files = list(api.list_repo_files(repo_id=hf_repo_id, repo_type="dataset"))
-                remote_format = _remote_storage_format_from_files(remote_files)
-                conflict_message = _remote_storage_conflict_message(
-                    env_id, hf_repo_id, storage_format, remote_format
-                )
-                if conflict_message:
-                    console.print(f"[{STYLE_FAIL}]{conflict_message}[/]")
-                    return False
-            except Exception:
-                pass
-        console.print(f"[{STYLE_INFO}]All episodes already uploaded, nothing to do[/]")
-        return True
-
-    new_dataset = local_dataset.select(new_indices)
-    n_new_episodes = len(new_episode_ids)
-    if replace:
-        console.print(
-            f"[{STYLE_INFO}]Replacing remote dataset with {n_new_episodes} local episodes ({len(new_indices)} frames)...[/]"
-        )
-    else:
-        console.print(
-            f"[{STYLE_INFO}]Uploading {n_new_episodes} new episodes ({len(new_indices)} frames)...[/]"
-        )
+    episode_ids = set(episode_ids)
 
     for attempt in range(1, max_retries + 1):
         try:
-            # 1. Check repo existence and get parent commit
-            repo_exists = False
-            parent_commit = None
-            remote_files = []
-            try:
-                repo_info = api.repo_info(repo_id=hf_repo_id, repo_type="dataset")
-                repo_exists = True
-                parent_commit = repo_info.sha
-                remote_files = list(api.list_repo_files(repo_id=hf_repo_id, repo_type="dataset"))
-            except Exception:
-                pass
-
-            if not repo_exists:
-                api.create_repo(repo_id=hf_repo_id, repo_type="dataset", exist_ok=True)
-                repo_info = api.repo_info(repo_id=hf_repo_id, repo_type="dataset")
-                parent_commit = repo_info.sha
-            elif not replace:
+            repo_exists, parent_commit, remote_files = _hf_repo_state(
+                api, hf_repo_id, create=True
+            )
+            if repo_exists and not replace:
                 remote_format = _remote_storage_format_from_files(remote_files)
                 conflict_message = _remote_storage_conflict_message(
                     env_id, hf_repo_id, storage_format, remote_format
@@ -3564,25 +3897,7 @@ def upload_local_dataset(env_id, max_retries=5, base_wait=1.0, replace=False):
                     console.print(f"[{STYLE_FAIL}]{conflict_message}[/]")
                     return False
 
-            # 2. Count existing shards to determine next shard index
-            next_shard_idx = 0
-            if repo_exists and not replace:
-                try:
-                    for item in api.list_repo_tree(
-                        hf_repo_id, repo_type="dataset", path_in_repo="data"
-                    ):
-                        if hasattr(item, "rfilename"):
-                            name = item.rfilename
-                        else:
-                            name = str(item)
-                        if name.startswith("data/train-") and name.endswith(".parquet"):
-                            next_shard_idx += 1
-                except Exception:
-                    pass  # No data/ dir yet, start at 0
-
-            # 3. Write new episodes as parquet shard to temp dir
-            import tempfile
-
+            next_shard_idx = _next_hf_shard_index(api, hf_repo_id, repo_exists, replace)
             operations = []
             if replace:
                 operations.extend(
@@ -3593,28 +3908,24 @@ def upload_local_dataset(env_id, max_retries=5, base_wait=1.0, replace=False):
 
             with tempfile.TemporaryDirectory() as tmpdir:
                 shard_path = os.path.join(tmpdir, "shard.parquet")
-                new_dataset = _strip_runtime_columns(new_dataset)
+                upload_dataset = _strip_runtime_columns(dataset)
                 if storage_format == STORAGE_FORMAT_LOSSLESS_VIDEO:
-                    new_dataset = _rewrite_video_paths_for_upload(new_dataset)
-                new_dataset.to_parquet(shard_path)
+                    upload_dataset = _rewrite_video_paths_for_upload(upload_dataset)
+                upload_dataset.to_parquet(shard_path)
                 shard_name = (
                     "data/train-00000-of-00001.parquet"
                     if replace
                     else f"data/train-{next_shard_idx:05d}-of-{next_shard_idx + 1:05d}.parquet"
                 )
                 operations.append(
-                    CommitOperationAdd(
-                        path_in_repo=shard_name,
-                        path_or_fileobj=shard_path,
-                    )
+                    CommitOperationAdd(path_in_repo=shard_name, path_or_fileobj=shard_path)
                 )
 
                 if storage_format == STORAGE_FORMAT_LOSSLESS_VIDEO:
-                    local_root = get_local_dataset_path(env_id)
                     video_paths = sorted(
                         {
                             row["video_path"]
-                            for row in new_dataset
+                            for row in upload_dataset
                             if "video_path" in row and row["video_path"]
                         }
                     )
@@ -3630,25 +3941,25 @@ def upload_local_dataset(env_id, max_retries=5, base_wait=1.0, replace=False):
                                 path_or_fileobj=video_path,
                             )
                         )
-                        video_name = os.path.basename(video_relpath)
-                        if video_name.endswith(CANONICAL_VIDEO_SUFFIX):
-                            episode_stem = video_name[: -len(CANONICAL_VIDEO_SUFFIX)]
-                            preview_relpath = _preview_video_relpath(episode_stem)
-                            preview_path = _local_preview_video_path(local_root, episode_stem)
-                            if preview_path:
-                                operations.append(
-                                    CommitOperationAdd(
-                                        path_in_repo=preview_relpath,
-                                        path_or_fileobj=preview_path,
+                        if include_previews:
+                            video_name = os.path.basename(video_relpath)
+                            if video_name.endswith(CANONICAL_VIDEO_SUFFIX):
+                                episode_stem = video_name[: -len(CANONICAL_VIDEO_SUFFIX)]
+                                preview_relpath = _preview_video_relpath(episode_stem)
+                                preview_path = _local_preview_video_path(local_root, episode_stem)
+                                if preview_path:
+                                    operations.append(
+                                        CommitOperationAdd(
+                                            path_in_repo=preview_relpath,
+                                            path_or_fileobj=preview_path,
+                                        )
                                     )
-                                )
 
-                # 4. Build updated dataset card
                 card_content = _build_dataset_card_content(
                     env_id,
                     hf_repo_id,
-                    new_frames=len(new_indices),
-                    new_episodes=n_new_episodes,
+                    new_frames=len(upload_dataset),
+                    new_episodes=len(episode_ids),
                     repo_exists=repo_exists,
                 )
                 if card_content:
@@ -3656,13 +3967,9 @@ def upload_local_dataset(env_id, max_retries=5, base_wait=1.0, replace=False):
                     with open(card_path, "w") as f:
                         f.write(card_content)
                     operations.append(
-                        CommitOperationAdd(
-                            path_in_repo="README.md",
-                            path_or_fileobj=card_path,
-                        )
+                        CommitOperationAdd(path_in_repo="README.md", path_or_fileobj=card_path)
                     )
 
-                # 5. Pre-upload LFS files then atomic commit
                 api.preupload_lfs_files(
                     repo_id=hf_repo_id,
                     repo_type="dataset",
@@ -3680,10 +3987,10 @@ def upload_local_dataset(env_id, max_retries=5, base_wait=1.0, replace=False):
                     parent_commit=parent_commit,
                 )
 
-            # 6. Track uploaded episodes locally
-            uploaded_episode_ids = new_episode_ids if replace else already_uploaded | new_episode_ids
+            uploaded_episode_ids = (
+                episode_ids if replace else _load_uploaded_episode_ids(env_id) | episode_ids
+            )
             _save_uploaded_episode_ids(env_id, uploaded_episode_ids)
-
             console.print(
                 f"[{STYLE_SUCCESS}]Dataset uploaded: https://huggingface.co/datasets/{hf_repo_id}[/]"
             )
@@ -3702,21 +4009,208 @@ def upload_local_dataset(env_id, max_retries=5, base_wait=1.0, replace=False):
                 if attempt < max_retries:
                     wait_time = base_wait * (2 ** (attempt - 1))
                     console.print(
-                        f"[{STYLE_INFO}]Conflict detected, retrying in {wait_time:.1f}s (attempt {attempt + 1}/{max_retries})...[/]"
+                        f"[{STYLE_INFO}]Conflict detected, retrying in {wait_time:.1f}s "
+                        f"(attempt {attempt + 1}/{max_retries})...[/]"
                     )
                     time.sleep(wait_time)
                     continue
-                else:
-                    console.print(f"[{STYLE_FAIL}]Max retries ({max_retries}) exceeded.[/]")
-                    console.print(
-                        f"[{STYLE_INFO}]Another client may be uploading. Try again later.[/]"
-                    )
-                    return False
-            else:
-                console.print(f"[{STYLE_FAIL}]Upload failed: {e}[/]")
+                console.print(f"[{STYLE_FAIL}]Max retries ({max_retries}) exceeded.[/]")
+                console.print(
+                    f"[{STYLE_INFO}]Another client may be uploading. Try again later.[/]"
+                )
                 return False
+            console.print(f"[{STYLE_FAIL}]Upload failed: {e}[/]")
+            return False
 
     return False
+
+
+def _load_live_episode_package_dataset(package_dir):
+    shard_path = os.path.join(package_dir, "episode.parquet")
+    if not os.path.exists(shard_path):
+        raise FileNotFoundError(f"Missing pending live-upload shard: {shard_path}")
+    return Dataset.from_parquet(shard_path)
+
+
+def drain_live_upload_queue(env_id, max_retries=5, base_wait=1.0):
+    """Retry verified live-upload episode packages left from interrupted sessions."""
+    entries = list(_pending_live_upload_entries(env_id))
+    if not entries:
+        return True
+
+    console.print(f"[{STYLE_INFO}]Draining {len(entries)} pending live-upload episode(s)...[/]")
+    ok = True
+    already_uploaded = _load_uploaded_episode_ids(env_id)
+    for episode_id, entry in entries:
+        package_dir = entry["package_dir"]
+        if episode_id in already_uploaded:
+            _set_live_upload_manifest_entry(
+                env_id,
+                episode_id,
+                state="uploaded",
+                package_dir=package_dir,
+                storage_format=entry.get("storage_format", STORAGE_FORMAT_IMAGES),
+                frames=entry.get("frames", 0),
+            )
+            shutil.rmtree(package_dir, ignore_errors=True)
+            continue
+        try:
+            dataset = _load_live_episode_package_dataset(package_dir)
+            storage_format = _dataset_storage_format(dataset)
+            success = _upload_dataset_shard_to_hub(
+                env_id,
+                dataset,
+                storage_format=storage_format,
+                local_root=package_dir,
+                episode_ids={episode_id},
+                replace=False,
+                include_previews=False,
+                max_retries=max_retries,
+                base_wait=base_wait,
+            )
+            if success:
+                _set_live_upload_manifest_entry(
+                    env_id,
+                    episode_id,
+                    state="uploaded",
+                    package_dir=package_dir,
+                    storage_format=storage_format,
+                    frames=len(dataset),
+                )
+                shutil.rmtree(package_dir, ignore_errors=True)
+            else:
+                ok = False
+                _set_live_upload_manifest_entry(
+                    env_id,
+                    episode_id,
+                    state="failed",
+                    package_dir=package_dir,
+                    storage_format=storage_format,
+                    frames=len(dataset),
+                    error="upload failed",
+                )
+        except Exception as e:
+            ok = False
+            _set_live_upload_manifest_entry(
+                env_id,
+                episode_id,
+                state="failed",
+                package_dir=package_dir,
+                storage_format=entry.get("storage_format", STORAGE_FORMAT_IMAGES),
+                frames=entry.get("frames", 0),
+                error=e,
+            )
+            console.print(f"[{STYLE_FAIL}]Pending live upload failed for {episode_id}: {e}[/]")
+    return ok
+
+
+def preflight_live_upload(env_id, storage_format):
+    """Validate live upload can reach the target Hub dataset before gameplay starts."""
+    if not ensure_hf_login():
+        return False
+    if storage_format == STORAGE_FORMAT_LOSSLESS_VIDEO:
+        try:
+            _require_lossless_video_tools()
+        except Exception as e:
+            console.print(f"[{STYLE_FAIL}]Live upload preflight failed: {e}[/]")
+            return False
+
+    hf_repo_id = env_id_to_hf_repo_id(env_id)
+    api = HfApi()
+    try:
+        _, _, remote_files = _hf_repo_state(api, hf_repo_id, create=True)
+    except Exception as e:
+        console.print(f"[{STYLE_FAIL}]Live upload preflight failed: {e}[/]")
+        return False
+
+    remote_format = _remote_storage_format_from_files(remote_files)
+    conflict_message = _remote_storage_conflict_message(
+        env_id, hf_repo_id, storage_format, remote_format
+    )
+    if conflict_message:
+        console.print(f"[{STYLE_FAIL}]{conflict_message}[/]")
+        return False
+    console.print(f"[{STYLE_INFO}]Live upload target ready: {hf_repo_id}[/]")
+    return True
+
+
+def upload_local_dataset(env_id, max_retries=5, base_wait=1.0, replace=False):
+    """Upload new episodes to HF Hub using append-only shard uploads.
+
+    Only uploads episodes that have not been uploaded before (tracked in a local
+    JSON file). Uploads new data as a parquet shard alongside existing shards —
+    no remote data is downloaded or replaced. Uses optimistic locking via
+    parent_commit in create_commit() to handle concurrent uploads safely.
+
+    Args:
+        env_id: The environment ID to upload
+        max_retries: Maximum number of retry attempts on conflict (default: 5)
+        base_wait: Base wait time between retries in seconds (default: 1.0)
+        replace: Replace all remote dataset files with the local dataset.
+    """
+    if not ensure_hf_login():
+        return False
+
+    had_pending_live_uploads = any(True for _ in _pending_live_upload_entries(env_id))
+    pending_ok = drain_live_upload_queue(env_id, max_retries=max_retries, base_wait=base_wait)
+    local_dataset = load_local_dataset(env_id, attach_runtime=False)
+    if local_dataset is None:
+        if not had_pending_live_uploads:
+            console.print(f"[{STYLE_FAIL}]No local dataset found for {env_id}[/]")
+            console.print(f"  Expected at: [{STYLE_PATH}]{get_local_dataset_path(env_id)}[/]")
+            return False
+        return pending_ok
+    storage_format = _dataset_storage_format(local_dataset)
+
+    already_uploaded = _load_uploaded_episode_ids(env_id)
+    new_indices = []
+    new_episode_ids = set()
+    for i, row in enumerate(local_dataset):
+        eid = _normalize_episode_id(row["episode_id"])
+        if replace or eid not in already_uploaded:
+            new_indices.append(i)
+            new_episode_ids.add(eid)
+
+    if not new_indices:
+        if not replace:
+            try:
+                api = HfApi()
+                hf_repo_id = env_id_to_hf_repo_id(env_id)
+                _, _, remote_files = _hf_repo_state(api, hf_repo_id, create=False)
+                remote_format = _remote_storage_format_from_files(remote_files)
+                conflict_message = _remote_storage_conflict_message(
+                    env_id, hf_repo_id, storage_format, remote_format
+                )
+                if conflict_message:
+                    console.print(f"[{STYLE_FAIL}]{conflict_message}[/]")
+                    return False
+            except Exception:
+                pass
+        console.print(f"[{STYLE_INFO}]All episodes already uploaded, nothing to do[/]")
+        return pending_ok
+
+    new_dataset = local_dataset.select(new_indices)
+    n_new_episodes = len(new_episode_ids)
+    if replace:
+        console.print(
+            f"[{STYLE_INFO}]Replacing remote dataset with {n_new_episodes} local episodes ({len(new_indices)} frames)...[/]"
+        )
+    else:
+        console.print(
+            f"[{STYLE_INFO}]Uploading {n_new_episodes} new episodes ({len(new_indices)} frames)...[/]"
+        )
+    local_ok = _upload_dataset_shard_to_hub(
+        env_id,
+        new_dataset,
+        storage_format=storage_format,
+        local_root=get_local_dataset_path(env_id),
+        episode_ids=new_episode_ids,
+        replace=replace,
+        include_previews=True,
+        max_retries=max_retries,
+        base_wait=base_wait,
+    )
+    return pending_ok and local_ok
 
 
 def minari_export(env_id, dataset_name=None, author=None):
@@ -4932,6 +5426,7 @@ class RecordPlan:
     headless: bool
     max_episodes: int | None
     max_steps: int | None
+    upload_live: bool
 
     @property
     def human(self) -> bool:
@@ -4944,14 +5439,27 @@ def _make_record_plan(args):
     headless = bool(getattr(args, "headless", False))
     episodes = getattr(args, "episodes", None)
     max_steps = getattr(args, "max_steps", None)
+    upload_live = bool(getattr(args, "upload_live", False))
+    dry_run = bool(getattr(args, "dry_run", False))
 
     if episodes is not None and episodes < 1:
         return None, "--episodes must be >= 1"
+    if upload_live and dry_run:
+        return None, "--upload-live cannot be combined with --dry-run"
 
     if agent == "human":
         if headless:
             return None, "--headless can only be used with --agent (not human mode)"
-        return RecordPlan(agent=agent, headless=False, max_episodes=episodes, max_steps=max_steps), None
+        return (
+            RecordPlan(
+                agent=agent,
+                headless=False,
+                max_episodes=episodes,
+                max_steps=max_steps,
+                upload_live=upload_live,
+            ),
+            None,
+        )
 
     if headless and episodes is None:
         return None, "--headless requires --episodes to be specified"
@@ -4962,6 +5470,7 @@ def _make_record_plan(args):
             headless=headless,
             max_episodes=episodes if episodes is not None else 1,
             max_steps=max_steps,
+            upload_live=upload_live,
         ),
         None,
     )
@@ -4982,6 +5491,12 @@ async def main():
         action="store_true",
         default=False,
         help="Record without uploading to Hugging Face (no HF account required)",
+    )
+    parser_record.add_argument(
+        "--upload-live",
+        action="store_true",
+        default=False,
+        help="Upload each completed episode during recording; incompatible with --dry-run",
     )
     parser_record.add_argument(
         "--agent",
@@ -5148,6 +5663,7 @@ async def main():
             ("fps", None),
             ("scale", None),
             ("dry_run", False),
+            ("upload_live", False),
             ("agent", "human"),
             ("headless", False),
             ("episodes", None),
@@ -5236,6 +5752,8 @@ async def main():
         if plan_error:
             console.print(f"[{STYLE_FAIL}]Error: {plan_error}[/]")
             return
+        if record_plan.upload_live and not preflight_live_upload(env_id, storage_format):
+            return
 
     playback_metadata = load_local_metadata(env_id) if args.command == "playback" else None
     env = None
@@ -5257,6 +5775,9 @@ async def main():
 
     if args.command == "record":
         recorder = None
+        live_upload_manager = (
+            LiveEpisodeUploadManager(env_id, storage_format) if record_plan.upload_live else None
+        )
 
         if record_plan.human:
             input_source = None  # Will default to HumanInputSource in _play
@@ -5266,6 +5787,7 @@ async def main():
                 headless=False,
                 collector="human",
                 storage_format=storage_format,
+                live_upload_manager=live_upload_manager,
             )
             recorded_dataset = await recorder.record(
                 fps=fps,
@@ -5290,6 +5812,7 @@ async def main():
                 headless=record_plan.headless,
                 collector=hf_policy_source.collector if hf_policy_source else record_plan.agent,
                 storage_format=storage_format,
+                live_upload_manager=live_upload_manager,
             )
 
             total_steps_counter = [0]
@@ -5317,6 +5840,20 @@ async def main():
         if recorded_dataset is None:
             if recorder is not None:
                 recorder.close()
+            if record_plan.upload_live:
+                console.print(
+                    f"[{STYLE_INFO}]Live recording finished. Pending retries, if any: "
+                    f"[{STYLE_CMD}]{_gymrec_cmd('upload', env_id)}[/]"
+                )
+            return
+
+        if record_plan.upload_live:
+            if recorder is not None:
+                recorder.close()
+            console.print(
+                f"[{STYLE_INFO}]Live recording finished. Pending retries, if any: "
+                f"[{STYLE_CMD}]{_gymrec_cmd('upload', env_id)}[/]"
+            )
             return
 
         if recorder is not None:

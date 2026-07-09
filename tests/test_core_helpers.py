@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import shutil
 import uuid
 
 import gymnasium as gym
@@ -255,6 +256,39 @@ def test_record_plan_requires_episodes_for_headless_agent():
     assert "--episodes" in error
 
 
+def test_record_plan_rejects_live_upload_dry_run():
+    plan, error = main._make_record_plan(
+        argparse.Namespace(
+            agent="human",
+            headless=False,
+            episodes=None,
+            max_steps=None,
+            upload_live=True,
+            dry_run=True,
+        )
+    )
+
+    assert plan is None
+    assert "--upload-live" in error
+    assert "--dry-run" in error
+
+
+def test_record_plan_preserves_live_upload_flag():
+    plan, error = main._make_record_plan(
+        argparse.Namespace(
+            agent="random",
+            headless=False,
+            episodes=2,
+            max_steps=None,
+            upload_live=True,
+            dry_run=False,
+        )
+    )
+
+    assert error is None
+    assert plan.upload_live is True
+
+
 def test_agent_input_source_does_not_own_headless_state():
     source = main.AgentInputSource(lambda observation: "action", headless=True)
 
@@ -363,3 +397,173 @@ def test_replay_resets_between_dataset_episodes():
         return env.reset_seeds
 
     assert asyncio.run(run_replay()) == [111, 222]
+
+
+def test_live_upload_manifest_tracks_pending_failed_and_uploaded(tmp_path):
+    if main.CONFIG is None:
+        main.CONFIG = main._load_config()
+    old_local_dir = main.CONFIG["storage"]["local_dir"]
+    main.CONFIG["storage"]["local_dir"] = str(tmp_path)
+    package_dir = tmp_path / "episode"
+    package_dir.mkdir()
+    try:
+        main._set_live_upload_manifest_entry(
+            "BreakoutNoFrameskip-v4",
+            "episode1",
+            state="pending",
+            package_dir=str(package_dir),
+            storage_format=main.STORAGE_FORMAT_LOSSLESS_VIDEO,
+            frames=3,
+        )
+        entries = list(main._pending_live_upload_entries("BreakoutNoFrameskip-v4"))
+        assert entries[0][0] == "episode1"
+        assert entries[0][1]["state"] == "pending"
+
+        main._set_live_upload_manifest_entry(
+            "BreakoutNoFrameskip-v4",
+            "episode1",
+            state="failed",
+            package_dir=str(package_dir),
+            storage_format=main.STORAGE_FORMAT_LOSSLESS_VIDEO,
+            frames=3,
+            error="network",
+        )
+        manifest = main._load_live_upload_manifest("BreakoutNoFrameskip-v4")
+        assert manifest["episodes"]["episode1"]["state"] == "failed"
+        assert manifest["episodes"]["episode1"]["error"] == "network"
+
+        main._set_live_upload_manifest_entry(
+            "BreakoutNoFrameskip-v4",
+            "episode1",
+            state="uploaded",
+            package_dir=str(package_dir),
+            storage_format=main.STORAGE_FORMAT_LOSSLESS_VIDEO,
+            frames=3,
+        )
+        assert list(main._pending_live_upload_entries("BreakoutNoFrameskip-v4")) == []
+    finally:
+        main.CONFIG["storage"]["local_dir"] = old_local_dir
+
+
+def test_build_recorded_dataset_includes_video_episode_metadata():
+    main._lazy_init()
+    recorder = object.__new__(main.DatasetRecorderWrapper)
+    episode_id = uuid.uuid4()
+    session_id = uuid.uuid4()
+    recorder.episode_ids = [episode_id.bytes, episode_id.bytes]
+    recorder.seeds = [123, 123]
+    recorder.frames = [None, None]
+    recorder.actions = [[0], []]
+    recorder.rewards = [1.0, None]
+    recorder.terminations = [True, None]
+    recorder.truncations = [False, None]
+    recorder.infos = ["{}", None]
+    recorder.session_ids = [session_id.bytes, session_id.bytes]
+    recorder.collector = "random"
+    recorder._gymrec_version = "0.1.0+test"
+    recorder.storage_format = main.STORAGE_FORMAT_LOSSLESS_VIDEO
+    recorder.video_paths = ["videos/e.rgb.mkv.bin", "videos/e.rgb.mkv.bin"]
+    recorder.frame_indices = [0, 1]
+    recorder.frame_sha256s = ["a", "b"]
+    recorder.frame_widths = [2, 2]
+    recorder.frame_heights = [1, 1]
+    recorder.episode_num_observations = [2, 2]
+
+    dataset = recorder._build_recorded_dataset()
+
+    assert len(dataset) == 2
+    assert dataset["video_path"] == ["videos/e.rgb.mkv.bin", "videos/e.rgb.mkv.bin"]
+    assert dataset["frame_index"] == [0, 1]
+    assert dataset["episode_num_observations"] == [2, 2]
+    assert dataset["storage_format"] == [main.STORAGE_FORMAT_LOSSLESS_VIDEO] * 2
+
+
+def test_live_episode_manager_packages_shard_without_previews(tmp_path, monkeypatch):
+    if main.CONFIG is None:
+        main.CONFIG = main._load_config()
+    main._lazy_init()
+    old_local_dir = main.CONFIG["storage"]["local_dir"]
+    main.CONFIG["storage"]["local_dir"] = str(tmp_path)
+    episode_uuid = uuid.uuid4()
+    episode_id = episode_uuid.hex
+    video_relpath = f"videos/{episode_id}.rgb.mkv.bin"
+    dataset = main.Dataset.from_dict(
+        {
+            "episode_id": [episode_uuid.bytes],
+            "seed": [123],
+            "actions": [[]],
+            "rewards": [None],
+            "terminations": [None],
+            "truncations": [None],
+            "infos": [None],
+            "session_id": [uuid.uuid4().bytes],
+            "collector": ["random"],
+            "gymrec_version": ["0.1.0+test"],
+            "storage_format": [main.STORAGE_FORMAT_LOSSLESS_VIDEO],
+            "video_path": [video_relpath],
+            "frame_index": [0],
+            "frame_sha256": ["hash"],
+            "frame_width": [2],
+            "frame_height": [2],
+            "episode_num_observations": [1],
+        }
+    )
+    dataset = dataset.cast_column("episode_id", main.Value("binary"))
+    dataset = dataset.cast_column("session_id", main.Value("binary"))
+    calls = []
+
+    def fake_upload(env_id, shard, **kwargs):
+        calls.append((env_id, shard, kwargs))
+        assert kwargs["include_previews"] is False
+        assert kwargs["episode_ids"] == {episode_id}
+        assert package.parquet_path and package.parquet_path.endswith("episode.parquet")
+        assert package_path.exists()
+        return True
+
+    monkeypatch.setattr(main, "_upload_dataset_shard_to_hub", fake_upload)
+    try:
+        manager = main.LiveEpisodeUploadManager(
+            "BreakoutNoFrameskip-v4", main.STORAGE_FORMAT_LOSSLESS_VIDEO
+        )
+        package = manager.begin_episode(episode_uuid)
+        package_path = tmp_path / "BreakoutNoFrameskip_dash_v4_live_pending" / episode_id
+        video_path = package_path / video_relpath
+        video_path.parent.mkdir(parents=True)
+        video_path.write_bytes(b"video")
+
+        assert manager.upload_episode(package, dataset) is True
+        assert calls
+        assert not package_path.exists()
+        manifest = main._load_live_upload_manifest("BreakoutNoFrameskip-v4")
+        assert manifest["episodes"][episode_id]["state"] == "uploaded"
+    finally:
+        main.CONFIG["storage"]["local_dir"] = old_local_dir
+
+
+def test_upload_local_dataset_fails_without_local_dataset_or_pending_queue(tmp_path, monkeypatch):
+    if main.CONFIG is None:
+        main.CONFIG = main._load_config()
+    old_local_dir = main.CONFIG["storage"]["local_dir"]
+    main.CONFIG["storage"]["local_dir"] = str(tmp_path)
+    monkeypatch.setattr(main, "ensure_hf_login", lambda: True)
+    try:
+        assert main.upload_local_dataset("BreakoutNoFrameskip-v4") is False
+    finally:
+        main.CONFIG["storage"]["local_dir"] = old_local_dir
+
+
+def test_streaming_video_verifier_accepts_hashes_and_rejects_corruption(tmp_path):
+    if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
+        pytest.skip("ffmpeg/ffprobe not available")
+    main._lazy_init()
+    frames = [
+        np.zeros((2, 2, 3), dtype=np.uint8),
+        np.full((2, 2, 3), 255, dtype=np.uint8),
+    ]
+    video_path = tmp_path / "tiny.rgb.mkv.bin"
+    main._encode_lossless_rgb_video(frames, str(video_path), fps=30)
+    hashes = [main._sha256_rgb(frame) for frame in frames]
+
+    main._verify_lossless_rgb_video_stream(str(video_path), 2, 2, hashes)
+    with pytest.raises(RuntimeError, match="verification failed"):
+        main._verify_lossless_rgb_video_stream(str(video_path), 2, 2, ["bad", hashes[1]])
