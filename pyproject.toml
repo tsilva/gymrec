@@ -21,6 +21,7 @@ dependencies = [
     "huggingface-hub",
     "simple-term-menu",
     "stable-retro-turbo",
+    "stable-baselines3>=2.9.0",
 ]
 
 [project.scripts]

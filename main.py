@@ -12,7 +12,9 @@ import time
 import tomllib
 import uuid
 from abc import ABC, abstractmethod
+from collections import deque
 from dataclasses import dataclass
+from urllib.parse import unquote, urlparse
 
 import gymnasium as gym
 from dotenv import find_dotenv, load_dotenv
@@ -205,6 +207,8 @@ BACKEND_LABELS = {
     "stable-retro": "Stable-Retro",
 }
 
+HUGGINGFACE_MODEL_SCHEME = "hf://"
+HUGGINGFACE_MODEL_URL_HOST = "huggingface.co"
 OBSERVATION_IMAGE_KEYS = ("obs", "image", "screen")
 STORAGE_FORMAT_IMAGES = "images"
 STORAGE_FORMAT_LOSSLESS_VIDEO = "lossless-video"
@@ -217,6 +221,23 @@ PREVIEW_VIDEO_SUFFIX = ".preview.mp4"
 RUNTIME_VIDEO_BASE_COLUMN = "_gymrec_video_base_path"
 RUNTIME_HF_REPO_COLUMN = "_gymrec_hf_repo_id"
 _VIDEO_DECODE_CACHE = {}
+
+NES_SIMPLE_ACTION_MASKS = {
+    "noop": (),
+    "right": (7,),
+    "right_b": (7, 0),
+    "right_a": (7, 8),
+    "right_a_b": (7, 8, 0),
+    "a": (8,),
+    "left": (6,),
+}
+
+STABLE_RETRO_DISCRETE_ACTION_SETS = {
+    "SuperMarioBros-Nes-v0": {
+        "simple": ("noop", "right", "right_b", "right_a", "right_a_b", "a", "left"),
+        "right": ("right", "right_b", "right_a", "right_a_b"),
+    }
+}
 
 
 def _extract_observation_image(observation):
@@ -964,10 +985,13 @@ class AgentInputSource(InputSource):
     def __init__(self, policy, headless=None):
         self.policy = policy
 
-    def reset(self):
+    def reset(self, **kwargs):
         """Reset any episode-local policy state."""
         if hasattr(self.policy, "reset"):
-            self.policy.reset()
+            try:
+                self.policy.reset(**kwargs)
+            except TypeError:
+                self.policy.reset()
 
     def get_action(self, observation):
         """Get action from policy."""
@@ -991,7 +1015,7 @@ class BasePolicy(ABC):
         self.action_space = action_space
         self.env = env
 
-    def reset(self):
+    def reset(self, **kwargs):
         """Reset any episode-local policy state."""
         pass
 
@@ -1276,6 +1300,369 @@ class BreakoutCatcherPolicy(BasePolicy):
             elif x < left_wall:
                 x = left_wall + (left_wall - x)
         return x
+
+
+@dataclass(frozen=True)
+class HFPolicySource:
+    ref: str
+    repo_id: str
+    revision: str
+    checkpoint_filename: str
+    model_path: str
+    metadata: dict
+    env_id: str
+    state: str | None
+    action_set: str
+    frame_skip: int
+    frame_stack: int
+    observation_size: int
+    obs_crop: tuple[int, int, int, int] | None
+    deterministic: bool = True
+    device: str = "auto"
+
+    @property
+    def collector(self) -> str:
+        return f"hf://{self.repo_id}"
+
+
+class StableBaselines3Policy(BasePolicy):
+    """Run an SB3 policy checkpoint against native Gymnasium observations."""
+
+    def __init__(self, action_space, source: HFPolicySource):
+        super().__init__(action_space)
+        try:
+            from stable_baselines3 import PPO
+        except ImportError as exc:
+            raise SystemExit(
+                "stable-baselines3 is required to record Hugging Face policy checkpoints. "
+                "Install dependencies with `uv sync` or reinstall the gymrec tool."
+            ) from exc
+
+        self.source = source
+        self.model = PPO.load(
+            source.model_path,
+            device=source.device,
+            custom_objects={
+                "learning_rate": 0.0,
+                "lr_schedule": lambda _progress_remaining: 0.0,
+                "clip_range": lambda _progress_remaining: 0.0,
+                "clip_range_vf": None,
+            },
+        )
+        self._frames = deque(maxlen=source.frame_stack)
+        self._repeat_remaining = 0
+        self._current_action = None
+        self._action_masks = (
+            _stable_retro_action_masks(source.env_id, source.action_set)
+            if isinstance(action_space, gym.spaces.MultiBinary)
+            else ()
+        )
+
+    def reset(self, **kwargs):
+        self._frames.clear()
+        observation = kwargs.get("observation")
+        if observation is not None:
+            frame = self._preprocess_observation(observation)
+            for _ in range(self.source.frame_stack):
+                self._frames.append(frame)
+        self._repeat_remaining = 0
+        self._current_action = None
+
+    def observe_step(self, reward, terminated, truncated, info):
+        if terminated or truncated:
+            self._repeat_remaining = 0
+            self._current_action = None
+
+    def __call__(self, observation):
+        if self._current_action is not None and self._repeat_remaining > 0:
+            self._repeat_remaining -= 1
+            return self._copy_action(self._current_action)
+
+        self._append_policy_frame(observation)
+        model_obs = self._model_observation()
+        action, _ = self.model.predict(model_obs, deterministic=self.source.deterministic)
+        self._current_action = self._to_env_action(action)
+        self._repeat_remaining = max(self.source.frame_skip - 1, 0)
+        return self._copy_action(self._current_action)
+
+    def _append_policy_frame(self, observation):
+        frame = self._preprocess_observation(observation)
+        if not self._frames:
+            for _ in range(self.source.frame_stack):
+                self._frames.append(frame)
+        else:
+            self._frames.append(frame)
+
+    def _preprocess_observation(self, observation):
+        frame = _observation_to_rgb_array(observation)
+        if self.source.obs_crop is not None:
+            top, right, bottom, left = self.source.obs_crop
+            height, width = frame.shape[:2]
+            y0 = top
+            y1 = height - bottom if bottom else height
+            x0 = left
+            x1 = width - right if right else width
+            frame = frame[y0:y1, x0:x1, :]
+        gray = np.dot(frame[..., :3], np.array([0.299, 0.587, 0.114])).astype(np.uint8)
+        if gray.shape != (self.source.observation_size, self.source.observation_size):
+            image = PILImage.fromarray(gray)
+            image = image.resize(
+                (self.source.observation_size, self.source.observation_size),
+                resample=PILImage.Resampling.BOX,
+            )
+            gray = np.asarray(image, dtype=np.uint8)
+        return np.asarray(gray, dtype=np.uint8)
+
+    def _model_observation(self):
+        stack = np.stack(list(self._frames), axis=0)
+        observation_space = getattr(self.model, "observation_space", None)
+        shape = getattr(observation_space, "shape", None)
+        if shape and tuple(shape) == tuple(stack.shape):
+            return stack
+        if shape and len(shape) == 3 and shape[-1] == self.source.frame_stack:
+            return np.moveaxis(stack, 0, -1)
+        return stack
+
+    def _to_env_action(self, action):
+        action_array = np.asarray(action)
+        action_index = int(action_array.reshape(-1)[0])
+
+        if isinstance(self.action_space, gym.spaces.Discrete):
+            return action_index
+
+        if isinstance(self.action_space, gym.spaces.MultiBinary):
+            if action_index < 0 or action_index >= len(self._action_masks):
+                raise ValueError(
+                    f"Policy returned action {action_index}, but action set "
+                    f"{self.source.action_set!r} has {len(self._action_masks)} actions"
+                )
+            native_action = np.zeros(self.action_space.n, dtype=np.int32)
+            for button_index in self._action_masks[action_index]:
+                if button_index < self.action_space.n:
+                    native_action[button_index] = 1
+            return native_action
+
+        raise ValueError(
+            "Hugging Face SB3 policy recording currently supports Discrete and "
+            "MultiBinary action spaces only."
+        )
+
+    @staticmethod
+    def _copy_action(action):
+        if isinstance(action, np.ndarray):
+            return action.copy()
+        return action
+
+
+def is_huggingface_model_ref(value):
+    text = str(value or "").strip()
+    if text.startswith(HUGGINGFACE_MODEL_SCHEME):
+        return True
+    parsed = urlparse(text)
+    return parsed.scheme in {"http", "https"} and parsed.netloc == HUGGINGFACE_MODEL_URL_HOST
+
+
+def parse_huggingface_model_ref(value):
+    text = str(value or "").strip()
+    if text.startswith(HUGGINGFACE_MODEL_SCHEME):
+        path = text.removeprefix(HUGGINGFACE_MODEL_SCHEME).strip("/")
+        parts = [unquote(part) for part in path.split("/") if part]
+        if len(parts) < 2:
+            raise ValueError(f"expected Hugging Face model ref like hf://owner/repo, got {value!r}")
+        repo_id = "/".join(parts[:2])
+        filename = "/".join(parts[2:]) or None
+        return repo_id, filename, None
+
+    parsed = urlparse(text)
+    if parsed.scheme not in {"http", "https"} or parsed.netloc != HUGGINGFACE_MODEL_URL_HOST:
+        raise ValueError(f"expected Hugging Face model URL, got {value!r}")
+    parts = [unquote(part) for part in parsed.path.split("/") if part]
+    if len(parts) < 2:
+        raise ValueError(f"expected Hugging Face model URL with owner/repo, got {value!r}")
+    repo_id = "/".join(parts[:2])
+    filename = None
+    revision = None
+    if len(parts) >= 5 and parts[2] in {"blob", "raw", "resolve"}:
+        revision = parts[3]
+        filename = "/".join(parts[4:])
+    elif len(parts) > 2:
+        filename = "/".join(parts[2:])
+    return repo_id, filename, revision
+
+
+def _select_huggingface_checkpoint(repo_id, revision, filename=None):
+    if filename:
+        return filename
+    try:
+        files = HfApi().list_repo_files(repo_id=repo_id, repo_type="model", revision=revision)
+    except Exception as exc:
+        raise SystemExit(f"Could not list Hugging Face model repo {repo_id}: {exc}") from exc
+    checkpoints = sorted(path for path in files if path.endswith(".zip"))
+    if not checkpoints:
+        raise SystemExit(f"Hugging Face model repo {repo_id} has no .zip checkpoint files")
+    if len(checkpoints) > 1:
+        choices = ", ".join(checkpoints)
+        raise SystemExit(
+            f"Hugging Face model repo {repo_id} has multiple .zip checkpoints; "
+            f"pass --hf-file. Choices: {choices}"
+        )
+    return checkpoints[0]
+
+
+def _metadata_int(metadata, *paths, default):
+    for path in paths:
+        value = metadata
+        for key in path:
+            if isinstance(value, dict) and key in value:
+                value = value[key]
+            elif isinstance(value, (list, tuple)) and isinstance(key, int) and key < len(value):
+                value = value[key]
+            else:
+                value = None
+                break
+        if value is not None:
+            return int(value)
+    return int(default)
+
+
+def _metadata_str(metadata, *paths, default=None):
+    for path in paths:
+        value = metadata
+        for key in path:
+            if not isinstance(value, dict) or key not in value:
+                value = None
+                break
+            value = value[key]
+        if value:
+            return str(value)
+    return default
+
+
+def _metadata_obs_crop(metadata):
+    env_config = metadata.get("env_config", {}) if isinstance(metadata, dict) else {}
+    value = env_config.get("obs_crop")
+    if value is None:
+        preprocessing = metadata.get("environment", {}).get("preprocessing", {})
+        value = preprocessing.get("obs_crop")
+    if value is None:
+        hud_crop_top = env_config.get("hud_crop_top")
+        if isinstance(hud_crop_top, int) and hud_crop_top > 0:
+            value = [hud_crop_top, 0, 0, 0]
+    if value is None:
+        return None
+    if not isinstance(value, (list, tuple)) or len(value) != 4:
+        raise SystemExit(f"Unsupported Hugging Face model obs_crop value: {value!r}")
+    return tuple(int(item) for item in value)
+
+
+def _stable_retro_action_masks(env_id, action_set):
+    action_sets = STABLE_RETRO_DISCRETE_ACTION_SETS.get(env_id, {})
+    if action_set not in action_sets:
+        valid = ", ".join(sorted(action_sets)) or "none"
+        raise SystemExit(
+            f"Unsupported action_set {action_set!r} for {env_id}; supported sets: {valid}"
+        )
+    return tuple(NES_SIMPLE_ACTION_MASKS[name] for name in action_sets[action_set])
+
+
+def resolve_huggingface_policy_source(
+    ref,
+    *,
+    filename=None,
+    revision=None,
+    device="auto",
+    deterministic=True,
+):
+    _lazy_init()
+    try:
+        repo_id, parsed_filename, parsed_revision = parse_huggingface_model_ref(ref)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+    resolved_revision = revision or parsed_revision or "main"
+    checkpoint_filename = _select_huggingface_checkpoint(
+        repo_id, resolved_revision, filename or parsed_filename
+    )
+    try:
+        model_path = hf_hub_download(
+            repo_id=repo_id,
+            repo_type="model",
+            revision=resolved_revision,
+            filename=checkpoint_filename,
+        )
+    except Exception as exc:
+        raise SystemExit(
+            f"Could not download {checkpoint_filename} from Hugging Face model repo {repo_id}: {exc}"
+        ) from exc
+
+    try:
+        metadata_path = hf_hub_download(
+            repo_id=repo_id,
+            repo_type="model",
+            revision=resolved_revision,
+            filename="model_metadata.json",
+        )
+    except Exception as exc:
+        raise SystemExit(
+            f"Could not download model_metadata.json from Hugging Face model repo {repo_id}: {exc}"
+        ) from exc
+
+    with open(metadata_path) as f:
+        metadata = json.load(f)
+
+    env_id = _metadata_str(
+        metadata,
+        ("env_config", "game"),
+        ("environment", "env_id"),
+        default=None,
+    )
+    if env_id and ":" in env_id:
+        env_id = env_id.split(":", 1)[1]
+    if not env_id:
+        raise SystemExit(f"Could not infer environment id from {repo_id}/model_metadata.json")
+
+    action_set = _metadata_str(
+        metadata,
+        ("env_config", "action_set"),
+        ("environment", "action", "action_set"),
+        default="native",
+    )
+    frame_skip = _metadata_int(
+        metadata,
+        ("env_config", "frame_skip"),
+        ("environment", "preprocessing", "frame_skip"),
+        default=1,
+    )
+    frame_stack = _metadata_int(
+        metadata,
+        ("environment", "preprocessing", "frame_stack"),
+        ("training_metadata", "preprocessing", "frame_stack"),
+        default=4,
+    )
+    observation_size = _metadata_int(
+        metadata,
+        ("env_config", "observation_size"),
+        ("environment", "preprocessing", "obs_resize", 0),
+        default=84,
+    )
+    state = _metadata_str(metadata, ("env_config", "state"), ("environment", "state"), default=None)
+
+    return HFPolicySource(
+        ref=ref,
+        repo_id=repo_id,
+        revision=resolved_revision,
+        checkpoint_filename=checkpoint_filename,
+        model_path=model_path,
+        metadata=metadata,
+        env_id=env_id,
+        state=state,
+        action_set=action_set,
+        frame_skip=max(frame_skip, 1),
+        frame_stack=max(frame_stack, 1),
+        observation_size=observation_size,
+        obs_crop=_metadata_obs_crop(metadata),
+        deterministic=deterministic,
+        device=device,
+    )
 
 
 AGENT_POLICY_FACTORIES = {
@@ -1819,7 +2206,7 @@ class DatasetRecorderWrapper(gym.Wrapper):
             # Default to human input
             self.input_source = HumanInputSource(self.env, self.key_lock, self.current_keys)
         elif hasattr(self.input_source, "reset"):
-            self.input_source.reset()
+            self.input_source.reset(seed=seed, observation=obs)
 
         # For human input, show the start screen and keymappings
         if isinstance(self.input_source, HumanInputSource):
@@ -1901,7 +2288,7 @@ class DatasetRecorderWrapper(gym.Wrapper):
                 seed = self._current_episode_seed
                 obs, _ = self.env.reset(seed=seed)
                 if hasattr(self.input_source, "reset"):
-                    self.input_source.reset()
+                    self.input_source.reset(seed=seed, observation=obs)
                 self._episode_count += 1
                 self._cumulative_reward = 0.0
                 step = 0
@@ -3658,13 +4045,16 @@ def _build_dataset_card_content(env_id, repo_id, new_frames, new_episodes, repo_
     )
 
 
-def _create_env__stableretro(env_id):
+def _create_env__stableretro(env_id, state=None):
     _ensure_stableretro_roms_path_imported()
 
     import stable_retro as retro
 
+    make_kwargs = {"render_mode": "rgb_array"}
+    if state:
+        make_kwargs["state"] = state
     try:
-        env = retro.make(env_id, render_mode="rgb_array")
+        env = retro.make(env_id, **make_kwargs)
     except FileNotFoundError:
         console.print(f"\n[{STYLE_FAIL}]Error: ROM not found for '{env_id}'.[/]")
         console.print("\nStable-retro requires ROM files to be imported separately.")
@@ -3726,13 +4116,13 @@ def _create_env__alepy(env_id):
         sys.exit(1)
 
 
-def create_env(env_id):
+def create_env(env_id, *, stable_retro_state=None):
     """Create a Gymnasium environment with the appropriate backend."""
 
     stable_retro_envs = set(_get_stableretro_envs())
     backend = classify_env_id(env_id, stable_retro_envs=stable_retro_envs)
     if backend == "stable-retro":
-        env = _create_env__stableretro(env_id)
+        env = _create_env__stableretro(env_id, state=stable_retro_state)
     elif backend == "vizdoom":
         env = _create_env__vizdoom(env_id)
     else:
@@ -4301,7 +4691,7 @@ def _add_env_id_arg(parser):
         type=str,
         nargs="?",
         default=None,
-        help="Gymnasium environment id (e.g. BreakoutNoFrameskip-v4)",
+        help="Gymnasium environment id, or a Hugging Face model ref for record (e.g. BreakoutNoFrameskip-v4 or hf://owner/repo)",
     )
 
 
@@ -4416,6 +4806,30 @@ async def main():
         choices=STORAGE_FORMATS,
         help="Observation storage backend: images or lossless-video (default: config.toml)",
     )
+    parser_record.add_argument(
+        "--hf-file",
+        type=str,
+        default=None,
+        help="Checkpoint filename in a Hugging Face model repo (needed only if multiple .zip files exist)",
+    )
+    parser_record.add_argument(
+        "--hf-revision",
+        type=str,
+        default=None,
+        help="Hugging Face model revision for policy refs (default: main)",
+    )
+    parser_record.add_argument(
+        "--device",
+        type=str,
+        default="auto",
+        help="SB3 policy device for Hugging Face model refs: auto, cpu, cuda, or mps",
+    )
+    parser_record.add_argument(
+        "--stochastic",
+        action="store_true",
+        default=False,
+        help="Sample stochastic SB3 actions for Hugging Face model refs (default: deterministic)",
+    )
 
     parser_playback = subparsers.add_parser("playback", help="Replay a dataset")
     _add_roms_path_arg(parser_playback, default=argparse.SUPPRESS)
@@ -4520,6 +4934,10 @@ async def main():
             ("episodes", None),
             ("max_steps", None),
             ("storage", None),
+            ("hf_file", None),
+            ("hf_revision", None),
+            ("device", "auto"),
+            ("stochastic", False),
         ]:
             if not hasattr(args, attr):
                 setattr(args, attr, default)
@@ -4542,6 +4960,7 @@ async def main():
         return
 
     env_id = args.env_id
+    hf_policy_source = None
 
     if env_id is None:
         if args.command in ("playback", "video"):
@@ -4551,6 +4970,31 @@ async def main():
         env_id = select_environment_interactive(available_recordings_only=is_recording_command)
 
     _lazy_init()
+
+    if args.command == "record" and is_huggingface_model_ref(env_id):
+        if getattr(args, "agent", "human") != "human":
+            console.print(
+                f"[{STYLE_FAIL}]Error: Hugging Face model refs already select the policy; "
+                "do not combine them with --agent.[/]"
+            )
+            return
+        hf_policy_source = resolve_huggingface_policy_source(
+            env_id,
+            filename=getattr(args, "hf_file", None),
+            revision=getattr(args, "hf_revision", None),
+            device=getattr(args, "device", "auto"),
+            deterministic=not bool(getattr(args, "stochastic", False)),
+        )
+        env_id = hf_policy_source.env_id
+        args.env_id = env_id
+        args.agent = "hf"
+        console.print(
+            f"[{STYLE_INFO}]Resolved policy {hf_policy_source.collector} -> "
+            f"{env_id}"
+            f"{' state=' + hf_policy_source.state if hf_policy_source.state else ''}, "
+            f"action_set={hf_policy_source.action_set}, "
+            f"frame_skip={hf_policy_source.frame_skip}[/]"
+        )
 
     if args.command == "upload":
         upload_local_dataset(env_id, replace=args.replace)
@@ -4569,7 +5013,10 @@ async def main():
     env = None
     fps = args.fps
     if args.command == "playback" or args.command == "record":
-        env = create_env(env_id)
+        env = create_env(
+            env_id,
+            stable_retro_state=hf_policy_source.state if hf_policy_source else None,
+        )
         if fps is None:
             fps = get_default_fps(env)
     elif args.command == "video" and fps is None:
@@ -4602,14 +5049,17 @@ async def main():
                 f"[{STYLE_INFO}]Recording with {record_plan.agent} agent ({mode_str}), {record_plan.max_episodes} episode(s)[/]"
             )
 
-            policy = create_agent_policy(record_plan.agent, env)
+            if hf_policy_source is not None:
+                policy = StableBaselines3Policy(env.action_space, hf_policy_source)
+            else:
+                policy = create_agent_policy(record_plan.agent, env)
             input_source = AgentInputSource(policy)
 
             recorder = DatasetRecorderWrapper(
                 env,
                 input_source=input_source,
                 headless=record_plan.headless,
-                collector=record_plan.agent,
+                collector=hf_policy_source.collector if hf_policy_source else record_plan.agent,
                 storage_format=storage_format,
             )
 

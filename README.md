@@ -52,6 +52,8 @@ gymrec record BreakoutNoFrameskip-v4 --dry-run   # save locally without upload p
 gymrec record BreakoutNoFrameskip-v4 --storage lossless-video --dry-run
 gymrec record SuperMarioBros-Nes-v0 --agent random --headless --episodes 100
 gymrec record BreakoutNoFrameskip-v4 --agent breakout --headless --episodes 50
+gymrec record hf://tsilva/SuperMarioBros-Nes-v0_Level1-1 --headless --episodes 10 --dry-run
+gymrec record https://huggingface.co/tsilva/SuperMarioBros-Nes-v0_Level1-1 --dry-run
 
 gymrec upload BreakoutNoFrameskip-v4             # upload new local episodes to Hub
 gymrec upload BreakoutNoFrameskip-v4 --replace   # replace remote files with local dataset
@@ -72,6 +74,8 @@ gymrec minari-export BreakoutNoFrameskip-v4      # export local data to Minari f
 Human recording opens a pygame window. Press `Space` to start recording, use the environment-specific controls printed in the terminal, press `Tab` to toggle the overlay, use `+`/`-` to adjust FPS, and press `Esc` to stop.
 
 Agent recording supports `human`, `random`, `mario`, and `breakout`. `--headless` is for agent mode only and requires `--episodes`.
+
+`record` also accepts Hugging Face SB3 policy model refs such as `hf://tsilva/SuperMarioBros-Nes-v0_Level1-1` or `https://huggingface.co/tsilva/SuperMarioBros-Nes-v0_Level1-1`. gymrec downloads the repo's `.zip` checkpoint and `model_metadata.json`, infers the Stable-Retro environment, state, action set, frame skip, frame stack, and preprocessing contract, then records the policy's native environment actions as a normal gymrec dataset. Use `--hf-file` when a model repo contains more than one `.zip`; use `--device cpu`, `--device mps`, or `--device cuda` to override SB3 device selection.
 
 Observation storage defaults to `lossless-video`, which stores canonical observations as per-episode lossless RGB streams under `videos/<episode>.rgb.mkv.bin` plus table rows containing `video_path`, `frame_index`, and `frame_sha256`; each canonical stream is decoded and hash-verified before the recording is accepted. Browser-friendly `videos/<episode>.preview.mp4` files are preview-only and are not used for replay/training. Lossless video storage requires `ffmpeg` and `ffprobe` on `PATH`. Use `--storage images` to store one lossless WebP-backed HF `Image` row per observation instead.
 

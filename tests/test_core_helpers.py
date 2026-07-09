@@ -121,3 +121,44 @@ def test_agent_input_source_does_not_own_headless_state():
 
     assert not hasattr(source, "headless")
     assert source.get_action(None) == "action"
+
+
+def test_huggingface_model_ref_parses_hf_scheme_and_urls():
+    assert main.is_huggingface_model_ref("hf://tsilva/SuperMarioBros-Nes-v0_Level1-1")
+    assert main.parse_huggingface_model_ref(
+        "hf://tsilva/SuperMarioBros-Nes-v0_Level1-1/model.zip"
+    ) == ("tsilva/SuperMarioBros-Nes-v0_Level1-1", "model.zip", None)
+    assert main.parse_huggingface_model_ref(
+        "https://huggingface.co/tsilva/SuperMarioBros-Nes-v0_Level1-1"
+    ) == ("tsilva/SuperMarioBros-Nes-v0_Level1-1", None, None)
+    assert main.parse_huggingface_model_ref(
+        "https://huggingface.co/tsilva/SuperMarioBros-Nes-v0_Level1-1/blob/main/model.zip"
+    ) == ("tsilva/SuperMarioBros-Nes-v0_Level1-1", "model.zip", "main")
+
+
+def test_huggingface_metadata_extracts_policy_contract():
+    metadata = {
+        "env_config": {
+            "game": "SuperMarioBros-Nes-v0",
+            "state": "Level1-1",
+            "action_set": "simple",
+            "frame_skip": 4,
+            "observation_size": 84,
+            "obs_crop": [32, 0, 0, 0],
+        },
+        "environment": {"preprocessing": {"frame_stack": 4}},
+    }
+
+    assert main._metadata_str(metadata, ("env_config", "game")) == "SuperMarioBros-Nes-v0"
+    assert main._metadata_str(metadata, ("env_config", "state")) == "Level1-1"
+    assert main._metadata_int(metadata, ("env_config", "frame_skip"), default=1) == 4
+    assert main._metadata_int(
+        metadata, ("environment", "preprocessing", "frame_stack"), default=1
+    ) == 4
+    assert main._metadata_obs_crop(metadata) == (32, 0, 0, 0)
+
+
+def test_stable_retro_simple_action_masks_match_nes_button_indices():
+    masks = main._stable_retro_action_masks("SuperMarioBros-Nes-v0", "simple")
+
+    assert masks == ((), (7,), (7, 0), (7, 8), (7, 8, 0), (8,), (6,))
