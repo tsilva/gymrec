@@ -33,6 +33,8 @@ ROMS_PATH=/path/to/roms
 
 `ROMS_PATH` is passed to ALE-py as `ALE_ROMS_DIR` for Atari games; if `ROMS_PATH` points at a single file, ALE-py receives its parent directory. For Stable-Retro, gymrec scans and imports matching ROMs from `ROMS_PATH` before listing or launching games. You can also pass it directly on the command line:
 
+The editable installation loads the repository `.env` as its default configuration even when `gymrec` is launched from another directory. A `.env` in the invocation directory overrides those defaults.
+
 ```bash
 gymrec list_environments --roms-path ./roms
 ROMS_PATH=./roms gymrec

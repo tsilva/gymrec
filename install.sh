@@ -10,10 +10,12 @@ fi
 
 if uv tool list | grep -q "^gymrec "; then
   echo "Existing gymrec tool detected; upgrading editable tool install."
-  uv tool install . -e --upgrade --force "$@"
+  uv tool install --project . . -e --upgrade --force \
+    --exclude-newer-package stable-retro-turbo=false "$@"
 else
   echo "Installing gymrec as an editable uv tool."
-  uv tool install . -e "$@"
+  uv tool install --project . . -e \
+    --exclude-newer-package stable-retro-turbo=false "$@"
 fi
 
 tool_path="$(uv tool dir --bin)/gymrec"

@@ -43,7 +43,9 @@ STYLE_SUCCESS = "bold green"
 STYLE_FAIL = "bold red"
 STYLE_INFO = "cyan"
 
-load_dotenv(find_dotenv(usecwd=True), override=True)  # Load .env from the invocation cwd.
+_project_dotenv = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+load_dotenv(_project_dotenv, override=False)
+load_dotenv(find_dotenv(usecwd=True), override=True)
 
 _initialized = False
 _stableretro_roms_path_imported = set()
