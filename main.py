@@ -210,7 +210,16 @@ BACKEND_LABELS = {
     "atari": "Atari (ALE-py)",
     "vizdoom": "VizDoom",
     "stable-retro": "Stable-Retro",
+    "supermariobrosnes-turbo": "SuperMarioBros-Nes-turbo",
 }
+
+SELECTABLE_RUNTIME_BACKENDS = ("stable-retro", "supermariobrosnes-turbo")
+SUPERMARIOBROS_NES_ENV_ID = "SuperMarioBros-Nes-v0"
+SUPERMARIOBROS_NES_ROM_SHA256 = (
+    "f61548fdf1670cffefcc4f0b7bdcdd9eaba0c226e3b74f8666071496988248de"
+)
+NES_BUTTON_ORDER = ("B", None, "SELECT", "START", "UP", "DOWN", "LEFT", "RIGHT", "A")
+NES_ACTION_ENCODING = "stable-retro-multibinary-9"
 
 HUGGINGFACE_MODEL_SCHEME = "hf://"
 HUGGINGFACE_MODEL_URL_HOST = "huggingface.co"
@@ -224,6 +233,7 @@ CANONICAL_VIDEO_SUFFIX = ".rgb.mkv.bin"
 PREVIEW_VIDEO_SUFFIX = ".preview.mp4"
 RUNTIME_VIDEO_BASE_COLUMN = "_gymrec_video_base_path"
 RUNTIME_HF_REPO_COLUMN = "_gymrec_hf_repo_id"
+ENVIRONMENT_METADATA_FILENAME = "gymrec-metadata.json"
 _VIDEO_DECODE_CACHE = {}
 
 NES_SIMPLE_ACTION_MASKS = {
@@ -242,6 +252,15 @@ STABLE_RETRO_DISCRETE_ACTION_SETS = {
         "right": ("right", "right_b", "right_a", "right_a_b"),
     }
 }
+
+
+def _is_nes_controller_env(env):
+    """Return whether an environment exposes the shared nine-button NES controller."""
+    if bool(getattr(env, "_gymrec_nes_controller", False)):
+        return True
+    if not bool(getattr(env, "_stable_retro", False)):
+        return False
+    return getattr(getattr(env, "unwrapped", None), "system", None) == "Nes"
 
 
 def _extract_observation_image(observation):
@@ -578,6 +597,124 @@ def classify_env_id(env_id, stable_retro_envs=None):
     ):
         return "stable-retro"
     return "atari"
+
+
+def _capture_backend_from_dataset(dataset):
+    """Return the most recently appended runtime backend carried by a dataset."""
+    if dataset is None or "capture_backend" not in (getattr(dataset, "column_names", None) or []):
+        return None
+    for value in reversed(dataset["capture_backend"]):
+        if value:
+            return str(value)
+    return None
+
+
+def _first_dataset_value(dataset, column):
+    if dataset is None or column not in (getattr(dataset, "column_names", None) or []):
+        return None
+    for value in reversed(dataset[column]):
+        if value is not None and value != "":
+            return value
+    return None
+
+
+def _environment_metadata_from_dataset(dataset):
+    """Recover environment provenance from current row columns or a Hub sidecar."""
+    metadata = {}
+    for column, metadata_key in (
+        ("logical_env_id", "env_id"),
+        ("capture_backend", "capture_backend"),
+        ("state_name", "state_name"),
+        ("rom_sha256", "rom_sha256"),
+        ("action_encoding", "action_encoding"),
+        ("frame_skip", "frameskip"),
+        ("sticky_action_prob", "sticky_actions"),
+    ):
+        value = _first_dataset_value(dataset, column)
+        if value is not None:
+            metadata[metadata_key] = value
+    button_order = _first_dataset_value(dataset, "nes_button_order")
+    if button_order is not None:
+        try:
+            metadata["nes_button_order"] = json.loads(button_order)
+        except (TypeError, json.JSONDecodeError):
+            metadata["nes_button_order"] = button_order
+    if "frameskip" in metadata or "sticky_actions" in metadata:
+        metadata["env_make_kwargs"] = {}
+        atari = metadata.get("capture_backend") == "atari"
+        if "frameskip" in metadata:
+            metadata["env_make_kwargs"]["frameskip" if atari else "frame_skip"] = int(
+                metadata["frameskip"]
+            )
+        if "sticky_actions" in metadata:
+            metadata["env_make_kwargs"][
+                "repeat_action_probability" if atari else "sticky_action_prob"
+            ] = float(metadata["sticky_actions"])
+    return metadata
+
+
+def _attach_hub_environment_metadata(dataset, hf_repo_id):
+    """Attach sidecar provenance to legacy Hub shards as runtime-only columns."""
+    try:
+        metadata_path = hf_hub_download(
+            repo_id=hf_repo_id,
+            filename=ENVIRONMENT_METADATA_FILENAME,
+            repo_type="dataset",
+        )
+        with open(metadata_path, "r") as file_obj:
+            metadata = json.load(file_obj)
+    except Exception:
+        return dataset
+
+    row_values = {
+        "logical_env_id": metadata.get("env_id"),
+        "capture_backend": metadata.get("capture_backend"),
+        "state_name": metadata.get("state_name"),
+        "rom_sha256": metadata.get("rom_sha256"),
+        "nes_button_order": (
+            json.dumps(metadata.get("nes_button_order"))
+            if metadata.get("nes_button_order") is not None
+            else None
+        ),
+        "action_encoding": metadata.get("action_encoding"),
+        "frame_skip": metadata.get("frameskip"),
+        "sticky_action_prob": metadata.get("sticky_actions"),
+    }
+    for column, value in row_values.items():
+        if column not in dataset.column_names and value is not None:
+            dataset = dataset.add_column(column, [value] * len(dataset))
+    return dataset
+
+
+def resolve_runtime_backend(env_id, requested=None, metadata=None, recorded_backend=None):
+    """Resolve logical environment identity separately from its runtime provider."""
+    logical_backend = classify_env_id(env_id)
+    if logical_backend == "atari":
+        logical_backend = classify_env_id(env_id, stable_retro_envs=set(_get_stableretro_envs()))
+    candidate = requested
+    if candidate is None and metadata:
+        candidate = metadata.get("capture_backend")
+    if candidate is None:
+        candidate = recorded_backend
+    if candidate is None:
+        candidate = logical_backend
+
+    if candidate == "supermariobrosnes-turbo":
+        if env_id != SUPERMARIOBROS_NES_ENV_ID:
+            raise ValueError(
+                "The supermariobrosnes-turbo backend only supports "
+                f"{SUPERMARIOBROS_NES_ENV_ID}; got {env_id}."
+            )
+        return candidate
+    if candidate == "stable-retro":
+        if logical_backend != "stable-retro":
+            raise ValueError(f"The stable-retro backend does not support {env_id}.")
+        return candidate
+    if candidate in {"atari", "vizdoom"} and candidate == logical_backend:
+        return candidate
+    if requested is not None or recorded_backend is not None:
+        raise ValueError(f"Unknown runtime backend: {candidate}")
+    return logical_backend
 
 
 def _load_config():
@@ -1046,8 +1183,8 @@ class HumanInputSource(InputSource):
 
         return action
 
-    def _get_stable_retro_action(self):
-        """Return the MultiBinary action vector for stable-retro environments."""
+    def _get_retro_action(self):
+        """Return a controller vector for Stable-Retro-compatible environments."""
         action = np.zeros(self.env.action_space.n, dtype=np.int32)
         platform = getattr(self.env.unwrapped, "system", None)
         mapping = STABLE_RETRO_KEY_BINDINGS.get(platform, {})
@@ -1062,8 +1199,8 @@ class HumanInputSource(InputSource):
         with self.key_lock:
             if hasattr(self.env, "_vizdoom") and self.env._vizdoom:
                 return self._get_vizdoom_action()
-            if hasattr(self.env, "_stable_retro") and self.env._stable_retro:
-                return self._get_stable_retro_action()
+            if bool(getattr(self.env, "_stable_retro", False)) or _is_nes_controller_env(self.env):
+                return self._get_retro_action()
             return self._get_atari_action()
 
 
@@ -1896,6 +2033,39 @@ def _recording_dataset_from_dict(data, storage_format):
         dataset = dataset.cast_column("observations", HFImage())
     dataset = dataset.cast_column("episode_id", Value("binary"))
     dataset = dataset.cast_column("session_id", Value("binary"))
+    for column in (
+        "logical_env_id",
+        "capture_backend",
+        "state_name",
+        "rom_sha256",
+        "nes_button_order",
+        "action_encoding",
+    ):
+        if column in dataset.column_names:
+            dataset = dataset.cast_column(column, Value("string"))
+    if "frame_skip" in dataset.column_names:
+        dataset = dataset.cast_column("frame_skip", Value("int64"))
+    if "sticky_action_prob" in dataset.column_names:
+        dataset = dataset.cast_column("sticky_action_prob", Value("float64"))
+    return dataset
+
+
+def _align_environment_metadata_columns(dataset):
+    """Add nullable environment columns so recordings append to pre-backend datasets."""
+    feature_types = {
+        "logical_env_id": "string",
+        "capture_backend": "string",
+        "state_name": "string",
+        "rom_sha256": "string",
+        "nes_button_order": "string",
+        "action_encoding": "string",
+        "frame_skip": "int64",
+        "sticky_action_prob": "float64",
+    }
+    for column, dtype in feature_types.items():
+        if column not in dataset.column_names:
+            dataset = dataset.add_column(column, [None] * len(dataset))
+        dataset = dataset.cast_column(column, Value(dtype))
     return dataset
 
 
@@ -1999,6 +2169,8 @@ class DatasetRecorderWrapper(gym.Wrapper):
         self._current_episode_video_hashes.clear()
 
     def _build_recorded_dataset(self):
+        env_metadata = getattr(self, "_env_metadata", None) or {}
+        row_count = len(self.frames)
         data = {
             "episode_id": self.episode_ids,
             "seed": self.seeds,
@@ -2011,6 +2183,19 @@ class DatasetRecorderWrapper(gym.Wrapper):
             "collector": [self.collector] * len(self.frames),
             "gymrec_version": [self._gymrec_version] * len(self.frames),
             "storage_format": [self.storage_format] * len(self.frames),
+            "logical_env_id": [env_metadata.get("env_id")] * row_count,
+            "capture_backend": [env_metadata.get("capture_backend")] * row_count,
+            "state_name": [env_metadata.get("state_name")] * row_count,
+            "rom_sha256": [env_metadata.get("rom_sha256")] * row_count,
+            "nes_button_order": [
+                json.dumps(env_metadata.get("nes_button_order"))
+                if env_metadata.get("nes_button_order") is not None
+                else None
+            ]
+            * row_count,
+            "action_encoding": [env_metadata.get("action_encoding")] * row_count,
+            "frame_skip": [env_metadata.get("frameskip")] * row_count,
+            "sticky_action_prob": [env_metadata.get("sticky_actions")] * row_count,
         }
         if self.storage_format == STORAGE_FORMAT_IMAGES:
             data["observations"] = self.frames
@@ -2074,6 +2259,18 @@ class DatasetRecorderWrapper(gym.Wrapper):
             "collector": self.collector,
             "gymrec_version": self._gymrec_version,
             "storage_format": self.storage_format,
+            "logical_env_id": (self._env_metadata or {}).get("env_id"),
+            "capture_backend": (self._env_metadata or {}).get("capture_backend"),
+            "state_name": (self._env_metadata or {}).get("state_name"),
+            "rom_sha256": (self._env_metadata or {}).get("rom_sha256"),
+            "nes_button_order": (
+                json.dumps((self._env_metadata or {}).get("nes_button_order"))
+                if (self._env_metadata or {}).get("nes_button_order") is not None
+                else None
+            ),
+            "action_encoding": (self._env_metadata or {}).get("action_encoding"),
+            "frame_skip": (self._env_metadata or {}).get("frameskip"),
+            "sticky_action_prob": (self._env_metadata or {}).get("sticky_actions"),
             "fps": self._fps or get_default_fps(self.env),
             "terminal_candidate_path": self._relative_live_package_path(
                 self._live_episode.terminal_candidate_path
@@ -2424,9 +2621,10 @@ class DatasetRecorderWrapper(gym.Wrapper):
             mr_idx = vizdoom_buttons.get("MOVE_RIGHT")
             table.add_row("alt+left", "MOVE_LEFT", f"btn {ml_idx}" if ml_idx is not None else "")
             table.add_row("alt+right", "MOVE_RIGHT", f"btn {mr_idx}" if mr_idx is not None else "")
-        elif hasattr(self.env, "_stable_retro") and self.env._stable_retro:
+        elif bool(getattr(self.env, "_stable_retro", False)) or _is_nes_controller_env(self.env):
             platform = getattr(self.env.unwrapped, "system", None)
-            env_type = f"Stable-Retro ({platform})"
+            backend = getattr(self.env, "_gymrec_backend", "stable-retro")
+            env_type = f"{BACKEND_LABELS.get(backend, backend)} ({platform})"
             buttons = getattr(self.env.unwrapped, "buttons", None)
             mapping = STABLE_RETRO_KEY_BINDINGS.get(platform, {})
             # Group keys: D-pad first, then action buttons, then special (SELECT/START)
@@ -3135,7 +3333,7 @@ def save_dataset_locally(dataset, env_id, metadata=None, video_artifact_dir=None
     """Save dataset to local disk, appending to any existing data."""
     path = get_local_dataset_path(env_id)
     metadata_path = _get_metadata_path(env_id)
-    dataset = _strip_runtime_columns(dataset)
+    dataset = _align_environment_metadata_columns(_strip_runtime_columns(dataset))
     new_storage_format = _dataset_storage_format(dataset)
     new_episode_count = len(set(dataset["episode_id"])) if "episode_id" in dataset.column_names else 0
     new_frame_count = len(dataset)
@@ -3147,7 +3345,9 @@ def save_dataset_locally(dataset, env_id, metadata=None, video_artifact_dir=None
     existing_video_dir = path
     if os.path.exists(path):
         # Load existing dataset - UUIDs are already unique, no offsetting needed
-        existing_dataset = load_from_disk(path, keep_in_memory=True)
+        existing_dataset = _align_environment_metadata_columns(
+            load_from_disk(path, keep_in_memory=True)
+        )
         existing_storage_format = _dataset_storage_format(existing_dataset)
         if existing_storage_format != new_storage_format:
             raise ValueError(
@@ -3197,6 +3397,17 @@ def save_dataset_locally(dataset, env_id, metadata=None, video_artifact_dir=None
             recording_entry["collectors"] = sorted(new_collectors)
         if new_versions:
             recording_entry["gymrec_versions"] = sorted(new_versions)
+        for key in (
+            "capture_backend",
+            "state_name",
+            "rom_sha256",
+            "nes_button_order",
+            "action_encoding",
+            "frameskip",
+            "sticky_actions",
+        ):
+            if key in metadata:
+                recording_entry[key] = metadata[key]
         existing_metadata["recordings"].append(recording_entry)
         with open(metadata_path, "w") as f:
             json.dump(existing_metadata, f, indent=2, default=_json_default)
@@ -3237,6 +3448,7 @@ def load_recorded_dataset(env_id):
     except Exception:
         return None, None
 
+    dataset = _attach_hub_environment_metadata(dataset, hf_repo_id)
     dataset = _attach_video_runtime_source(dataset, hf_repo_id=hf_repo_id)
     return dataset, "hub"
 
@@ -3319,7 +3531,7 @@ def _human_record_env_make_kwargs(backend):
             "frameskip": HUMAN_RECORD_FRAMESKIP,
             "repeat_action_probability": HUMAN_RECORD_STICKY_ACTION_PROB,
         }
-    if backend == "stable-retro":
+    if backend in {"stable-retro", "supermariobrosnes-turbo"}:
         return {
             "frame_skip": HUMAN_RECORD_FRAMESKIP,
             "sticky_action_prob": HUMAN_RECORD_STICKY_ACTION_PROB,
@@ -3352,7 +3564,7 @@ def _env_make_kwargs_from_metadata(env_id, metadata, backend=None):
             kwargs["frameskip"] = max(frameskip, 1)
         if sticky is not None:
             kwargs["repeat_action_probability"] = sticky
-    elif backend == "stable-retro":
+    elif backend in {"stable-retro", "supermariobrosnes-turbo"}:
         if frameskip is not None:
             kwargs["frame_skip"] = max(frameskip, 1)
         if sticky is not None:
@@ -3366,6 +3578,7 @@ def _stable_retro_state_from_metadata(metadata):
         return None
     return _metadata_str(
         metadata,
+        ("state_name",),
         ("stable_retro_state",),
         ("retro_state",),
         ("state",),
@@ -3786,6 +3999,32 @@ def _remote_storage_conflict_message(env_id, hf_repo_id, local_format, remote_fo
     )
 
 
+def _remote_parquet_columns(hf_repo_id, remote_files):
+    data_files = sorted(
+        path for path in remote_files if path.startswith("data/") and path.endswith(".parquet")
+    )
+    if not data_files:
+        return None
+    shard_path = hf_hub_download(
+        repo_id=hf_repo_id,
+        filename=data_files[0],
+        repo_type="dataset",
+    )
+    return Dataset.from_parquet(shard_path).column_names
+
+
+def _match_remote_parquet_schema(dataset, remote_columns):
+    """Keep append shards loadable when a legacy Hub repo has fewer columns."""
+    if not remote_columns or dataset.column_names == remote_columns:
+        return dataset
+    missing = [column for column in remote_columns if column not in dataset.column_names]
+    if missing:
+        raise ValueError(
+            "Local data is missing remote dataset columns: " + ", ".join(sorted(missing))
+        )
+    return dataset.select_columns(remote_columns)
+
+
 def _hf_repo_state(api, hf_repo_id, create=False):
     """Return repo existence, parent commit, and file list, optionally creating the repo."""
     repo_exists = False
@@ -3866,6 +4105,11 @@ def _upload_dataset_shard_to_hub(
             with tempfile.TemporaryDirectory() as tmpdir:
                 shard_path = os.path.join(tmpdir, "shard.parquet")
                 upload_dataset = _strip_runtime_columns(dataset)
+                if repo_exists and not replace:
+                    remote_columns = _remote_parquet_columns(hf_repo_id, remote_files)
+                    upload_dataset = _match_remote_parquet_schema(
+                        upload_dataset, remote_columns
+                    )
                 upload_dataset.to_parquet(shard_path)
                 shard_name = (
                     "data/train-00000-of-00001.parquet"
@@ -3875,6 +4119,21 @@ def _upload_dataset_shard_to_hub(
                 operations.append(
                     CommitOperationAdd(path_in_repo=shard_name, path_or_fileobj=shard_path)
                 )
+
+                sidecar_metadata = {
+                    **_environment_metadata_from_dataset(dataset),
+                    **(load_local_metadata(env_id) or {}),
+                }
+                if sidecar_metadata:
+                    sidecar_path = os.path.join(tmpdir, ENVIRONMENT_METADATA_FILENAME)
+                    with open(sidecar_path, "w") as file_obj:
+                        json.dump(sidecar_metadata, file_obj, indent=2, default=_json_default)
+                    operations.append(
+                        CommitOperationAdd(
+                            path_in_repo=ENVIRONMENT_METADATA_FILENAME,
+                            path_or_fileobj=sidecar_path,
+                        )
+                    )
 
                 if storage_format == STORAGE_FORMAT_LOSSLESS_VIDEO:
                     video_paths = sorted(
@@ -4075,6 +4334,19 @@ def _dataset_from_recovered_live_records(package_dir, episode_id, records):
         "gymrec_version": [records[0]["gymrec_version"] for _ in records],
         "storage_format": [storage_format for _ in records],
     }
+    environment_columns = (
+        "logical_env_id",
+        "capture_backend",
+        "state_name",
+        "rom_sha256",
+        "nes_button_order",
+        "action_encoding",
+        "frame_skip",
+        "sticky_action_prob",
+    )
+    for column in environment_columns:
+        if column in records[0]:
+            data[column] = [record.get(column) for record in records]
 
     terminal_record = {
         "episode_id": episode_bytes,
@@ -4089,6 +4361,9 @@ def _dataset_from_recovered_live_records(package_dir, episode_id, records):
         "gymrec_version": records[0]["gymrec_version"],
         "storage_format": storage_format,
     }
+    for column in environment_columns:
+        if column in data:
+            terminal_record[column] = records[0].get(column)
 
     if storage_format == STORAGE_FORMAT_IMAGES:
         data["observations"] = [
@@ -4446,6 +4721,11 @@ def _capture_env_metadata(env):
     metadata = {
         "env_id": getattr(env, "_env_id", "unknown"),
         "backend": classify_env_id(getattr(env, "_env_id", "")),
+        "capture_backend": getattr(
+            env,
+            "_gymrec_backend",
+            classify_env_id(getattr(env, "_env_id", "")),
+        ),
         "frameskip": get_frameskip(env),
         "fps": get_default_fps(env),
     }
@@ -4498,6 +4778,19 @@ def _capture_env_metadata(env):
         metadata["sticky_actions"] = env_make_kwargs["repeat_action_probability"]
     elif "sticky_action_prob" in env_make_kwargs:
         metadata["sticky_actions"] = env_make_kwargs["sticky_action_prob"]
+
+    state_name = getattr(env, "_gymrec_state_name", None)
+    if state_name:
+        metadata["state_name"] = state_name
+    rom_sha256 = getattr(env, "_gymrec_rom_sha256", None)
+    if rom_sha256:
+        metadata["rom_sha256"] = rom_sha256
+    if _is_nes_controller_env(env):
+        metadata.setdefault("sticky_actions", 0.0)
+        metadata["nes_button_order"] = list(NES_BUTTON_ORDER)
+        metadata["action_encoding"] = NES_ACTION_ENCODING
+        metadata["frame_stack"] = 1
+        metadata["noop_reset_max"] = 0
 
     # ALE-specific: check unwrapped for sticky actions
     unwrapped = getattr(env, "unwrapped", None)
@@ -4583,6 +4876,19 @@ def _dataset_card_environment_lines(metadata, backend):
         "|---------|-------|",
     ]
 
+    if metadata.get("capture_backend"):
+        lines.append(f"| Capture Backend | {metadata['capture_backend']} |")
+    if metadata.get("state_name"):
+        lines.append(f"| State | {metadata['state_name']} |")
+    if metadata.get("rom_sha256"):
+        lines.append(f"| ROM SHA-256 | `{metadata['rom_sha256']}` |")
+    if metadata.get("action_encoding"):
+        lines.append(f"| Action Encoding | {metadata['action_encoding']} |")
+    if metadata.get("nes_button_order"):
+        lines.append(
+            f"| NES Button Order | `{json.dumps(metadata['nes_button_order'])}` |"
+        )
+
     for key, label in (
         ("frameskip", "Frameskip"),
         ("fps", "Target FPS"),
@@ -4605,7 +4911,7 @@ def _dataset_card_environment_lines(metadata, backend):
         rmin, rmax = metadata["reward_range"]
         lines.append(f"| Reward Range | [{rmin}, {rmax}] |")
 
-    if backend == "stable-retro":
+    if backend in {"stable-retro", "supermariobrosnes-turbo"}:
         if metadata.get("retro_platform"):
             lines.append(f"| Platform | {metadata['retro_platform']} |")
         if metadata.get("retro_game"):
@@ -4640,7 +4946,7 @@ def render_dataset_card_content(
     curator=None,
 ):
     """Render the shared Hugging Face dataset card Markdown."""
-    backend = classify_env_id(env_id)
+    backend = (metadata or {}).get("capture_backend") or classify_env_id(env_id)
     collectors = collectors or []
     gymrec_versions = gymrec_versions or []
     curator = curator or _current_hf_username()
@@ -4802,6 +5108,132 @@ def _warn_unsupported_env_kwargs(env_id, kwargs):
     )
 
 
+def _sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as file_obj:
+        for chunk in iter(lambda: file_obj.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def resolve_supermariobrosnes_rom_path(roms_path=None):
+    """Resolve the canonical SMB NES ROM from a file or directory by SHA-256."""
+    source = roms_path or _get_roms_path()
+    if not source:
+        raise FileNotFoundError(
+            "SuperMarioBros-Nes-turbo requires ROMS_PATH or --roms-path to point to "
+            "the canonical Super Mario Bros NES ROM or a directory containing it."
+        )
+
+    source = os.path.abspath(os.path.expanduser(os.fspath(source)))
+    if os.path.isfile(source):
+        candidates = [source]
+    elif os.path.isdir(source):
+        candidates = [
+            os.path.join(root, filename)
+            for root, _dirs, files in os.walk(source)
+            for filename in sorted(files)
+            if filename.lower().endswith(".nes")
+        ]
+    else:
+        raise FileNotFoundError(f"ROMS_PATH does not exist: {source}")
+
+    for candidate in candidates:
+        if _sha256_file(candidate) == SUPERMARIOBROS_NES_ROM_SHA256:
+            return candidate
+
+    if os.path.isfile(source):
+        detail = "the selected file has the wrong SHA-256"
+    elif not candidates:
+        detail = "the directory contains no .nes files"
+    else:
+        detail = f"none of the {len(candidates)} .nes files match the canonical SHA-256"
+    raise ValueError(f"Could not resolve the canonical Super Mario Bros NES ROM: {detail}.")
+
+
+def _lane_zero_value(value):
+    if isinstance(value, dict):
+        return _vector_info_to_lane_info(value)
+    if isinstance(value, np.ndarray):
+        if value.ndim == 0:
+            return value.item()
+        value = value[0]
+    elif isinstance(value, (list, tuple)):
+        value = value[0]
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
+def _vector_info_to_lane_info(vector_info):
+    """Convert Gymnasium vector-info dictionaries into an ordinary lane-zero dict."""
+    if not vector_info:
+        return {}
+    lane_info = {}
+    for key, value in vector_info.items():
+        if key.startswith("_"):
+            continue
+        mask = vector_info.get(f"_{key}")
+        if mask is not None and not bool(_lane_zero_value(mask)):
+            continue
+        lane_info[key] = _lane_zero_value(value)
+    return lane_info
+
+
+class SuperMarioBrosNesTurboEnvAdapter(gym.Env):
+    """Expose a one-lane SMB turbo VectorEnv as an ordinary Gymnasium Env."""
+
+    def __init__(self, vector_env):
+        _lazy_init()
+        if getattr(vector_env, "num_envs", None) != 1:
+            raise ValueError("The gymrec turbo adapter requires num_envs=1")
+        self.vector_env = vector_env
+        self.action_space = vector_env.single_action_space
+        self.observation_space = vector_env.single_observation_space
+        self.metadata = dict(getattr(vector_env, "metadata", {}) or {})
+        self.render_mode = getattr(vector_env, "render_mode", "rgb_array")
+        self.autoreset_mode = getattr(vector_env, "autoreset_mode", None)
+        self.system = "Nes"
+        self.buttons = list(NES_BUTTON_ORDER)
+        self._needs_reset = True
+
+    def reset(self, *, seed=None, options=None):
+        super().reset(seed=seed)
+        observations, infos = self.vector_env.reset(seed=seed, options=options)
+        self._needs_reset = False
+        return observations[0], _vector_info_to_lane_info(infos)
+
+    def step(self, action):
+        if self._needs_reset:
+            raise RuntimeError("reset() must be called before step() or after a terminal step")
+        action = np.asarray(action, dtype=self.action_space.dtype)
+        if action.shape != self.action_space.shape or not self.action_space.contains(action):
+            raise ValueError(
+                f"Expected a Stable-Retro-compatible NES action with shape "
+                f"{self.action_space.shape}; got {action.shape}"
+            )
+        observations, rewards, terminations, truncations, infos = self.vector_env.step(
+            action[np.newaxis, ...]
+        )
+        terminated = bool(terminations[0])
+        truncated = bool(truncations[0])
+        if terminated or truncated:
+            self._needs_reset = True
+        return (
+            observations[0],
+            float(rewards[0]),
+            terminated,
+            truncated,
+            _vector_info_to_lane_info(infos),
+        )
+
+    def render(self):
+        return self.vector_env.render()
+
+    def close(self):
+        self.vector_env.close()
+
+
 def _create_env__stableretro(env_id, state=None, env_make_kwargs=None):
     _ensure_stableretro_roms_path_imported()
 
@@ -4831,7 +5263,58 @@ def _create_env__stableretro(env_id, state=None, env_make_kwargs=None):
         env = retro.make(env_id, **make_kwargs)
         env._gymrec_make_kwargs = {}
     env._stable_retro = True
+    env._gymrec_backend = "stable-retro"
     env._gymrec_stable_retro_state = state
+    env._gymrec_state_name = state
+    env._gymrec_nes_controller = (
+        getattr(getattr(env, "unwrapped", None), "system", None) == "Nes"
+    )
+    try:
+        rom_path = retro.data.get_romfile_path(env_id, retro.data.Integrations.ALL)
+        env._gymrec_rom_sha256 = _sha256_file(rom_path)
+    except (FileNotFoundError, OSError, AttributeError):
+        pass
+    return env
+
+
+def _create_env__supermariobrosnes_turbo(env_id, state=None, env_make_kwargs=None):
+    if env_id != SUPERMARIOBROS_NES_ENV_ID:
+        raise ValueError(
+            "The supermariobrosnes-turbo backend only supports "
+            f"{SUPERMARIOBROS_NES_ENV_ID}."
+        )
+
+    from supermariobrosnes_turbo import Actions, SuperMarioBrosNesTurboVecEnv
+
+    rom_path = resolve_supermariobrosnes_rom_path()
+    state = state or "Level1-1"
+    optional_kwargs = dict(env_make_kwargs or {})
+    frame_skip = max(int(optional_kwargs.get("frame_skip", 1)), 1)
+    sticky_action_prob = float(optional_kwargs.get("sticky_action_prob", 0.0))
+    vector_env = SuperMarioBrosNesTurboVecEnv(
+        SUPERMARIOBROS_NES_ENV_ID,
+        num_envs=1,
+        num_threads=1,
+        render_mode="rgb_array",
+        use_restricted_actions=Actions.ALL,
+        rom_path=rom_path,
+        state=state,
+        obs_layout="hwc",
+        frame_stack=1,
+        frame_skip=frame_skip,
+        sticky_action_prob=sticky_action_prob,
+        noop_reset_max=0,
+        info_filter="all",
+    )
+    env = SuperMarioBrosNesTurboEnvAdapter(vector_env)
+    env._gymrec_backend = "supermariobrosnes-turbo"
+    env._gymrec_nes_controller = True
+    env._gymrec_state_name = state
+    env._gymrec_rom_sha256 = SUPERMARIOBROS_NES_ROM_SHA256
+    env._gymrec_make_kwargs = {
+        "frame_skip": frame_skip,
+        "sticky_action_prob": sticky_action_prob,
+    }
     return env
 
 
@@ -4896,22 +5379,33 @@ def create_env(
     env_id,
     *,
     stable_retro_state=None,
+    backend=None,
     human_recording=False,
     metadata=None,
 ):
     """Create a Gymnasium environment with the appropriate backend."""
 
-    stable_retro_envs = set(_get_stableretro_envs())
-    backend = classify_env_id(env_id, stable_retro_envs=stable_retro_envs)
+    if backend is None and not (metadata or {}).get("capture_backend"):
+        stable_retro_envs = set(_get_stableretro_envs())
+        backend = classify_env_id(env_id, stable_retro_envs=stable_retro_envs)
+    backend = resolve_runtime_backend(env_id, requested=backend, metadata=metadata)
     if human_recording:
         env_make_kwargs = _human_record_env_make_kwargs(backend)
     else:
         env_make_kwargs = _env_make_kwargs_from_metadata(env_id, metadata, backend=backend)
-    if backend == "stable-retro" and stable_retro_state is None:
+    if backend in {"stable-retro", "supermariobrosnes-turbo"} and stable_retro_state is None:
         stable_retro_state = _stable_retro_state_from_metadata(metadata)
+    if env_id == SUPERMARIOBROS_NES_ENV_ID and stable_retro_state is None:
+        stable_retro_state = "Level1-1"
 
     if backend == "stable-retro":
         env = _create_env__stableretro(
+            env_id,
+            state=stable_retro_state,
+            env_make_kwargs=env_make_kwargs,
+        )
+    elif backend == "supermariobrosnes-turbo":
+        env = _create_env__supermariobrosnes_turbo(
             env_id,
             state=stable_retro_state,
             env_make_kwargs=env_make_kwargs,
@@ -4923,6 +5417,7 @@ def create_env(
         env = _create_env__alepy(env_id, env_make_kwargs=env_make_kwargs)
 
     env._env_id = env_id
+    env._gymrec_backend = backend
     return env
 
 
@@ -4952,7 +5447,7 @@ def get_frameskip(env) -> int:
     # VizDoom and Retro have different frameskip semantics; skip detection
     if hasattr(env, "_vizdoom") and env._vizdoom:
         return 1
-    if hasattr(env, "_stable_retro") and env._stable_retro:
+    if bool(getattr(env, "_stable_retro", False)) or _is_nes_controller_env(env):
         return 1
 
     # Check spec kwargs (works for gym.make() environments)
@@ -5518,6 +6013,18 @@ def _add_roms_path_arg(parser, default=None):
     )
 
 
+def _add_backend_arg(parser):
+    parser.add_argument(
+        "--backend",
+        choices=SELECTABLE_RUNTIME_BACKENDS,
+        default=None,
+        help=(
+            "Runtime backend for Stable-Retro-compatible environments. Playback overrides "
+            "the recorded capture backend when supplied."
+        ),
+    )
+
+
 @dataclass(frozen=True)
 class RecordPlan:
     agent: str
@@ -5582,6 +6089,7 @@ async def main():
     parser_record = subparsers.add_parser("record", help="Record gameplay")
     _add_roms_path_arg(parser_record, default=argparse.SUPPRESS)
     _add_env_id_arg(parser_record)
+    _add_backend_arg(parser_record)
     _add_fps_arg(parser_record, "Frames per second for playback/recording")
     _add_scale_arg(parser_record)
     parser_record.add_argument(
@@ -5666,6 +6174,7 @@ async def main():
     parser_playback = subparsers.add_parser("playback", help="Replay a dataset")
     _add_roms_path_arg(parser_playback, default=argparse.SUPPRESS)
     _add_env_id_arg(parser_playback)
+    _add_backend_arg(parser_playback)
     _add_fps_arg(parser_playback, "Frames per second for playback/recording")
     _add_scale_arg(parser_playback)
     parser_playback.add_argument(
@@ -5771,6 +6280,7 @@ async def main():
             ("hf_revision", None),
             ("device", "auto"),
             ("deterministic", False),
+            ("backend", None),
         ]:
             if not hasattr(args, attr):
                 setattr(args, attr, default)
@@ -5854,15 +6364,38 @@ async def main():
             return
 
     playback_metadata = load_local_metadata(env_id) if args.command == "playback" else None
+    loaded_dataset = None
+    playback_source = None
+    recorded_backend = None
+    if args.command == "playback":
+        loaded_dataset, playback_source = load_recorded_dataset(env_id)
+        if loaded_dataset is None:
+            _print_missing_dataset(env_id)
+            return
+        dataset_metadata = _environment_metadata_from_dataset(loaded_dataset)
+        playback_metadata = {**dataset_metadata, **(playback_metadata or {})}
+        recorded_backend = _capture_backend_from_dataset(loaded_dataset)
+
     env = None
     fps = args.fps
     if args.command == "playback" or args.command == "record":
-        env = create_env(
-            env_id,
-            stable_retro_state=hf_policy_source.state if hf_policy_source else None,
-            human_recording=bool(record_plan and record_plan.human),
-            metadata=playback_metadata,
-        )
+        try:
+            selected_backend = resolve_runtime_backend(
+                env_id,
+                requested=getattr(args, "backend", None),
+                metadata=playback_metadata,
+                recorded_backend=recorded_backend,
+            )
+            env = create_env(
+                env_id,
+                stable_retro_state=hf_policy_source.state if hf_policy_source else None,
+                backend=selected_backend,
+                human_recording=bool(record_plan and record_plan.human),
+                metadata=playback_metadata,
+            )
+        except (FileNotFoundError, ValueError) as exc:
+            console.print(f"[{STYLE_FAIL}]Error: {exc}[/]")
+            return
         if fps is None:
             if args.command == "playback" and playback_metadata:
                 fps = _get_default_fps_for_env_id(env_id, metadata=playback_metadata)
@@ -5985,11 +6518,7 @@ async def main():
                     f"To upload later: [{STYLE_CMD}]{_gymrec_cmd('upload', env_id)}[/]"
                 )
     elif args.command == "playback":
-        loaded_dataset, source = load_recorded_dataset(env_id)
-        if loaded_dataset is None:
-            _print_missing_dataset(env_id)
-            return
-        if source == "local":
+        if playback_source == "local":
             console.print(
                 f"[{STYLE_INFO}]Playing back from local dataset ({len(loaded_dataset)} frames)[/]"
             )

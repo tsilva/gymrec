@@ -6,7 +6,7 @@
 
 gymrec is a Python CLI for collecting gameplay from Gymnasium environments and saving it as replayable Hugging Face datasets. It supports human keyboard capture, built-in agent policies, local dataset storage, Hub uploads, playback verification, and MP4 exports.
 
-It works across Atari through ALE-py, Stable-Retro console environments, and VizDoom. Recordings store observations, actions, rewards, episode metadata, collector provenance, and the gymrec version used to collect the run.
+It works across Atari through ALE-py, Stable-Retro console environments, the native `supermariobrosnes-turbo` runtime, and VizDoom. Recordings store observations, actions, rewards, episode metadata, collector provenance, and the gymrec version used to collect the run.
 
 ## Install
 
@@ -31,7 +31,7 @@ Set `ROMS_PATH` in the `.env` file for the directory where you run `gymrec` to m
 ROMS_PATH=/path/to/roms
 ```
 
-`ROMS_PATH` is passed to ALE-py as `ALE_ROMS_DIR` for Atari games; if `ROMS_PATH` points at a single file, ALE-py receives its parent directory. For Stable-Retro, gymrec scans and imports matching ROMs from `ROMS_PATH` before listing or launching games. You can also pass it directly on the command line:
+`ROMS_PATH` is passed to ALE-py as `ALE_ROMS_DIR` for Atari games; if `ROMS_PATH` points at a single file, ALE-py receives its parent directory. For Stable-Retro, gymrec scans and imports matching ROMs from `ROMS_PATH` before listing or launching games. For `supermariobrosnes-turbo`, it may point to the ROM file itself or a directory: gymrec selects the canonical `SuperMarioBros-Nes-v0` ROM by SHA-256 even when several `.nes` files are present. You can also pass it directly on the command line:
 
 The editable installation loads the repository `.env` as its default configuration even when `gymrec` is launched from another directory. A `.env` in the invocation directory overrides those defaults.
 
@@ -54,14 +54,18 @@ gymrec record BreakoutNoFrameskip-v4 --dry-run   # save locally without upload p
 gymrec record BreakoutNoFrameskip-v4 --storage lossless-video --dry-run
 gymrec record BreakoutNoFrameskip-v4 --upload-live
 gymrec record SuperMarioBros-Nes-v0 --agent random --headless --episodes 100
+gymrec record SuperMarioBros-Nes-v0 --backend supermariobrosnes-turbo --dry-run
 gymrec record BreakoutNoFrameskip-v4 --agent breakout --headless --episodes 50
 gymrec record hf://tsilva/SuperMarioBros-Nes-v0_Level1-1 --headless --episodes 10 --dry-run
+gymrec record hf://<level1-1-policy> --backend supermariobrosnes-turbo --headless --episodes 10 --dry-run
 gymrec record https://huggingface.co/tsilva/SuperMarioBros-Nes-v0_Level1-1 --dry-run
 
 gymrec upload BreakoutNoFrameskip-v4             # upload new local episodes to Hub
 gymrec upload BreakoutNoFrameskip-v4 --replace   # replace remote files with local dataset
 gymrec playback BreakoutNoFrameskip-v4           # replay recorded actions
 gymrec playback BreakoutNoFrameskip-v4 --verify  # compare replay frames against recorded frames
+gymrec playback SuperMarioBros-Nes-v0 --backend stable-retro
+gymrec playback SuperMarioBros-Nes-v0 --backend supermariobrosnes-turbo
 
 gymrec video BreakoutNoFrameskip-v4              # export all episodes to MP4
 gymrec video BreakoutNoFrameskip-v4 --range 3-7  # export a 1-based episode range
@@ -90,6 +94,8 @@ The interactive recording menu only shows Atari and Stable-Retro environments wh
 
 Playback uses the local dataset first, then falls back to the Hugging Face Hub dataset repo. Video export requires `ffmpeg` and writes MP4 files from local data or downloaded Hub data.
 
+`SuperMarioBros-Nes-v0` is the logical environment ID for both Mario runtimes. Use `--backend stable-retro` or `--backend supermariobrosnes-turbo` on `record` and `playback` to select the runtime without changing the dataset name. The exact nine-button NES `MultiBinary` action vector is stored unchanged, so one captured trajectory can be replayed through either backend for parity checks and later video capture. Playback uses an explicit `--backend` override when supplied; otherwise it uses recorded capture-backend metadata when available and defaults older Mario datasets to Stable-Retro.
+
 ## Notes
 
 - Requires Python `>=3.12,<3.13` and `uv`.
@@ -98,6 +104,7 @@ Playback uses the local dataset first, then falls back to the Hugging Face Hub d
 - `config.toml` controls display scale, FPS defaults, local storage path/format, dataset metadata, and overlay defaults.
 - `keymappings.toml` controls Atari, VizDoom, and Stable-Retro keyboard bindings.
 - Stable-Retro support uses the latest resolvable `stable-retro-turbo`, which keeps the `stable_retro` import name and provides PyPI wheels for macOS arm64.
+- Native Mario playback uses the PyPI `supermariobrosnes-turbo` package with one lane, one thread, RGB HWC observations, `frame_stack=1`, `frame_skip=1`, sticky actions disabled, and autoreset disabled.
 - `ffmpeg` must be available on `PATH` for `video` exports; `ffmpeg` and `ffprobe` are required for `--storage lossless-video`.
 - `minari-export` requires Minari. For the installed tool, run `./install.sh --with 'minari>=0.5.0'`; for repository development, run `uv sync --extra minari`.
 

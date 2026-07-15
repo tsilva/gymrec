@@ -22,6 +22,7 @@ dependencies = [
     "simple-term-menu",
     "stable-retro-turbo",
     "stable-baselines3>=2.9.0",
+    "supermariobrosnes-turbo>=0.3.0",
 ]
 
 [project.scripts]
