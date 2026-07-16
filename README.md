@@ -57,7 +57,7 @@ gymrec record SuperMarioBros-Nes-v0 --agent random --headless --episodes 100
 gymrec record SuperMarioBros-Nes-v0 --backend supermariobrosnes-turbo --dry-run
 gymrec record BreakoutNoFrameskip-v4 --agent breakout --headless --episodes 50
 gymrec record hf://tsilva/NES-SuperMarioBros_Level1-1_gray84-hudcrop-stack4-simple_ppo --headless --episodes 10 --dry-run
-gymrec record https://huggingface.co/tsilva/NES-SuperMarioBros_Level1-1_gray84-hudcrop-stack4-simple_ppo --headless --episodes 10 --dry-run
+gymrec record https://huggingface.co/tsilva/NES-SuperMarioBros_Level1-1_gray84-hudcrop-stack4-simple_ppo --headless --episodes 10 --seed 123 --policy-seed 456 --dry-run
 
 gymrec upload BreakoutNoFrameskip-v4             # upload new local episodes to Hub
 gymrec upload BreakoutNoFrameskip-v4 --replace   # replace remote files with local dataset
@@ -81,28 +81,34 @@ Human recording opens a pygame window. Press `Space` to start recording, use the
 
 Agent recording supports `human`, `random`, `mario`, and `breakout`. `--headless` is for agent mode only and requires `--episodes`.
 
-`record` also accepts Hugging Face rlab SB3 policy bundles. Each model repo must contain versioned `model.json` and `recipe.json` documents plus the checkpoint declared by `model.json`. gymrec validates the document versions, file sizes, SHA-256 bindings, algorithm/model identity, resolved evaluation environment, provider, task, and action sampling mode before execution. Unknown versions and unsupported providers fail explicitly.
+`record` also accepts Hugging Face rlab SB3 policy bundles. Each model repo must contain versioned `model.json` and its hash-bound `recipe.json`, plus the checkpoint selected by `model.json`. `release_manifest.json` is optional, but when present every artifact it declares is downloaded from the same immutable commit and hash-verified. gymrec resolves branches and tags to an immutable commit before downloading anything, then validates document versions, file sizes, SHA-256 bindings, algorithm/model identity, environment, provider, task, and action sampling mode. Missing standardized files, unknown versions, legacy model repositories, and inconsistent releases fail explicitly.
 
-For Mario bundles, gymrec creates the exact native vector provider declared by `recipe.eval.environment` (`supermariobrosnes-turbo` or `stable-retro-turbo`). Crop, grayscale, resize algorithm, layout, frame stacking, max pooling, frame skip, sticky actions, and provider flags are executed by that provider; gymrec does not recreate the preprocessing in Python. The policy receives the native policy observation while the dataset stores raw RGB renders and backend-neutral nine-button NES action vectors. The recipe's Mario reward/termination contract and evaluation seed are also applied. Action sampling follows `recipe.json` by default; use `--deterministic` or `--stochastic` only to override it. `--device cpu`, `--device mps`, or `--device cuda` overrides SB3 device selection. `--hf-file` is only an optional assertion that the requested checkpoint matches `model.json`.
+For Mario bundles, gymrec creates the native vector provider declared by `recipe.eval.environment` (`supermariobrosnes-turbo` or `stable-retro-turbo`), falling back only to the standardized `model.json` training environment when the recipe intentionally omits its eval environment. Crop, grayscale, resize algorithm, layout, frame stacking, max pooling, frame skip, sticky actions, and provider flags are executed by that provider; gymrec does not recreate the preprocessing in Python. The policy receives the native policy observation while the dataset stores raw RGB renders and backend-neutral nine-button NES action vectors. The recipe's Mario reward and termination contract are applied. Action sampling follows `recipe.json` by default; use `--deterministic` or `--stochastic` only to override it. `--device cpu`, `--device mps`, or `--device cuda` overrides SB3 device selection. The checkpoint cannot be selected from the CLI.
 
-Policy-recorded rows include the source repo/revision, recipe and checkpoint SHA-256 values, and both bundle format versions. These fields make the policy/environment contract recoverable from the trajectory dataset without relying on a mutable model-repo branch.
+`--seed` is the base environment reset seed. `--policy-seed` is the base stochastic-policy seed and defaults to `--seed`. Omitted seeds are generated and printed. Episode `i` uses base seed `+ i`, so each episode is independently reproducible from its environment seed, policy seed, and collector contract.
+
+Policy-recorded rows add only `collector_contract_id`, `policy_mode`, and `policy_seed`; human and built-in collectors store nulls in those columns. The immutable collector documents are stored once under `collectors/<collector_contract_id>/`: verbatim `model.json`, verbatim `recipe.json`, optional verbatim `release_manifest.json`, and gymrec's canonical `collection.json`. The latter binds the immutable model commit and hashes to the effective execution settings, declared/effective differences, inference device, runtime versions, seed protocol, and policy-adapter version. Checkpoints remain in the model repository and are not copied into the dataset.
 
 Observation storage defaults to `lossless-video`, which stores canonical observations as per-episode lossless RGB streams under `videos/<episode>.rgb.mkv.bin` plus table rows containing `video_path`, `frame_index`, and `frame_sha256`; each canonical stream is decoded and hash-verified before the recording is accepted. Browser-friendly `videos/<episode>.preview.mp4` files are preview-only and are not used for replay/training. Lossless video storage requires `ffmpeg` and `ffprobe` on `PATH`. Use `--storage images` to store one lossless WebP-backed HF `Image` row per observation instead.
 
 Use `--upload-live` to preflight Hugging Face access before gameplay and upload each completed episode as its own shard while recording. In live mode, `lossless-video` streams frames directly into ffmpeg instead of buffering the whole episode in memory; completed steps are journaled with a recoverable terminal-frame candidate, verified episodes are uploaded immediately, failed or interrupted uploads are left in a resumable local queue, and `gymrec upload <env_id>` recovers/retries that queue. Live upload is incompatible with `--dry-run` and skips preview MP4 generation.
 
-Hub uploads append new parquet shards only when the existing remote dataset has the same storage layout as the local dataset. If a remote dataset already uses a different current storage format, `gymrec upload` refuses to append so the Dataset Viewer does not show a mixed schema; use `gymrec upload <env_id> --replace` to intentionally rewrite the remote repo from the current local dataset.
+This provenance release is a clean schema break. Local datasets and remote append targets must have the exact current schema; gymrec does not add missing columns, drop new columns, align legacy Parquet, or migrate old datasets. `--replace` is accepted only when the local source already has the complete new schema. Collector directories are uploaded with the first shard that references them, safely reused when identical, and rejected on any content conflict.
 
 The interactive recording menu only shows Atari and Stable-Retro environments whose ROMs are installed in the active Python environment. It uses a full-screen terminal menu by default and falls back to a plain text search prompt when the terminal cannot support it. Set `GYMREC_TEXT_MENU=1` to force the text selector. `list_environments` also shows missing ROMs for backends that register games separately from installed game files.
 
 Playback uses the local dataset first, then falls back to the Hugging Face Hub dataset repo. Video export requires `ffmpeg` and writes MP4 files from local data or downloaded Hub data.
 
-`SuperMarioBros-Nes-v0` is the logical environment ID for both Mario runtimes. Use `--backend stable-retro` or `--backend supermariobrosnes-turbo` on `record` and `playback` to select the runtime without changing the dataset name. The exact nine-button NES `MultiBinary` action vector is stored unchanged, so one captured trajectory can be replayed through either backend for parity checks and later video capture. Playback uses an explicit `--backend` override when supplied; otherwise it uses recorded capture-backend metadata when available and defaults older Mario datasets to Stable-Retro.
+`SuperMarioBros-Nes-v0` is the logical environment ID for both Mario runtimes. Use `--backend stable-retro` or `--backend supermariobrosnes-turbo` on `record` and `playback` to select the runtime without changing the dataset name. The exact nine-button NES `MultiBinary` action vector is stored unchanged, so one captured trajectory can be replayed through either backend for parity checks and later video capture. Playback uses an explicit `--backend` override when supplied; otherwise it uses the canonical row-level capture-backend metadata.
+
+## Tests
+
+Run `uv run pytest -q` for the local suite. Set `GYMREC_HF_SMOKE=1` to include the network smoke test that resolves and validates the published standardized Level1‑1 repository.
 
 ## Notes
 
 - Requires Python `>=3.12,<3.13` and `uv`.
-- Hugging Face uploads use dataset repos named `{username}/gymrec__{encoded_env_id}` by default.
+- Environment recordings use dataset repos named `{username}/gymrec__{encoded_env_id}` by default; policy recordings default to the source model repo name unless `--dataset-repo` is supplied.
 - Local datasets are stored under `~/.gymrec/datasets` by default.
 - `config.toml` controls display scale, FPS defaults, local storage path/format, dataset metadata, and overlay defaults.
 - `keymappings.toml` controls Atari, VizDoom, and Stable-Retro keyboard bindings.

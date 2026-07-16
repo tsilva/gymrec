@@ -11,8 +11,7 @@ import main
 
 @pytest.fixture
 def temp_storage_dir(tmp_path):
-    if main.CONFIG is None:
-        main.CONFIG = main._load_config()
+    main._lazy_init()
     previous_local_dir = main.CONFIG["storage"]["local_dir"]
     main.CONFIG["storage"]["local_dir"] = str(tmp_path)
     try:
@@ -308,6 +307,18 @@ def test_capture_backend_metadata_round_trip(temp_storage_dir):
             "collector": ["human"],
             "gymrec_version": ["test"],
             "storage_format": [main.STORAGE_FORMAT_IMAGES],
+            "logical_env_id": [main.SUPERMARIOBROS_NES_ENV_ID],
+            "capture_backend": ["supermariobrosnes-turbo"],
+            "state_name": ["Level1-1"],
+            "rom_sha256": [main.SUPERMARIOBROS_NES_ROM_SHA256],
+            "nes_button_order": [json.dumps(main.NES_BUTTON_ORDER)],
+            "action_encoding": [main.NES_ACTION_ENCODING],
+            "frame_skip": [1],
+            "sticky_action_prob": [0.0],
+            "collector_contract_id": [None],
+            "policy_mode": [None],
+            "policy_seed": [None],
+            "observations": [np.zeros((1, 1, 3), dtype=np.uint8)],
         }
     )
     dataset = dataset.cast_column("episode_id", main.Value("binary"))
@@ -344,20 +355,12 @@ def test_dataset_capture_backend_is_optional_for_older_datasets():
     assert main._capture_backend_from_dataset(new_dataset) == "supermariobrosnes-turbo"
 
 
-def test_legacy_hub_schema_drops_new_columns_from_append_shard():
+def test_legacy_hub_schema_is_rejected_without_alignment():
     main._lazy_init()
-    dataset = main.Dataset.from_dict(
-        {
-            "actions": [[0], []],
-            "capture_backend": ["supermariobrosnes-turbo"] * 2,
-            "state_name": ["Level1-1"] * 2,
-        }
-    )
-
-    compatible = main._match_remote_parquet_schema(dataset, ["actions"])
-
-    assert compatible.column_names == ["actions"]
-    assert compatible["actions"] == [[0], []]
+    with pytest.raises(ValueError, match="canonical gymrec schema"):
+        main._validate_remote_parquet_schema(
+            "owner/legacy", ["actions"], main.STORAGE_FORMAT_IMAGES
+        )
 
 
 def test_environment_metadata_can_be_recovered_from_dataset_rows():
@@ -433,6 +436,8 @@ def test_recorded_rows_carry_backend_neutral_nes_metadata():
     recorder.collector = "human"
     recorder._gymrec_version = "test"
     recorder.storage_format = main.STORAGE_FORMAT_IMAGES
+    recorder.policy_seeds = [None]
+    recorder.collector_contract = None
     recorder._env_metadata = {
         "env_id": main.SUPERMARIOBROS_NES_ENV_ID,
         "capture_backend": "supermariobrosnes-turbo",

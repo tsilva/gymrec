@@ -4,6 +4,7 @@ import hashlib
 import json
 import shutil
 import uuid
+from dataclasses import replace
 
 import gymnasium as gym
 import numpy as np
@@ -130,6 +131,21 @@ def make_minimal_dataset(episode_uuid=None, collector="random"):
             "collector": [collector, collector],
             "gymrec_version": ["0.1.0+test", "0.1.0+test"],
             "storage_format": [main.STORAGE_FORMAT_IMAGES, main.STORAGE_FORMAT_IMAGES],
+            "logical_env_id": ["BreakoutNoFrameskip-v4"] * 2,
+            "capture_backend": ["atari"] * 2,
+            "state_name": [None] * 2,
+            "rom_sha256": [None] * 2,
+            "nes_button_order": [None] * 2,
+            "action_encoding": [None] * 2,
+            "frame_skip": [1] * 2,
+            "sticky_action_prob": [0.0] * 2,
+            "collector_contract_id": [None] * 2,
+            "policy_mode": [None] * 2,
+            "policy_seed": [None] * 2,
+            "observations": [
+                np.zeros((1, 1, 3), dtype=np.uint8),
+                np.ones((1, 1, 3), dtype=np.uint8),
+            ],
         }
     )
     dataset = dataset.cast_column("episode_id", main.Value("binary"))
@@ -139,8 +155,7 @@ def make_minimal_dataset(episode_uuid=None, collector="random"):
 
 @pytest.fixture
 def temp_storage_dir(tmp_path):
-    if main.CONFIG is None:
-        main.CONFIG = main._load_config()
+    main._lazy_init()
     previous_local_dir = main.CONFIG["storage"]["local_dir"]
     main.CONFIG["storage"]["local_dir"] = str(tmp_path)
     try:
@@ -218,7 +233,7 @@ def test_repo_recording_save_persists_identity_and_is_discoverable(temp_storage_
 
 
 def test_load_recorded_dataset_repo_ref_uses_exact_dataset_repo(monkeypatch):
-    hub_dataset = DatasetLike({"actions": [[0]]})
+    hub_dataset = make_minimal_dataset()
     calls = []
     monkeypatch.setattr(main, "load_local_dataset", lambda identity: None)
     monkeypatch.setattr(
@@ -227,7 +242,6 @@ def test_load_recorded_dataset_repo_ref_uses_exact_dataset_repo(monkeypatch):
         lambda repo_id, split: calls.append((repo_id, split)) or hub_dataset,
         raising=False,
     )
-    monkeypatch.setattr(main, "_attach_hub_environment_metadata", lambda dataset, repo: dataset)
     monkeypatch.setattr(
         main,
         "_attach_video_runtime_source",
@@ -414,7 +428,7 @@ def test_load_recorded_dataset_prefers_local_without_hub_lookup(monkeypatch):
 
 
 def test_load_recorded_dataset_uses_single_hub_load(monkeypatch):
-    hub_dataset = DatasetLike({"actions": [[0]]})
+    hub_dataset = make_minimal_dataset()
     calls = []
     monkeypatch.setattr(main, "load_local_dataset", lambda env_id: None)
     monkeypatch.setattr(main, "env_id_to_hf_repo_id", lambda env_id: "user/gymrec__env")
@@ -565,6 +579,25 @@ def test_record_plan_preserves_live_upload_flag():
     assert plan.upload_live is True
 
 
+def test_record_plan_separates_environment_and_policy_seed_bases():
+    plan, error = main._make_record_plan(
+        argparse.Namespace(
+            agent="random",
+            headless=False,
+            episodes=2,
+            max_steps=None,
+            upload_live=False,
+            dry_run=True,
+            seed=123,
+            policy_seed=None,
+        )
+    )
+
+    assert error is None
+    assert plan.seed == 123
+    assert plan.policy_seed == 123
+
+
 def test_agent_input_source_wraps_policy_only():
     source = main.AgentInputSource(lambda observation: "action")
 
@@ -577,6 +610,9 @@ def test_huggingface_model_ref_parses_hf_scheme_and_urls():
     assert main.parse_huggingface_model_ref(
         "hf://tsilva/SuperMarioBros-Nes-v0_Level1-1/model.zip"
     ) == ("tsilva/SuperMarioBros-Nes-v0_Level1-1", "model.zip", None)
+    assert main.parse_huggingface_model_ref(
+        "hf://tsilva/SuperMarioBros-Nes-v0_Level1-1@" + "a" * 40
+    ) == ("tsilva/SuperMarioBros-Nes-v0_Level1-1", None, "a" * 40)
     assert main.parse_huggingface_model_ref(
         "https://huggingface.co/tsilva/SuperMarioBros-Nes-v0_Level1-1"
     ) == ("tsilva/SuperMarioBros-Nes-v0_Level1-1", None, None)
@@ -611,11 +647,15 @@ def test_huggingface_policy_source_defaults_to_stochastic_actions():
         revision="main",
         checkpoint_filename="model.zip",
         model_path="/tmp/model.zip",
+        model_json_path="/tmp/model.json",
+        recipe_json_path="/tmp/recipe.json",
+        release_manifest_path=None,
         model_document={
             "checkpoint": {"sha256": "checkpoint"},
             "recipe": {"sha256": "recipe"},
         },
         recipe_document={},
+        release_manifest_document=None,
         evaluation={"action_sampling": "stochastic", "environment": environment},
         environment=environment,
         provider="supermariobrosnes-turbo",
@@ -730,13 +770,44 @@ def _write_policy_bundle(tmp_path, *, recipe_format_version=1, checkpoint_sha256
     }
 
 
-def test_resolve_huggingface_policy_consumes_versioned_recipe_bundle(tmp_path, monkeypatch):
-    files = _write_policy_bundle(tmp_path)
+def _mock_policy_repo(monkeypatch, files):
+    main._lazy_init()
+    monkeypatch.setattr(
+        main,
+        "_resolve_huggingface_model_commit",
+        lambda _repo_id, _revision: ("a" * 40, set(files)),
+    )
     monkeypatch.setattr(
         main,
         "hf_hub_download",
         lambda *, filename, **_kwargs: files[filename],
     )
+
+
+def _add_release_manifest(tmp_path, files, *, recipe_sha256=None):
+    artifacts = {}
+    for filename, path in files.items():
+        payload = open(path, "rb").read()
+        artifacts[filename] = {
+            "sha256": hashlib.sha256(payload).hexdigest(),
+            "size_bytes": len(payload),
+        }
+    if recipe_sha256 is not None:
+        artifacts["recipe.json"]["sha256"] = recipe_sha256
+    manifest = {
+        "document_type": "rlab.release_manifest",
+        "format_version": 1,
+        "repository": {"repo_id": "tsilva/level1-1"},
+        "artifacts": artifacts,
+    }
+    path = tmp_path / "release_manifest.json"
+    path.write_text(json.dumps(manifest, sort_keys=True))
+    files["release_manifest.json"] = str(path)
+
+
+def test_resolve_huggingface_policy_consumes_versioned_recipe_bundle(tmp_path, monkeypatch):
+    files = _write_policy_bundle(tmp_path)
+    _mock_policy_repo(monkeypatch, files)
 
     source = main.resolve_huggingface_policy_source("hf://tsilva/level1-1")
 
@@ -744,6 +815,8 @@ def test_resolve_huggingface_policy_consumes_versioned_recipe_bundle(tmp_path, m
     assert source.state == "Level1-1"
     assert source.action_set == "simple"
     assert source.deterministic is False
+    assert source.revision == "a" * 40
+    assert source.collector == f"hf://tsilva/level1-1@{'a' * 40}"
     assert source.env_make_kwargs == {
         "frame_stack": 4,
         "obs_copy": "safe_view",
@@ -763,11 +836,7 @@ def test_resolve_huggingface_policy_consumes_versioned_recipe_bundle(tmp_path, m
 
 def test_resolve_huggingface_policy_rejects_unknown_recipe_version(tmp_path, monkeypatch):
     files = _write_policy_bundle(tmp_path, recipe_format_version=99)
-    monkeypatch.setattr(
-        main,
-        "hf_hub_download",
-        lambda *, filename, **_kwargs: files[filename],
-    )
+    _mock_policy_repo(monkeypatch, files)
 
     with pytest.raises(SystemExit, match="Unsupported recipe.json format_version 99"):
         main.resolve_huggingface_policy_source("hf://tsilva/level1-1")
@@ -775,14 +844,118 @@ def test_resolve_huggingface_policy_rejects_unknown_recipe_version(tmp_path, mon
 
 def test_resolve_huggingface_policy_rejects_checkpoint_hash_mismatch(tmp_path, monkeypatch):
     files = _write_policy_bundle(tmp_path, checkpoint_sha256="0" * 64)
-    monkeypatch.setattr(
-        main,
-        "hf_hub_download",
-        lambda *, filename, **_kwargs: files[filename],
-    )
+    _mock_policy_repo(monkeypatch, files)
 
     with pytest.raises(SystemExit, match="model.zip SHA-256 mismatch"):
         main.resolve_huggingface_policy_source("hf://tsilva/level1-1")
+
+
+def test_resolve_huggingface_policy_validates_optional_release_manifest(tmp_path, monkeypatch):
+    files = _write_policy_bundle(tmp_path)
+    _add_release_manifest(tmp_path, files)
+    _mock_policy_repo(monkeypatch, files)
+
+    source = main.resolve_huggingface_policy_source("hf://tsilva/level1-1")
+
+    assert source.release_manifest_path == files["release_manifest.json"]
+    assert source.release_manifest_document["document_type"] == "rlab.release_manifest"
+
+
+def test_resolve_huggingface_policy_rejects_inconsistent_release_manifest(tmp_path, monkeypatch):
+    files = _write_policy_bundle(tmp_path)
+    _add_release_manifest(tmp_path, files, recipe_sha256="0" * 64)
+    _mock_policy_repo(monkeypatch, files)
+
+    with pytest.raises(SystemExit, match="release artifact recipe.json SHA-256 mismatch"):
+        main.resolve_huggingface_policy_source("hf://tsilva/level1-1")
+
+
+def test_resolve_huggingface_policy_falls_back_to_standardized_model_environment(
+    tmp_path, monkeypatch
+):
+    files = _write_policy_bundle(tmp_path)
+    recipe_path = tmp_path / "recipe.json"
+    recipe = json.loads(recipe_path.read_text())
+    evaluation_environment = recipe["recipe"]["eval"].pop("environment")
+    recipe_path.write_text(json.dumps(recipe, sort_keys=True))
+
+    model_path = tmp_path / "model.json"
+    model = json.loads(model_path.read_text())
+    preprocessing = {
+        "frame_skip": evaluation_environment["frame_skip"],
+        "frame_stack": evaluation_environment["env_args"]["frame_stack"],
+        "max_pool_frames": evaluation_environment["max_pool_frames"],
+        "obs_copy": evaluation_environment["env_args"]["obs_copy"],
+        "obs_crop": evaluation_environment["obs_crop"],
+        "obs_crop_fill": evaluation_environment["obs_crop_fill"],
+        "obs_crop_mode": evaluation_environment["obs_crop_mode"],
+        "obs_grayscale": evaluation_environment["env_args"]["obs_grayscale"],
+        "obs_resize": [84, 84],
+        "obs_resize_algorithm": evaluation_environment["obs_resize_algorithm"],
+        "sticky_action_prob": evaluation_environment["sticky_action_prob"],
+    }
+    model["provenance"] = {
+        "training_metadata": {
+            "environment": {
+                "env_id": "supermariobrosnes-turbo:SuperMarioBros-Nes-v0",
+                "preprocessing": preprocessing,
+                "provider_args": evaluation_environment["env_args"],
+                "state": "Level1-1",
+                "task": evaluation_environment["task"],
+            }
+        }
+    }
+    model["recipe"]["sha256"] = hashlib.sha256(recipe_path.read_bytes()).hexdigest()
+    model["recipe"]["size_bytes"] = recipe_path.stat().st_size
+    model_path.write_text(json.dumps(model, sort_keys=True))
+    _mock_policy_repo(monkeypatch, files)
+
+    source = main.resolve_huggingface_policy_source("hf://tsilva/level1-1")
+
+    assert source.environment["game"] == "SuperMarioBros-Nes-v0"
+    assert source.environment["state"] == "Level1-1"
+    assert source.env_make_kwargs["frame_stack"] == 4
+
+
+def test_collector_contract_id_is_stable_seed_independent_and_materialized_once(
+    tmp_path, monkeypatch
+):
+    files = _write_policy_bundle(tmp_path)
+    _mock_policy_repo(monkeypatch, files)
+    source = main.resolve_huggingface_policy_source("hf://tsilva/level1-1")
+    env = argparse.Namespace(
+        _gymrec_backend=source.backend,
+        _env_id=source.env_id,
+        _gymrec_state_name=source.state,
+        _gymrec_make_kwargs=source.env_make_kwargs,
+        observation_space=gym.spaces.Box(0, 255, shape=(4, 84, 84), dtype=np.uint8),
+        action_space=gym.spaces.MultiBinary(9),
+    )
+
+    first = main.build_collector_contract(source, env, inference_device="cpu")
+    second = main.build_collector_contract(source, env, inference_device="cpu")
+    changed_device = main.build_collector_contract(source, env, inference_device="mps")
+    changed_mode = main.build_collector_contract(
+        replace(source, deterministic=True), env, inference_device="cpu"
+    )
+    changed_env = argparse.Namespace(**vars(env))
+    changed_env._gymrec_make_kwargs = {**source.env_make_kwargs, "sticky_action_prob": 0.25}
+    changed_execution = main.build_collector_contract(source, changed_env, inference_device="cpu")
+    main._materialize_collector_contract(first, tmp_path / "dataset")
+    main._materialize_collector_contract(first, tmp_path / "dataset")
+
+    assert first.contract_id == second.contract_id
+    assert first.contract_id != changed_device.contract_id
+    assert first.contract_id != changed_mode.contract_id
+    assert first.contract_id != changed_execution.contract_id
+    collector_dir = tmp_path / "dataset" / "collectors" / first.contract_id
+    assert sorted(path.name for path in collector_dir.iterdir()) == [
+        "collection.json",
+        "model.json",
+        "recipe.json",
+    ]
+    assert json.loads((collector_dir / "model.json").read_text()) == source.model_document
+    assert "seed" not in first.collection_document
 
 
 def test_stable_retro_simple_action_masks_match_nes_button_indices():
@@ -811,18 +984,32 @@ def test_dataset_playback_episodes_preserve_episode_seeds_and_actions():
 
 def test_agent_recording_uses_sequential_recipe_seed_base():
     env = OneStepTerminalEnv()
+    policy_resets = []
+
+    class SeededPolicy:
+        def reset(self, *, seed=None, **_kwargs):
+            policy_resets.append(seed)
+
+        def __call__(self, _observation):
+            return 0
+
     recorder = main.DatasetRecorderWrapper(
         env,
-        input_source=main.AgentInputSource(lambda _observation: 0),
+        input_source=main.AgentInputSource(SeededPolicy()),
         headless=True,
         storage_format=main.STORAGE_FORMAT_IMAGES,
         initial_seed=10000,
+        initial_policy_seed=20000,
     )
+    recorder.collector_contract = argparse.Namespace(contract_id="a" * 64, policy_mode="stochastic")
 
     dataset = asyncio.run(recorder.record(fps=1000, max_episodes=2))
 
     assert env.reset_seeds == [10000, 10001]
     assert sorted(set(dataset["seed"])) == [10000, 10001]
+    assert policy_resets == [20000, 20001]
+    assert sorted(set(dataset["policy_seed"])) == [20000, 20001]
+    assert set(dataset["collector_contract_id"]) == {"a" * 64}
 
 
 def test_replay_resets_between_dataset_episodes():
@@ -911,6 +1098,8 @@ def test_build_recorded_dataset_includes_video_episode_metadata():
     recorder.frame_widths = [2, 2]
     recorder.frame_heights = [1, 1]
     recorder.episode_num_observations = [2, 2]
+    recorder.policy_seeds = [None, None]
+    recorder.collector_contract = None
 
     dataset = recorder._build_recorded_dataset()
 

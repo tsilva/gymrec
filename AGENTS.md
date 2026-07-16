@@ -69,12 +69,14 @@ README.md is the authoritative user command reference. For repository developmen
 - Naming convention: `{username}/gymrec__{encoded_env_id}`, where env IDs use the reversible `_slash_`, `_dash_`, and `_underscore_` encoding.
 - Concatenates new recordings with existing datasets on Hub
 - Auto-generates dataset cards with episode/frame statistics
-- Fields: `episode_id`, `seed`, `actions`, `rewards`, `terminations`, `truncations`, `infos`, `session_id`, `collector`, `gymrec_version`, `storage_format`
+- Fields: `episode_id`, `seed`, `actions`, `rewards`, `terminations`, `truncations`, `infos`, `session_id`, `collector`, `gymrec_version`, `storage_format`, `collector_contract_id`, `policy_mode`, `policy_seed`
 - Image-backed storage adds `observations`; video-backed storage adds `video_path`, `frame_index`, `frame_sha256`, `frame_width`, `frame_height`, and `episode_num_observations`
-- **Provenance columns** (added per-row, constant per session):
+- **Provenance columns** (added per-row):
   - `session_id` (`binary(16)`): UUID grouping all episodes from one `gymrec record` run
   - `collector` (`string`): Who collected the data (`"human"`, `"random"`, `"mario"`, `"breakout"`, or future agent names)
   - `gymrec_version` (`string`): Version string like `"0.1.0+abc1234"` from `_get_gymrec_version()`
+  - `collector_contract_id`, `policy_mode`, and `policy_seed`: policy-only provenance; null for human and built-in collectors
+- Standardized HF policy documents are stored once under `collectors/<collector_contract_id>/`; dataset schemas are a clean break and legacy local/remote schemas are rejected rather than aligned.
 
 **FPS Handling**
 - Attempts to read from environment metadata first
