@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import hashlib
 import json
 import shutil
 import uuid
@@ -154,6 +155,90 @@ def test_env_id_encoding_round_trips_special_characters():
 
     assert encoded == "ALE_slash_Breakout_dash_v5_underscore_custom"
     assert main._decode_hf_repo_name(encoded) == env_id
+
+
+def test_policy_recording_identity_defaults_to_source_repo_and_accepts_override():
+    source = argparse.Namespace(
+        env_id="SuperMarioBros-Nes-v0",
+        repo_id="tsilva/SuperMarioBros-NES_Level1",
+    )
+
+    default_identity = main._policy_recording_identity(source)
+    override_identity = main._policy_recording_identity(
+        source, "hf://tsilva/mario-world-model-data"
+    )
+
+    assert default_identity.env_id == "SuperMarioBros-Nes-v0"
+    assert default_identity.dataset_repo_id == "tsilva/SuperMarioBros-NES_Level1"
+    assert default_identity.display_ref == "hf://tsilva/SuperMarioBros-NES_Level1"
+    assert override_identity.dataset_repo_id == "tsilva/mario-world-model-data"
+
+
+def test_repo_recording_identities_isolate_same_environment_local_state(temp_storage_dir):
+    level1 = main.RecordingIdentity(
+        env_id="SuperMarioBros-Nes-v0",
+        dataset_repo_id="tsilva/SuperMarioBros-NES_Level1",
+    )
+    level4 = main.RecordingIdentity(
+        env_id="SuperMarioBros-Nes-v0",
+        dataset_repo_id="tsilva/SuperMarioBros-Nes-v0_Level4-1",
+    )
+
+    assert main.get_local_dataset_path(level1) == str(
+        temp_storage_dir / "repos" / "tsilva" / "SuperMarioBros-NES_Level1" / "dataset"
+    )
+    assert main.get_local_dataset_path(level1) != main.get_local_dataset_path(level4)
+    assert main._get_metadata_path(level1).endswith(
+        "repos/tsilva/SuperMarioBros-NES_Level1/metadata.json"
+    )
+    assert main._get_uploaded_episodes_path(level1).endswith(
+        "repos/tsilva/SuperMarioBros-NES_Level1/uploaded.json"
+    )
+    assert main._get_live_upload_queue_dir(level1).endswith(
+        "repos/tsilva/SuperMarioBros-NES_Level1/live_pending"
+    )
+
+
+def test_repo_recording_save_persists_identity_and_is_discoverable(temp_storage_dir):
+    identity = main.RecordingIdentity(
+        env_id="SuperMarioBros-Nes-v0",
+        dataset_repo_id="tsilva/SuperMarioBros-NES_Level1",
+    )
+
+    main.save_dataset_locally(
+        make_minimal_dataset(collector="hf://tsilva/SuperMarioBros-NES_Level1"),
+        identity,
+        metadata={"env_id": identity.env_id},
+    )
+
+    assert "hf://tsilva/SuperMarioBros-NES_Level1" in (
+        main._get_available_recording_refs_from_local()
+    )
+    assert main.load_local_metadata(identity)["dataset_repo_id"] == identity.dataset_repo_id
+
+
+def test_load_recorded_dataset_repo_ref_uses_exact_dataset_repo(monkeypatch):
+    hub_dataset = DatasetLike({"actions": [[0]]})
+    calls = []
+    monkeypatch.setattr(main, "load_local_dataset", lambda identity: None)
+    monkeypatch.setattr(
+        main,
+        "load_dataset",
+        lambda repo_id, split: calls.append((repo_id, split)) or hub_dataset,
+        raising=False,
+    )
+    monkeypatch.setattr(main, "_attach_hub_environment_metadata", lambda dataset, repo: dataset)
+    monkeypatch.setattr(
+        main,
+        "_attach_video_runtime_source",
+        lambda dataset, hf_repo_id: dataset,
+    )
+
+    assert main.load_recorded_dataset("hf://tsilva/SuperMarioBros-NES_Level1") == (
+        hub_dataset,
+        "hub",
+    )
+    assert calls == [("tsilva/SuperMarioBros-NES_Level1", "train")]
 
 
 def test_human_record_env_make_kwargs_force_deterministic_supported_backends():
@@ -500,36 +585,41 @@ def test_huggingface_model_ref_parses_hf_scheme_and_urls():
     ) == ("tsilva/SuperMarioBros-Nes-v0_Level1-1", "model.zip", "main")
 
 
-def test_huggingface_metadata_extracts_policy_contract():
-    metadata = {
-        "env_config": {
-            "game": "SuperMarioBros-Nes-v0",
-            "state": "Level1-1",
-            "action_set": "simple",
-            "frame_skip": 4,
-            "observation_size": 84,
-            "obs_crop": [32, 0, 0, 0],
-        },
-        "environment": {"preprocessing": {"frame_stack": 4}},
-    }
-
-    assert main._metadata_str(metadata, ("env_config", "game")) == "SuperMarioBros-Nes-v0"
-    assert main._metadata_str(metadata, ("env_config", "state")) == "Level1-1"
-    assert main._metadata_int(metadata, ("env_config", "frame_skip"), default=1) == 4
-    assert main._metadata_int(
-        metadata, ("environment", "preprocessing", "frame_stack"), default=1
-    ) == 4
-    assert main._metadata_obs_crop(metadata) == (32, 0, 0, 0)
-
-
 def test_huggingface_policy_source_defaults_to_stochastic_actions():
+    environment = {
+        "env_provider": "supermariobrosnes-turbo",
+        "game": "SuperMarioBros-Nes-v0",
+        "state": "Level1-1",
+        "frame_skip": 4,
+        "max_pool_frames": False,
+        "observation_size": 84,
+        "obs_crop": [32, 0, 0, 0],
+        "obs_crop_mode": "remove",
+        "obs_crop_fill": 0,
+        "obs_resize_algorithm": "area",
+        "sticky_action_prob": 0.0,
+        "env_args": {
+            "frame_stack": 4,
+            "obs_grayscale": True,
+            "obs_layout": "chw",
+        },
+        "task": {"id": "mario", "action": {"set": "simple"}},
+    }
     source = main.HFPolicySource(
         ref="hf://tsilva/SuperMarioBros-Nes-v0_Level1-1",
         repo_id="tsilva/SuperMarioBros-Nes-v0_Level1-1",
         revision="main",
         checkpoint_filename="model.zip",
         model_path="/tmp/model.zip",
-        metadata={},
+        model_document={
+            "checkpoint": {"sha256": "checkpoint"},
+            "recipe": {"sha256": "recipe"},
+        },
+        recipe_document={},
+        evaluation={"action_sampling": "stochastic", "environment": environment},
+        environment=environment,
+        provider="supermariobrosnes-turbo",
+        backend="supermariobrosnes-turbo",
         env_id="SuperMarioBros-Nes-v0",
         state="Level1-1",
         action_set="simple",
@@ -540,6 +630,159 @@ def test_huggingface_policy_source_defaults_to_stochastic_actions():
     )
 
     assert source.deterministic is False
+    assert source.env_make_kwargs["obs_resize"] == (84, 84)
+    assert source.env_make_kwargs["maxpool_last_two"] is False
+    assert source.env_make_kwargs["obs_grayscale"] is True
+
+
+def _write_policy_bundle(tmp_path, *, recipe_format_version=1, checkpoint_sha256=None):
+    checkpoint_path = tmp_path / "model.zip"
+    checkpoint_path.write_bytes(b"policy checkpoint")
+    checkpoint_hash = hashlib.sha256(checkpoint_path.read_bytes()).hexdigest()
+    recipe = {
+        "document_type": "rlab.recipe",
+        "format_version": recipe_format_version,
+        "provenance": {},
+        "recipe": {
+            "schema_version": 2,
+            "eval": {
+                "action_sampling": "stochastic",
+                "episodes": 100,
+                "max_steps": 4500,
+                "n_envs": 20,
+                "seed": 10000,
+                "seed_protocol": "vector-lane-v1",
+                "environment": {
+                    "env_provider": "supermariobrosnes-turbo",
+                    "game": "SuperMarioBros-Nes-v0",
+                    "state": "Level1-1",
+                    "frame_skip": 4,
+                    "max_pool_frames": False,
+                    "observation_size": 84,
+                    "obs_crop": [32, 0, 0, 0],
+                    "obs_crop_mode": "remove",
+                    "obs_crop_fill": 0,
+                    "obs_resize_algorithm": "area",
+                    "sticky_action_prob": 0.0,
+                    "env_args": {
+                        "frame_stack": 4,
+                        "obs_copy": "safe_view",
+                        "obs_grayscale": True,
+                        "obs_layout": "chw",
+                        "use_restricted_actions": "filtered",
+                    },
+                    "task": {
+                        "id": "mario",
+                        "action": {"set": "simple"},
+                        "signals": {
+                            "x": ["xscrollHi", "xscrollLo"],
+                            "score": "score",
+                            "lives": "lives",
+                            "level": ["levelHi", "levelLo"],
+                        },
+                        "events": {
+                            "life_loss": {"signal": "lives", "operation": "decrease"},
+                            "level_change": {"signal": "level", "operation": "change"},
+                        },
+                        "termination": {
+                            "failure": ["life_loss"],
+                            "success": ["level_change"],
+                            "max_episode_steps": 4500,
+                        },
+                        "reward": {"reward_mode": "score"},
+                    },
+                },
+            },
+        },
+    }
+    recipe_path = tmp_path / "recipe.json"
+    recipe_path.write_text(json.dumps(recipe, sort_keys=True))
+    recipe_hash = hashlib.sha256(recipe_path.read_bytes()).hexdigest()
+    model = {
+        "document_type": "rlab.model",
+        "format_version": 1,
+        "checkpoint": {
+            "filename": "model.zip",
+            "sha256": checkpoint_sha256 or checkpoint_hash,
+            "size_bytes": checkpoint_path.stat().st_size,
+            "algorithm_id": "ppo",
+            "model_class": "stable_baselines3.ppo.ppo.PPO",
+        },
+        "recipe": {
+            "filename": "recipe.json",
+            "document_type": "rlab.recipe",
+            "format_version": recipe_format_version,
+            "sha256": recipe_hash,
+            "size_bytes": recipe_path.stat().st_size,
+        },
+        "policy": {
+            "algorithm_id": "ppo",
+            "model_class": "stable_baselines3.ppo.ppo.PPO",
+        },
+        "provenance": {},
+    }
+    model_path = tmp_path / "model.json"
+    model_path.write_text(json.dumps(model, sort_keys=True))
+    return {
+        "model.json": str(model_path),
+        "recipe.json": str(recipe_path),
+        "model.zip": str(checkpoint_path),
+    }
+
+
+def test_resolve_huggingface_policy_consumes_versioned_recipe_bundle(tmp_path, monkeypatch):
+    files = _write_policy_bundle(tmp_path)
+    monkeypatch.setattr(
+        main,
+        "hf_hub_download",
+        lambda *, filename, **_kwargs: files[filename],
+    )
+
+    source = main.resolve_huggingface_policy_source("hf://tsilva/level1-1")
+
+    assert source.backend == "supermariobrosnes-turbo"
+    assert source.state == "Level1-1"
+    assert source.action_set == "simple"
+    assert source.deterministic is False
+    assert source.env_make_kwargs == {
+        "frame_stack": 4,
+        "obs_copy": "safe_view",
+        "obs_grayscale": True,
+        "obs_layout": "chw",
+        "use_restricted_actions": "filtered",
+        "obs_resize": (84, 84),
+        "obs_crop": (32, 0, 0, 0),
+        "obs_crop_mode": "remove",
+        "obs_crop_fill": 0,
+        "obs_resize_algorithm": "area",
+        "frame_skip": 4,
+        "maxpool_last_two": False,
+        "sticky_action_prob": 0.0,
+    }
+
+
+def test_resolve_huggingface_policy_rejects_unknown_recipe_version(tmp_path, monkeypatch):
+    files = _write_policy_bundle(tmp_path, recipe_format_version=99)
+    monkeypatch.setattr(
+        main,
+        "hf_hub_download",
+        lambda *, filename, **_kwargs: files[filename],
+    )
+
+    with pytest.raises(SystemExit, match="Unsupported recipe.json format_version 99"):
+        main.resolve_huggingface_policy_source("hf://tsilva/level1-1")
+
+
+def test_resolve_huggingface_policy_rejects_checkpoint_hash_mismatch(tmp_path, monkeypatch):
+    files = _write_policy_bundle(tmp_path, checkpoint_sha256="0" * 64)
+    monkeypatch.setattr(
+        main,
+        "hf_hub_download",
+        lambda *, filename, **_kwargs: files[filename],
+    )
+
+    with pytest.raises(SystemExit, match="model.zip SHA-256 mismatch"):
+        main.resolve_huggingface_policy_source("hf://tsilva/level1-1")
 
 
 def test_stable_retro_simple_action_masks_match_nes_button_indices():
@@ -564,6 +807,22 @@ def test_dataset_playback_episodes_preserve_episode_seeds_and_actions():
     assert total_steps == 2
     assert [episode["seed"] for episode in episodes] == [111, 222]
     assert [list(episode["items"]) for episode in episodes] == [[[0]], [[0]]]
+
+
+def test_agent_recording_uses_sequential_recipe_seed_base():
+    env = OneStepTerminalEnv()
+    recorder = main.DatasetRecorderWrapper(
+        env,
+        input_source=main.AgentInputSource(lambda _observation: 0),
+        headless=True,
+        storage_format=main.STORAGE_FORMAT_IMAGES,
+        initial_seed=10000,
+    )
+
+    dataset = asyncio.run(recorder.record(fps=1000, max_episodes=2))
+
+    assert env.reset_seeds == [10000, 10001]
+    assert sorted(set(dataset["seed"])) == [10000, 10001]
 
 
 def test_replay_resets_between_dataset_episodes():
@@ -720,9 +979,7 @@ def test_live_episode_manager_packages_shard_without_previews(
     assert package_path.exists() is not upload_success
 
 
-def test_upload_uses_remote_episode_ids_when_local_marker_is_stale(
-    temp_storage_dir, monkeypatch
-):
+def test_upload_uses_remote_episode_ids_when_local_marker_is_stale(temp_storage_dir, monkeypatch):
     episode_uuid = uuid.uuid4()
     dataset = make_minimal_dataset(episode_uuid=episode_uuid)
     calls = []
@@ -822,9 +1079,7 @@ def test_recover_live_video_journal_appends_terminal_candidate(tmp_path):
     step_frame = np.zeros((2, 2, 3), dtype=np.uint8)
     terminal_frame = np.full((2, 2, 3), 128, dtype=np.uint8)
     main._encode_lossless_rgb_video([step_frame], str(video_path), fps=30)
-    main.PILImage.fromarray(terminal_frame).save(
-        terminal_path, format="WEBP", lossless=True
-    )
+    main.PILImage.fromarray(terminal_frame).save(terminal_path, format="WEBP", lossless=True)
     records = [
         {
             "row_index": 0,

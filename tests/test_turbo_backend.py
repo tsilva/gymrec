@@ -25,9 +25,7 @@ class FakeTurboVectorEnv:
     metadata = {"render_modes": ["rgb_array"], "autoreset_mode": AutoresetMode.DISABLED}
     num_envs = 1
     single_action_space = gym.spaces.MultiBinary(9)
-    single_observation_space = gym.spaces.Box(
-        0, 255, shape=(2, 3, 3), dtype=np.uint8
-    )
+    single_observation_space = gym.spaces.Box(0, 255, shape=(2, 3, 3), dtype=np.uint8)
     render_mode = "rgb_array"
     autoreset_mode = AutoresetMode.DISABLED
 
@@ -78,9 +76,7 @@ class FakeStableRetroEnv(gym.Env):
 
     def __init__(self):
         self.action_space = gym.spaces.MultiBinary(9)
-        self.observation_space = gym.spaces.Box(
-            0, 255, shape=(2, 3, 3), dtype=np.uint8
-        )
+        self.observation_space = gym.spaces.Box(0, 255, shape=(2, 3, 3), dtype=np.uint8)
         self.actions = []
         self._stable_retro = True
         self._gymrec_backend = "stable-retro"
@@ -92,6 +88,44 @@ class FakeStableRetroEnv(gym.Env):
     def step(self, action):
         self.actions.append(np.array(action, copy=True))
         return np.zeros((2, 3, 3), dtype=np.uint8), 0.0, False, False, {}
+
+
+class FakeMarioRecipeEnv(gym.Env):
+    metadata = {}
+    action_space = gym.spaces.MultiBinary(9)
+    observation_space = gym.spaces.Box(0, 255, shape=(4, 84, 84), dtype=np.uint8)
+
+    def __init__(self):
+        self._step = 0
+        self._gymrec_policy_observations = True
+
+    @staticmethod
+    def _info(x, score=0, lives=3, level=(0, 0)):
+        return {
+            "xscrollHi": x // 256,
+            "xscrollLo": x % 256,
+            "score": score,
+            "lives": lives,
+            "levelHi": level[0],
+            "levelLo": level[1],
+        }
+
+    def reset(self, *, seed=None, options=None):
+        super().reset(seed=seed)
+        self._step = 0
+        return np.zeros((4, 84, 84), dtype=np.uint8), self._info(0)
+
+    def step(self, action):
+        del action
+        self._step += 1
+        if self._step == 1:
+            info = self._info(10, score=100)
+        else:
+            info = self._info(0, score=100, level=(0, 1))
+        return np.zeros((4, 84, 84), dtype=np.uint8), 0.0, False, False, info
+
+    def render(self):
+        return np.full((224, 240, 3), 7, dtype=np.uint8)
 
 
 def test_runtime_backend_selection_is_explicit_and_backward_compatible(monkeypatch):
@@ -184,6 +218,64 @@ def test_turbo_adapter_preserves_disabled_autoreset_render_and_close():
     assert vector_env.closed is True
 
 
+def test_recipe_policy_observation_uses_raw_provider_render_for_recording():
+    env = FakeMarioRecipeEnv()
+    observation, _ = env.reset()
+
+    frame = main._recording_observation(env, observation)
+
+    assert frame.shape == (224, 240, 3)
+    assert np.all(frame == 7)
+
+
+def test_mario_recipe_task_applies_score_reward_and_level_success():
+    task = {
+        "id": "mario",
+        "action": {"set": "simple"},
+        "signals": {
+            "x": ["xscrollHi", "xscrollLo"],
+            "score": "score",
+            "lives": "lives",
+            "level": ["levelHi", "levelLo"],
+        },
+        "events": {
+            "life_loss": {"signal": "lives", "operation": "decrease"},
+            "level_change": {"signal": "level", "operation": "change"},
+        },
+        "termination": {
+            "failure": ["life_loss"],
+            "success": ["level_change"],
+            "max_episode_steps": 4500,
+        },
+        "reward": {
+            "reward_mode": "score",
+            "progress_reward_scale": 1.0,
+            "score_progress_clipped": False,
+            "completion_reward": 0.0,
+            "death_penalty": 25.0,
+            "time_penalty": 0.0,
+            "use_native_reward": False,
+            "clip_rewards": False,
+        },
+    }
+    env = main.MarioRecipeTaskEnv(FakeMarioRecipeEnv(), task)
+    env.reset(seed=10000)
+
+    _, reward, terminated, truncated, info = env.step(np.zeros(9, dtype=np.int8))
+    assert reward == pytest.approx(11.0)
+    assert terminated is False
+    assert truncated is False
+    assert info["progress_delta"] == 10
+    assert info["score_delta"] == 100
+
+    _, reward, terminated, truncated, info = env.step(np.zeros(9, dtype=np.int8))
+    assert reward == pytest.approx(0.0)
+    assert terminated is True
+    assert truncated is False
+    assert info["task_outcome"] == "success"
+    assert info["task_events"] == ["level_change"]
+
+
 def test_resolve_rom_directory_selects_canonical_hash_not_filename(tmp_path, monkeypatch):
     misleading = tmp_path / "SuperMarioBros.nes"
     canonical = tmp_path / "renamed-copy.nes"
@@ -193,11 +285,7 @@ def test_resolve_rom_directory_selects_canonical_hash_not_filename(tmp_path, mon
     monkeypatch.setattr(
         main,
         "_sha256_file",
-        lambda path: (
-            main.SUPERMARIOBROS_NES_ROM_SHA256
-            if path == str(canonical)
-            else "0" * 64
-        ),
+        lambda path: main.SUPERMARIOBROS_NES_ROM_SHA256 if path == str(canonical) else "0" * 64,
     )
 
     assert main.resolve_supermariobrosnes_rom_path(tmp_path) == str(canonical)

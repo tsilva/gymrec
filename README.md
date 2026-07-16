@@ -56,9 +56,8 @@ gymrec record BreakoutNoFrameskip-v4 --upload-live
 gymrec record SuperMarioBros-Nes-v0 --agent random --headless --episodes 100
 gymrec record SuperMarioBros-Nes-v0 --backend supermariobrosnes-turbo --dry-run
 gymrec record BreakoutNoFrameskip-v4 --agent breakout --headless --episodes 50
-gymrec record hf://tsilva/SuperMarioBros-Nes-v0_Level1-1 --headless --episodes 10 --dry-run
-gymrec record hf://<level1-1-policy> --backend supermariobrosnes-turbo --headless --episodes 10 --dry-run
-gymrec record https://huggingface.co/tsilva/SuperMarioBros-Nes-v0_Level1-1 --dry-run
+gymrec record hf://tsilva/NES-SuperMarioBros_Level1-1_gray84-hudcrop-stack4-simple_ppo --headless --episodes 10 --dry-run
+gymrec record https://huggingface.co/tsilva/NES-SuperMarioBros_Level1-1_gray84-hudcrop-stack4-simple_ppo --headless --episodes 10 --dry-run
 
 gymrec upload BreakoutNoFrameskip-v4             # upload new local episodes to Hub
 gymrec upload BreakoutNoFrameskip-v4 --replace   # replace remote files with local dataset
@@ -82,7 +81,11 @@ Human recording opens a pygame window. Press `Space` to start recording, use the
 
 Agent recording supports `human`, `random`, `mario`, and `breakout`. `--headless` is for agent mode only and requires `--episodes`.
 
-`record` also accepts Hugging Face SB3 policy model refs such as `hf://tsilva/SuperMarioBros-Nes-v0_Level1-1` or `https://huggingface.co/tsilva/SuperMarioBros-Nes-v0_Level1-1`. gymrec downloads the repo's `.zip` checkpoint and `model_metadata.json`, infers the Stable-Retro environment, state, action set, frame skip, frame stack, and preprocessing contract, then records the policy's native environment actions as a normal gymrec dataset. HF policy recording samples stochastic actions by default; pass `--deterministic` to use argmax actions. Use `--hf-file` when a model repo contains more than one `.zip`; use `--device cpu`, `--device mps`, or `--device cuda` to override SB3 device selection.
+`record` also accepts Hugging Face rlab SB3 policy bundles. Each model repo must contain versioned `model.json` and `recipe.json` documents plus the checkpoint declared by `model.json`. gymrec validates the document versions, file sizes, SHA-256 bindings, algorithm/model identity, resolved evaluation environment, provider, task, and action sampling mode before execution. Unknown versions and unsupported providers fail explicitly.
+
+For Mario bundles, gymrec creates the exact native vector provider declared by `recipe.eval.environment` (`supermariobrosnes-turbo` or `stable-retro-turbo`). Crop, grayscale, resize algorithm, layout, frame stacking, max pooling, frame skip, sticky actions, and provider flags are executed by that provider; gymrec does not recreate the preprocessing in Python. The policy receives the native policy observation while the dataset stores raw RGB renders and backend-neutral nine-button NES action vectors. The recipe's Mario reward/termination contract and evaluation seed are also applied. Action sampling follows `recipe.json` by default; use `--deterministic` or `--stochastic` only to override it. `--device cpu`, `--device mps`, or `--device cuda` overrides SB3 device selection. `--hf-file` is only an optional assertion that the requested checkpoint matches `model.json`.
+
+Policy-recorded rows include the source repo/revision, recipe and checkpoint SHA-256 values, and both bundle format versions. These fields make the policy/environment contract recoverable from the trajectory dataset without relying on a mutable model-repo branch.
 
 Observation storage defaults to `lossless-video`, which stores canonical observations as per-episode lossless RGB streams under `videos/<episode>.rgb.mkv.bin` plus table rows containing `video_path`, `frame_index`, and `frame_sha256`; each canonical stream is decoded and hash-verified before the recording is accepted. Browser-friendly `videos/<episode>.preview.mp4` files are preview-only and are not used for replay/training. Lossless video storage requires `ffmpeg` and `ffprobe` on `PATH`. Use `--storage images` to store one lossless WebP-backed HF `Image` row per observation instead.
 

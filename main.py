@@ -12,7 +12,6 @@ import time
 import tomllib
 import uuid
 from abc import ABC, abstractmethod
-from collections import deque
 from dataclasses import dataclass
 from urllib.parse import unquote, urlparse
 
@@ -156,9 +155,7 @@ def _load_keymappings(pygame):
     atari = parse_key_bindings("atari")
     vizdoom = parse_key_bindings("vizdoom")
     retro = {
-        console: {
-            _resolve_key(key_name, key_map): action for key_name, action in bindings.items()
-        }
+        console: {_resolve_key(key_name, key_map): action for key_name, action in bindings.items()}
         for console, bindings in config["stable_retro"].items()
     }
 
@@ -210,19 +207,29 @@ BACKEND_LABELS = {
     "atari": "Atari (ALE-py)",
     "vizdoom": "VizDoom",
     "stable-retro": "Stable-Retro",
+    "stable-retro-turbo": "Stable-Retro TurboVecEnv",
     "supermariobrosnes-turbo": "SuperMarioBros-Nes-turbo",
 }
 
-SELECTABLE_RUNTIME_BACKENDS = ("stable-retro", "supermariobrosnes-turbo")
-SUPERMARIOBROS_NES_ENV_ID = "SuperMarioBros-Nes-v0"
-SUPERMARIOBROS_NES_ROM_SHA256 = (
-    "f61548fdf1670cffefcc4f0b7bdcdd9eaba0c226e3b74f8666071496988248de"
+SELECTABLE_RUNTIME_BACKENDS = (
+    "stable-retro",
+    "stable-retro-turbo",
+    "supermariobrosnes-turbo",
 )
+SUPERMARIOBROS_NES_ENV_ID = "SuperMarioBros-Nes-v0"
+SUPERMARIOBROS_NES_ROM_SHA256 = "f61548fdf1670cffefcc4f0b7bdcdd9eaba0c226e3b74f8666071496988248de"
 NES_BUTTON_ORDER = ("B", None, "SELECT", "START", "UP", "DOWN", "LEFT", "RIGHT", "A")
 NES_ACTION_ENCODING = "stable-retro-multibinary-9"
 
 HUGGINGFACE_MODEL_SCHEME = "hf://"
 HUGGINGFACE_MODEL_URL_HOST = "huggingface.co"
+RLAB_RECIPE_FILENAME = "recipe.json"
+RLAB_MODEL_FILENAME = "model.json"
+RLAB_RECIPE_DOCUMENT_TYPE = "rlab.recipe"
+RLAB_MODEL_DOCUMENT_TYPE = "rlab.model"
+RLAB_RECIPE_FORMAT_VERSION = 1
+RLAB_MODEL_FORMAT_VERSION = 1
+RLAB_RECIPE_SCHEMA_VERSION = 2
 OBSERVATION_IMAGE_KEYS = ("obs", "image", "screen")
 STORAGE_FORMAT_IMAGES = "images"
 STORAGE_FORMAT_LOSSLESS_VIDEO = "lossless-video"
@@ -297,6 +304,18 @@ def _observation_to_rgb_array(observation):
         raise ValueError(f"Unsupported frame shape: {frame_array.shape}")
 
     return np.ascontiguousarray(frame_array)
+
+
+def _recording_observation(env, observation):
+    """Return raw RGB gameplay when an env exposes preprocessed policy observations."""
+    if bool(getattr(env, "_gymrec_policy_observations", False)):
+        frame = env.render()
+        if frame is None:
+            raise RuntimeError(
+                "The recipe-selected environment returned no raw RGB render for recording"
+            )
+        return frame
+    return observation
 
 
 def _sha256_rgb(frame_array):
@@ -419,9 +438,7 @@ def _encode_browser_preview_video(frames, output_path, fps, ffmpeg_path=None):
     height, width = first.shape[:2]
     for frame in frames:
         if frame.shape != first.shape:
-            raise ValueError(
-                f"All preview frames must have shape {first.shape}; got {frame.shape}"
-            )
+            raise ValueError(f"All preview frames must have shape {first.shape}; got {frame.shape}")
 
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     cmd = [
@@ -592,9 +609,9 @@ def classify_env_id(env_id, stable_retro_envs=None):
         return "atari"
     if env_id.startswith(("Vizdoom", "vizdoom")):
         return "vizdoom"
-    if (stable_retro_envs is not None and env_id in stable_retro_envs) or _env_id_has_retro_platform(
-        env_id
-    ):
+    if (
+        stable_retro_envs is not None and env_id in stable_retro_envs
+    ) or _env_id_has_retro_platform(env_id):
         return "stable-retro"
     return "atari"
 
@@ -629,6 +646,12 @@ def _environment_metadata_from_dataset(dataset):
         ("action_encoding", "action_encoding"),
         ("frame_skip", "frameskip"),
         ("sticky_action_prob", "sticky_actions"),
+        ("policy_source_repo", "policy_source_repo"),
+        ("policy_source_revision", "policy_source_revision"),
+        ("policy_recipe_sha256", "policy_recipe_sha256"),
+        ("policy_checkpoint_sha256", "policy_checkpoint_sha256"),
+        ("policy_recipe_format_version", "policy_recipe_format_version"),
+        ("policy_model_format_version", "policy_model_format_version"),
     ):
         value = _first_dataset_value(dataset, column)
         if value is not None:
@@ -679,6 +702,12 @@ def _attach_hub_environment_metadata(dataset, hf_repo_id):
         "action_encoding": metadata.get("action_encoding"),
         "frame_skip": metadata.get("frameskip"),
         "sticky_action_prob": metadata.get("sticky_actions"),
+        "policy_source_repo": metadata.get("policy_source_repo"),
+        "policy_source_revision": metadata.get("policy_source_revision"),
+        "policy_recipe_sha256": metadata.get("policy_recipe_sha256"),
+        "policy_checkpoint_sha256": metadata.get("policy_checkpoint_sha256"),
+        "policy_recipe_format_version": metadata.get("policy_recipe_format_version"),
+        "policy_model_format_version": metadata.get("policy_model_format_version"),
     }
     for column, value in row_values.items():
         if column not in dataset.column_names and value is not None:
@@ -706,9 +735,9 @@ def resolve_runtime_backend(env_id, requested=None, metadata=None, recorded_back
                 f"{SUPERMARIOBROS_NES_ENV_ID}; got {env_id}."
             )
         return candidate
-    if candidate == "stable-retro":
+    if candidate in {"stable-retro", "stable-retro-turbo"}:
         if logical_backend != "stable-retro":
-            raise ValueError(f"The stable-retro backend does not support {env_id}.")
+            raise ValueError(f"The {candidate} backend does not support {env_id}.")
         return candidate
     if candidate in {"atari", "vizdoom"} and candidate == logical_backend:
         return candidate
@@ -856,9 +885,7 @@ def _ensure_stableretro_roms_path_imported(quiet: bool = True, force: bool = Fal
         return 0
 
     if quiet:
-        console.print(
-            f"[{STYLE_INFO}]Indexing games from ROMS_PATH: [{STYLE_PATH}]{roms_path}[/]"
-        )
+        console.print(f"[{STYLE_INFO}]Indexing games from ROMS_PATH: [{STYLE_PATH}]{roms_path}[/]")
         with console.status(f"[{STYLE_INFO}]Scanning and importing matching ROMs...[/]"):
             imported_games, stable_retro_games = _import_roms(
                 roms_path, quiet=quiet, source_label="ROMS_PATH", return_games=True
@@ -1534,7 +1561,12 @@ class HFPolicySource:
     revision: str
     checkpoint_filename: str
     model_path: str
-    metadata: dict
+    model_document: dict
+    recipe_document: dict
+    evaluation: dict
+    environment: dict
+    provider: str
+    backend: str
     env_id: str
     state: str | None
     action_set: str
@@ -1549,11 +1581,39 @@ class HFPolicySource:
     def collector(self) -> str:
         return f"hf://{self.repo_id}"
 
+    @property
+    def checkpoint_sha256(self) -> str:
+        return str(self.model_document["checkpoint"]["sha256"])
+
+    @property
+    def recipe_sha256(self) -> str:
+        return str(self.model_document["recipe"]["sha256"])
+
+    @property
+    def env_make_kwargs(self) -> dict:
+        """Compile the resolved evaluation environment into native provider kwargs."""
+        environment = self.environment
+        kwargs = dict(environment.get("env_args") or {})
+        observation_size = int(environment["observation_size"])
+        kwargs.update(
+            {
+                "obs_resize": (observation_size, observation_size),
+                "obs_crop": tuple(int(value) for value in environment["obs_crop"]),
+                "obs_crop_mode": str(environment["obs_crop_mode"]),
+                "obs_crop_fill": int(environment["obs_crop_fill"]),
+                "obs_resize_algorithm": str(environment["obs_resize_algorithm"]),
+                "frame_skip": int(environment["frame_skip"]),
+                "maxpool_last_two": bool(environment["max_pool_frames"]),
+                "sticky_action_prob": float(environment["sticky_action_prob"]),
+            }
+        )
+        return kwargs
+
 
 class StableBaselines3Policy(BasePolicy):
-    """Run an SB3 policy checkpoint against native Gymnasium observations."""
+    """Run an SB3 policy against recipe-native provider observations."""
 
-    def __init__(self, action_space, source: HFPolicySource):
+    def __init__(self, action_space, source: HFPolicySource, observation_space=None):
         super().__init__(action_space)
         try:
             from stable_baselines3 import PPO
@@ -1563,6 +1623,12 @@ class StableBaselines3Policy(BasePolicy):
                 "Install dependencies with `uv sync` or reinstall the gymrec tool."
             ) from exc
 
+        checkpoint = source.model_document["checkpoint"]
+        if checkpoint.get("algorithm_id") != "ppo":
+            raise SystemExit(
+                "gymrec currently supports only rlab SB3 PPO policy bundles; "
+                f"got {checkpoint.get('algorithm_id')!r}"
+            )
         self.source = source
         self.model = PPO.load(
             source.model_path,
@@ -1574,79 +1640,44 @@ class StableBaselines3Policy(BasePolicy):
                 "clip_range_vf": None,
             },
         )
-        self._frames = deque(maxlen=source.frame_stack)
-        self._repeat_remaining = 0
-        self._current_action = None
         self._action_masks = (
             _stable_retro_action_masks(source.env_id, source.action_set)
             if isinstance(action_space, gym.spaces.MultiBinary)
             else ()
         )
+        model_observation_shape = getattr(
+            getattr(self.model, "observation_space", None), "shape", None
+        )
+        provider_observation_shape = getattr(observation_space, "shape", None)
+        if (
+            model_observation_shape is not None
+            and provider_observation_shape is not None
+            and tuple(model_observation_shape) != tuple(provider_observation_shape)
+        ):
+            raise SystemExit(
+                "Recipe-native provider observation shape does not match the policy: "
+                f"provider={tuple(provider_observation_shape)}, "
+                f"model={tuple(model_observation_shape)}"
+            )
+        if self._action_masks:
+            model_action_count = getattr(getattr(self.model, "action_space", None), "n", None)
+            if model_action_count != len(self._action_masks):
+                raise SystemExit(
+                    "Recipe action set does not match the policy action space: "
+                    f"recipe={len(self._action_masks)}, model={model_action_count}"
+                )
 
     def reset(self, **kwargs):
-        self._frames.clear()
-        observation = kwargs.get("observation")
-        if observation is not None:
-            frame = self._preprocess_observation(observation)
-            for _ in range(self.source.frame_stack):
-                self._frames.append(frame)
-        self._repeat_remaining = 0
-        self._current_action = None
+        seed = kwargs.get("seed")
+        if seed is not None:
+            self.model.set_random_seed(int(seed))
 
     def observe_step(self, reward, terminated, truncated, info):
-        if terminated or truncated:
-            self._repeat_remaining = 0
-            self._current_action = None
+        del reward, terminated, truncated, info
 
     def __call__(self, observation):
-        if self._current_action is not None and self._repeat_remaining > 0:
-            self._repeat_remaining -= 1
-            return self._copy_action(self._current_action)
-
-        self._append_policy_frame(observation)
-        model_obs = self._model_observation()
-        action, _ = self.model.predict(model_obs, deterministic=self.source.deterministic)
-        self._current_action = self._to_env_action(action)
-        self._repeat_remaining = max(self.source.frame_skip - 1, 0)
-        return self._copy_action(self._current_action)
-
-    def _append_policy_frame(self, observation):
-        frame = self._preprocess_observation(observation)
-        if not self._frames:
-            for _ in range(self.source.frame_stack):
-                self._frames.append(frame)
-        else:
-            self._frames.append(frame)
-
-    def _preprocess_observation(self, observation):
-        frame = _observation_to_rgb_array(observation)
-        if self.source.obs_crop is not None:
-            top, right, bottom, left = self.source.obs_crop
-            height, width = frame.shape[:2]
-            y0 = top
-            y1 = height - bottom if bottom else height
-            x0 = left
-            x1 = width - right if right else width
-            frame = frame[y0:y1, x0:x1, :]
-        gray = np.dot(frame[..., :3], np.array([0.299, 0.587, 0.114])).astype(np.uint8)
-        if gray.shape != (self.source.observation_size, self.source.observation_size):
-            image = PILImage.fromarray(gray)
-            image = image.resize(
-                (self.source.observation_size, self.source.observation_size),
-                resample=PILImage.Resampling.BOX,
-            )
-            gray = np.asarray(image, dtype=np.uint8)
-        return np.asarray(gray, dtype=np.uint8)
-
-    def _model_observation(self):
-        stack = np.stack(list(self._frames), axis=0)
-        observation_space = getattr(self.model, "observation_space", None)
-        shape = getattr(observation_space, "shape", None)
-        if shape and tuple(shape) == tuple(stack.shape):
-            return stack
-        if shape and len(shape) == 3 and shape[-1] == self.source.frame_stack:
-            return np.moveaxis(stack, 0, -1)
-        return stack
+        action, _ = self.model.predict(observation, deterministic=self.source.deterministic)
+        return self._copy_action(self._to_env_action(action))
 
     def _to_env_action(self, action):
         action_array = np.asarray(action)
@@ -1715,25 +1746,6 @@ def parse_huggingface_model_ref(value):
     return repo_id, filename, revision
 
 
-def _select_huggingface_checkpoint(repo_id, revision, filename=None):
-    if filename:
-        return filename
-    try:
-        files = HfApi().list_repo_files(repo_id=repo_id, repo_type="model", revision=revision)
-    except Exception as exc:
-        raise SystemExit(f"Could not list Hugging Face model repo {repo_id}: {exc}") from exc
-    checkpoints = sorted(path for path in files if path.endswith(".zip"))
-    if not checkpoints:
-        raise SystemExit(f"Hugging Face model repo {repo_id} has no .zip checkpoint files")
-    if len(checkpoints) > 1:
-        choices = ", ".join(checkpoints)
-        raise SystemExit(
-            f"Hugging Face model repo {repo_id} has multiple .zip checkpoints; "
-            f"pass --hf-file. Choices: {choices}"
-        )
-    return checkpoints[0]
-
-
 def _metadata_value(metadata, path):
     value = metadata
     for key in path:
@@ -1774,23 +1786,6 @@ def _metadata_str(metadata, *paths, default=None):
     return default
 
 
-def _metadata_obs_crop(metadata):
-    env_config = metadata.get("env_config", {}) if isinstance(metadata, dict) else {}
-    value = env_config.get("obs_crop")
-    if value is None:
-        preprocessing = metadata.get("environment", {}).get("preprocessing", {})
-        value = preprocessing.get("obs_crop")
-    if value is None:
-        hud_crop_top = env_config.get("hud_crop_top")
-        if isinstance(hud_crop_top, int) and hud_crop_top > 0:
-            value = [hud_crop_top, 0, 0, 0]
-    if value is None:
-        return None
-    if not isinstance(value, (list, tuple)) or len(value) != 4:
-        raise SystemExit(f"Unsupported Hugging Face model obs_crop value: {value!r}")
-    return tuple(int(item) for item in value)
-
-
 def _stable_retro_action_masks(env_id, action_set):
     action_sets = STABLE_RETRO_DISCRETE_ACTION_SETS.get(env_id, {})
     if action_set not in action_sets:
@@ -1801,13 +1796,126 @@ def _stable_retro_action_masks(env_id, action_set):
     return tuple(NES_SIMPLE_ACTION_MASKS[name] for name in action_sets[action_set])
 
 
+def _download_huggingface_policy_file(repo_id, revision, filename):
+    try:
+        return hf_hub_download(
+            repo_id=repo_id,
+            repo_type="model",
+            revision=revision,
+            filename=filename,
+        )
+    except Exception as exc:
+        raise SystemExit(
+            f"Could not download {filename} from Hugging Face model repo {repo_id}: {exc}"
+        ) from exc
+
+
+def _load_json_document(path, *, label):
+    try:
+        with open(path) as f:
+            value = json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"Could not read {label}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise SystemExit(f"{label} must contain a JSON object")
+    return value
+
+
+def _huggingface_snapshot_revision(path, fallback):
+    """Recover the immutable Hub commit from a standard hf_hub_download cache path."""
+    snapshot_dir = os.path.dirname(path)
+    if os.path.basename(os.path.dirname(snapshot_dir)) == "snapshots":
+        return os.path.basename(snapshot_dir)
+    return fallback
+
+
+def _validate_rlab_document(document, *, label, document_type, format_version):
+    if document.get("document_type") != document_type:
+        raise SystemExit(
+            f"Unsupported {label} document_type {document.get('document_type')!r}; "
+            f"expected {document_type!r}"
+        )
+    if document.get("format_version") != format_version:
+        raise SystemExit(
+            f"Unsupported {label} format_version {document.get('format_version')!r}; "
+            f"gymrec supports version {format_version}"
+        )
+
+
+def _validate_bound_file(path, binding, *, label):
+    if not isinstance(binding, dict):
+        raise SystemExit(f"model.json is missing its {label} binding")
+    expected_size = binding.get("size_bytes")
+    if not isinstance(expected_size, int) or expected_size < 0:
+        raise SystemExit(f"model.json has an invalid {label} size_bytes")
+    actual_size = os.path.getsize(path)
+    if actual_size != expected_size:
+        raise SystemExit(
+            f"{label} size mismatch: model.json declares {expected_size}, got {actual_size}"
+        )
+    expected_sha256 = binding.get("sha256")
+    actual_sha256 = _sha256_file(path)
+    if expected_sha256 != actual_sha256:
+        raise SystemExit(
+            f"{label} SHA-256 mismatch: model.json declares {expected_sha256!r}, "
+            f"got {actual_sha256!r}"
+        )
+
+
+def _recipe_evaluation_environment(recipe_document, *, repo_id):
+    recipe = recipe_document.get("recipe")
+    if not isinstance(recipe, dict):
+        raise SystemExit(f"{repo_id}/recipe.json is missing recipe")
+    if recipe.get("schema_version") != RLAB_RECIPE_SCHEMA_VERSION:
+        raise SystemExit(
+            f"Unsupported rlab recipe schema_version {recipe.get('schema_version')!r}; "
+            f"gymrec supports version {RLAB_RECIPE_SCHEMA_VERSION}"
+        )
+    evaluation = recipe.get("eval")
+    if not isinstance(evaluation, dict):
+        raise SystemExit(f"{repo_id}/recipe.json is missing recipe.eval")
+    environment = evaluation.get("environment")
+    if not isinstance(environment, dict):
+        raise SystemExit(f"{repo_id}/recipe.json is missing recipe.eval.environment")
+    required = {
+        "env_provider",
+        "frame_skip",
+        "game",
+        "max_pool_frames",
+        "obs_crop",
+        "obs_crop_fill",
+        "obs_crop_mode",
+        "obs_resize_algorithm",
+        "observation_size",
+        "sticky_action_prob",
+        "task",
+    }
+    missing = sorted(required - set(environment))
+    if missing:
+        raise SystemExit(
+            f"{repo_id}/recipe.json evaluation environment is missing: {', '.join(missing)}"
+        )
+    if not isinstance(environment.get("env_args", {}), dict):
+        raise SystemExit(f"{repo_id}/recipe.json environment.env_args must be an object")
+    obs_crop = environment["obs_crop"]
+    if not isinstance(obs_crop, list) or len(obs_crop) != 4:
+        raise SystemExit(f"{repo_id}/recipe.json environment.obs_crop must contain four integers")
+    action_sampling = evaluation.get("action_sampling")
+    if action_sampling not in {"stochastic", "deterministic"}:
+        raise SystemExit(
+            f"Unsupported recipe.eval.action_sampling {action_sampling!r}; "
+            "expected 'stochastic' or 'deterministic'"
+        )
+    return evaluation, environment
+
+
 def resolve_huggingface_policy_source(
     ref,
     *,
     filename=None,
     revision=None,
     device="auto",
-    deterministic=False,
+    deterministic=None,
 ):
     _lazy_init()
     try:
@@ -1815,88 +1923,115 @@ def resolve_huggingface_policy_source(
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
     resolved_revision = revision or parsed_revision or "main"
-    checkpoint_filename = _select_huggingface_checkpoint(
-        repo_id, resolved_revision, filename or parsed_filename
+    model_json_path = _download_huggingface_policy_file(
+        repo_id, resolved_revision, RLAB_MODEL_FILENAME
     )
-    try:
-        model_path = hf_hub_download(
-            repo_id=repo_id,
-            repo_type="model",
-            revision=resolved_revision,
-            filename=checkpoint_filename,
-        )
-    except Exception as exc:
+    recipe_json_path = _download_huggingface_policy_file(
+        repo_id, resolved_revision, RLAB_RECIPE_FILENAME
+    )
+    model_document = _load_json_document(model_json_path, label=f"{repo_id}/model.json")
+    recipe_document = _load_json_document(recipe_json_path, label=f"{repo_id}/recipe.json")
+    _validate_rlab_document(
+        model_document,
+        label="model.json",
+        document_type=RLAB_MODEL_DOCUMENT_TYPE,
+        format_version=RLAB_MODEL_FORMAT_VERSION,
+    )
+    _validate_rlab_document(
+        recipe_document,
+        label="recipe.json",
+        document_type=RLAB_RECIPE_DOCUMENT_TYPE,
+        format_version=RLAB_RECIPE_FORMAT_VERSION,
+    )
+
+    recipe_binding = model_document.get("recipe")
+    if not isinstance(recipe_binding, dict):
+        raise SystemExit(f"{repo_id}/model.json is missing recipe binding")
+    if recipe_binding.get("filename") != RLAB_RECIPE_FILENAME:
         raise SystemExit(
-            f"Could not download {checkpoint_filename} from Hugging Face model repo {repo_id}: {exc}"
-        ) from exc
-
-    try:
-        metadata_path = hf_hub_download(
-            repo_id=repo_id,
-            repo_type="model",
-            revision=resolved_revision,
-            filename="model_metadata.json",
+            f"Unsupported recipe filename {recipe_binding.get('filename')!r}; "
+            f"expected {RLAB_RECIPE_FILENAME!r}"
         )
-    except Exception as exc:
+    if (
+        recipe_binding.get("document_type") != RLAB_RECIPE_DOCUMENT_TYPE
+        or recipe_binding.get("format_version") != RLAB_RECIPE_FORMAT_VERSION
+    ):
+        raise SystemExit(f"{repo_id}/model.json recipe binding does not match recipe.json")
+    _validate_bound_file(recipe_json_path, recipe_binding, label="recipe.json")
+
+    checkpoint = model_document.get("checkpoint")
+    if not isinstance(checkpoint, dict):
+        raise SystemExit(f"{repo_id}/model.json is missing checkpoint")
+    checkpoint_filename = checkpoint.get("filename")
+    if not isinstance(checkpoint_filename, str) or not checkpoint_filename:
+        raise SystemExit(f"{repo_id}/model.json has an invalid checkpoint filename")
+    requested_filename = filename or parsed_filename
+    if requested_filename and requested_filename not in {
+        RLAB_MODEL_FILENAME,
+        RLAB_RECIPE_FILENAME,
+        checkpoint_filename,
+    }:
         raise SystemExit(
-            f"Could not download model_metadata.json from Hugging Face model repo {repo_id}: {exc}"
-        ) from exc
+            f"Requested checkpoint {requested_filename!r} does not match "
+            f"{repo_id}/model.json ({checkpoint_filename!r})"
+        )
+    model_path = _download_huggingface_policy_file(repo_id, resolved_revision, checkpoint_filename)
+    _validate_bound_file(model_path, checkpoint, label=checkpoint_filename)
 
-    with open(metadata_path) as f:
-        metadata = json.load(f)
+    policy = model_document.get("policy")
+    if not isinstance(policy, dict):
+        raise SystemExit(f"{repo_id}/model.json is missing policy")
+    for key in ("algorithm_id", "model_class"):
+        if policy.get(key) != checkpoint.get(key):
+            raise SystemExit(f"{repo_id}/model.json policy.{key} does not match checkpoint.{key}")
 
-    env_id = _metadata_str(
-        metadata,
-        ("env_config", "game"),
-        ("environment", "env_id"),
-        default=None,
+    evaluation, environment = _recipe_evaluation_environment(recipe_document, repo_id=repo_id)
+    provider = str(environment["env_provider"])
+    backend_by_provider = {
+        "supermariobrosnes-turbo": "supermariobrosnes-turbo",
+        "stable-retro-turbo": "stable-retro-turbo",
+    }
+    if provider not in backend_by_provider:
+        raise SystemExit(
+            f"Unsupported rlab evaluation env_provider {provider!r}; supported providers: "
+            + ", ".join(sorted(backend_by_provider))
+        )
+    task = environment["task"]
+    if not isinstance(task, dict) or task.get("id") != "mario":
+        raise SystemExit(
+            f"Unsupported rlab evaluation task {getattr(task, 'get', lambda *_: None)('id')!r}; "
+            "gymrec currently supports recipe task 'mario'"
+        )
+    action = task.get("action")
+    if not isinstance(action, dict) or not action.get("set"):
+        raise SystemExit(f"{repo_id}/recipe.json task.action.set is required")
+    env_args = environment.get("env_args", {})
+    frame_stack = int(env_args.get("frame_stack", 1))
+    action_sampling = evaluation["action_sampling"]
+    resolved_deterministic = (
+        action_sampling == "deterministic" if deterministic is None else bool(deterministic)
     )
-    if env_id and ":" in env_id:
-        env_id = env_id.split(":", 1)[1]
-    if not env_id:
-        raise SystemExit(f"Could not infer environment id from {repo_id}/model_metadata.json")
-
-    action_set = _metadata_str(
-        metadata,
-        ("env_config", "action_set"),
-        ("environment", "action", "action_set"),
-        default="native",
-    )
-    frame_skip = _metadata_int(
-        metadata,
-        ("env_config", "frame_skip"),
-        ("environment", "preprocessing", "frame_skip"),
-        default=1,
-    )
-    frame_stack = _metadata_int(
-        metadata,
-        ("environment", "preprocessing", "frame_stack"),
-        ("training_metadata", "preprocessing", "frame_stack"),
-        default=4,
-    )
-    observation_size = _metadata_int(
-        metadata,
-        ("env_config", "observation_size"),
-        ("environment", "preprocessing", "obs_resize", 0),
-        default=84,
-    )
-    state = _metadata_str(metadata, ("env_config", "state"), ("environment", "state"), default=None)
 
     return HFPolicySource(
         ref=ref,
         repo_id=repo_id,
-        revision=resolved_revision,
+        revision=_huggingface_snapshot_revision(model_json_path, resolved_revision),
         checkpoint_filename=checkpoint_filename,
         model_path=model_path,
-        metadata=metadata,
-        env_id=env_id,
-        state=state,
-        action_set=action_set,
-        frame_skip=max(frame_skip, 1),
+        model_document=model_document,
+        recipe_document=recipe_document,
+        evaluation=evaluation,
+        environment=environment,
+        provider=provider,
+        backend=backend_by_provider[provider],
+        env_id=str(environment["game"]),
+        state=str(environment["state"]) if environment.get("state") is not None else None,
+        action_set=str(action["set"]),
+        frame_skip=max(int(environment["frame_skip"]), 1),
         frame_stack=max(frame_stack, 1),
-        observation_size=observation_size,
-        obs_crop=_metadata_obs_crop(metadata),
-        deterministic=deterministic,
+        observation_size=int(environment["observation_size"]),
+        obs_crop=tuple(int(value) for value in environment["obs_crop"]),
+        deterministic=resolved_deterministic,
         device=device,
     )
 
@@ -1931,7 +2066,7 @@ class LiveEpisodePackage:
 
 
 def _upload_live_episode_package(
-    env_id,
+    recording_identity,
     episode_id,
     package_dir,
     dataset,
@@ -1951,9 +2086,10 @@ def _upload_live_episode_package(
         "storage_format": storage_format,
         "frames": len(dataset),
     }
-    _set_live_upload_manifest_entry(env_id, episode_id, state="pending", **manifest_kwargs)
+    identity = _coerce_recording_identity(recording_identity)
+    _set_live_upload_manifest_entry(identity, episode_id, state="pending", **manifest_kwargs)
     success = _upload_dataset_shard_to_hub(
-        env_id,
+        identity,
         dataset,
         storage_format=storage_format,
         local_root=package_dir,
@@ -1964,12 +2100,12 @@ def _upload_live_episode_package(
         base_wait=base_wait,
     )
     if success:
-        _set_live_upload_manifest_entry(env_id, episode_id, state="uploaded", **manifest_kwargs)
+        _set_live_upload_manifest_entry(identity, episode_id, state="uploaded", **manifest_kwargs)
         shutil.rmtree(package_dir, ignore_errors=True)
         return True
 
     _set_live_upload_manifest_entry(
-        env_id,
+        identity,
         episode_id,
         state="failed",
         error="upload failed",
@@ -1981,12 +2117,13 @@ def _upload_live_episode_package(
 class LiveEpisodeUploadManager:
     """Materialize, upload, and track one verified episode at a time."""
 
-    def __init__(self, env_id, storage_format, max_retries=5, base_wait=1.0):
-        self.env_id = env_id
+    def __init__(self, recording_identity, storage_format, max_retries=5, base_wait=1.0):
+        self.identity = _coerce_recording_identity(recording_identity)
+        self.env_id = self.identity.display_ref
         self.storage_format = storage_format
         self.max_retries = max_retries
         self.base_wait = base_wait
-        self.queue_dir = _get_live_upload_queue_dir(env_id)
+        self.queue_dir = _get_live_upload_queue_dir(self.identity)
 
     def begin_episode(self, episode_uuid):
         episode_id = episode_uuid.hex
@@ -1996,7 +2133,7 @@ class LiveEpisodeUploadManager:
         os.makedirs(package_dir, exist_ok=True)
         package = LiveEpisodePackage(episode_id=episode_id, package_dir=package_dir)
         _set_live_upload_manifest_entry(
-            self.env_id,
+            self.identity,
             package.episode_id,
             state="recording",
             package_dir=package.package_dir,
@@ -2007,7 +2144,7 @@ class LiveEpisodeUploadManager:
 
     def upload_episode(self, package, dataset):
         return _upload_live_episode_package(
-            self.env_id,
+            self.identity,
             package.episode_id,
             package.package_dir,
             dataset,
@@ -2040,6 +2177,10 @@ def _recording_dataset_from_dict(data, storage_format):
         "rom_sha256",
         "nes_button_order",
         "action_encoding",
+        "policy_source_repo",
+        "policy_source_revision",
+        "policy_recipe_sha256",
+        "policy_checkpoint_sha256",
     ):
         if column in dataset.column_names:
             dataset = dataset.cast_column(column, Value("string"))
@@ -2047,6 +2188,9 @@ def _recording_dataset_from_dict(data, storage_format):
         dataset = dataset.cast_column("frame_skip", Value("int64"))
     if "sticky_action_prob" in dataset.column_names:
         dataset = dataset.cast_column("sticky_action_prob", Value("float64"))
+    for column in ("policy_recipe_format_version", "policy_model_format_version"):
+        if column in dataset.column_names:
+            dataset = dataset.cast_column(column, Value("int64"))
     return dataset
 
 
@@ -2061,6 +2205,12 @@ def _align_environment_metadata_columns(dataset):
         "action_encoding": "string",
         "frame_skip": "int64",
         "sticky_action_prob": "float64",
+        "policy_source_repo": "string",
+        "policy_source_revision": "string",
+        "policy_recipe_sha256": "string",
+        "policy_checkpoint_sha256": "string",
+        "policy_recipe_format_version": "int64",
+        "policy_model_format_version": "int64",
     }
     for column, dtype in feature_types.items():
         if column not in dataset.column_names:
@@ -2082,6 +2232,7 @@ class DatasetRecorderWrapper(gym.Wrapper):
         collector="human",
         storage_format=None,
         live_upload_manager=None,
+        initial_seed=None,
     ):
         _lazy_init()
         super().__init__(env)
@@ -2099,6 +2250,7 @@ class DatasetRecorderWrapper(gym.Wrapper):
         self.input_source = input_source
         self.collector = collector
         self.live_upload_manager = live_upload_manager
+        self.initial_seed = int(initial_seed) if initial_seed is not None else None
         self._gymrec_version = _get_gymrec_version()
 
         if not headless:
@@ -2196,6 +2348,14 @@ class DatasetRecorderWrapper(gym.Wrapper):
             "action_encoding": [env_metadata.get("action_encoding")] * row_count,
             "frame_skip": [env_metadata.get("frameskip")] * row_count,
             "sticky_action_prob": [env_metadata.get("sticky_actions")] * row_count,
+            "policy_source_repo": [env_metadata.get("policy_source_repo")] * row_count,
+            "policy_source_revision": [env_metadata.get("policy_source_revision")] * row_count,
+            "policy_recipe_sha256": [env_metadata.get("policy_recipe_sha256")] * row_count,
+            "policy_checkpoint_sha256": [env_metadata.get("policy_checkpoint_sha256")] * row_count,
+            "policy_recipe_format_version": [env_metadata.get("policy_recipe_format_version")]
+            * row_count,
+            "policy_model_format_version": [env_metadata.get("policy_model_format_version")]
+            * row_count,
         }
         if self.storage_format == STORAGE_FORMAT_IMAGES:
             data["observations"] = self.frames
@@ -2238,7 +2398,9 @@ class DatasetRecorderWrapper(gym.Wrapper):
         if row_index < 0 or row_index >= len(self.rewards):
             return
 
-        terminal_frame = _observation_to_rgb_array(next_observation)
+        terminal_frame = _observation_to_rgb_array(
+            _recording_observation(self.env, next_observation)
+        )
         PILImage.fromarray(terminal_frame).save(
             self._live_episode.terminal_candidate_path,
             format="WEBP",
@@ -2271,6 +2433,16 @@ class DatasetRecorderWrapper(gym.Wrapper):
             "action_encoding": (self._env_metadata or {}).get("action_encoding"),
             "frame_skip": (self._env_metadata or {}).get("frameskip"),
             "sticky_action_prob": (self._env_metadata or {}).get("sticky_actions"),
+            "policy_source_repo": (self._env_metadata or {}).get("policy_source_repo"),
+            "policy_source_revision": (self._env_metadata or {}).get("policy_source_revision"),
+            "policy_recipe_sha256": (self._env_metadata or {}).get("policy_recipe_sha256"),
+            "policy_checkpoint_sha256": (self._env_metadata or {}).get("policy_checkpoint_sha256"),
+            "policy_recipe_format_version": (self._env_metadata or {}).get(
+                "policy_recipe_format_version"
+            ),
+            "policy_model_format_version": (self._env_metadata or {}).get(
+                "policy_model_format_version"
+            ),
             "fps": self._fps or get_default_fps(self.env),
             "terminal_candidate_path": self._relative_live_package_path(
                 self._live_episode.terminal_candidate_path
@@ -2771,7 +2943,9 @@ class DatasetRecorderWrapper(gym.Wrapper):
 
         self._session_uuid = uuid.uuid4()
         self._current_episode_uuid = uuid.uuid4()
-        self._current_episode_seed = int(time.time())
+        self._current_episode_seed = (
+            self.initial_seed if self.initial_seed is not None else int(time.time())
+        )
         seed = self._current_episode_seed
         self._episode_count = 1
         self._cumulative_reward = 0.0
@@ -2808,7 +2982,11 @@ class DatasetRecorderWrapper(gym.Wrapper):
             # Get action from input source
             action = self.input_source.get_action(obs)
 
-            self._record_frame(self._current_episode_uuid, obs, action)
+            self._record_frame(
+                self._current_episode_uuid,
+                _recording_observation(self.env, obs),
+                action,
+            )
             obs, reward, terminated, truncated, info = self.env.step(action)
             if hasattr(self.input_source, "observe_step"):
                 self.input_source.observe_step(reward, terminated, truncated, info)
@@ -2819,7 +2997,7 @@ class DatasetRecorderWrapper(gym.Wrapper):
                 self.truncations.append(bool(truncated))
                 self.infos.append(json.dumps(info, default=_json_default))
 
-            self._render_frame(obs)
+            self._render_frame(_recording_observation(self.env, obs))
 
             # Frame pacing: skip if headless (run at max speed)
             if not self.headless:
@@ -2853,7 +3031,10 @@ class DatasetRecorderWrapper(gym.Wrapper):
             self._write_live_step_journal(obs)
 
             if terminated or truncated:
-                self._record_terminal_observation(self._current_episode_uuid, obs)
+                self._record_terminal_observation(
+                    self._current_episode_uuid,
+                    _recording_observation(self.env, obs),
+                )
 
                 if self._progress_callback is not None:
                     self._progress_callback(self._episode_count, step)
@@ -2863,7 +3044,11 @@ class DatasetRecorderWrapper(gym.Wrapper):
                     break
 
                 self._current_episode_uuid = uuid.uuid4()
-                self._current_episode_seed = int(time.time())
+                self._current_episode_seed = (
+                    self.initial_seed + self._episode_count
+                    if self.initial_seed is not None
+                    else int(time.time())
+                )
                 seed = self._current_episode_seed
                 self._start_live_episode(self._current_episode_uuid)
                 obs, _ = self.env.reset(seed=seed)
@@ -2872,14 +3057,17 @@ class DatasetRecorderWrapper(gym.Wrapper):
                 self._episode_count += 1
                 self._cumulative_reward = 0.0
                 step = 0
-                self._render_frame(obs)
+                self._render_frame(_recording_observation(self.env, obs))
 
         # Record terminal observation on user exit (ESC) or when max_episodes reached
         if self.recording and self.frames and self.actions[-1] != []:
             # Mark last real step as truncated: user exited mid-episode.
             # Minari requires at least one True in terminations or truncations per episode.
             self.truncations[-1] = True
-            self._record_terminal_observation(self._current_episode_uuid, obs)
+            self._record_terminal_observation(
+                self._current_episode_uuid,
+                _recording_observation(self.env, obs),
+            )
 
         if self.recording and self.frames:
             self._recorded_dataset = self._build_recorded_dataset()
@@ -3113,6 +3301,76 @@ def env_id_to_hf_repo_id(env_id):
     return hf_repo_id
 
 
+def normalize_dataset_repo_id(value):
+    """Normalize an owner/repo or hf://owner/repo dataset reference."""
+    text = str(value or "").strip()
+    if text.startswith(HUGGINGFACE_MODEL_SCHEME):
+        text = text.removeprefix(HUGGINGFACE_MODEL_SCHEME).strip("/")
+    parts = [unquote(part) for part in text.split("/") if part]
+    if len(parts) != 2 or any(part in {".", ".."} for part in parts):
+        raise ValueError(
+            f"expected a Hugging Face dataset repo like owner/repo or hf://owner/repo, "
+            f"got {value!r}"
+        )
+    return "/".join(parts)
+
+
+@dataclass(frozen=True)
+class RecordingIdentity:
+    """Identify one recording collection independently from its environment."""
+
+    env_id: str | None = None
+    dataset_repo_id: str | None = None
+
+    def __post_init__(self):
+        if self.dataset_repo_id is not None:
+            object.__setattr__(
+                self,
+                "dataset_repo_id",
+                normalize_dataset_repo_id(self.dataset_repo_id),
+            )
+        if not self.env_id and not self.dataset_repo_id:
+            raise ValueError("recording identity requires an environment or dataset repo")
+
+    @property
+    def display_ref(self):
+        if self.dataset_repo_id:
+            return f"{HUGGINGFACE_MODEL_SCHEME}{self.dataset_repo_id}"
+        return self.env_id
+
+    def with_env_id(self, env_id):
+        if not env_id or env_id == self.env_id:
+            return self
+        return RecordingIdentity(env_id=str(env_id), dataset_repo_id=self.dataset_repo_id)
+
+
+def _coerce_recording_identity(value, *, env_id=None):
+    if isinstance(value, RecordingIdentity):
+        return value.with_env_id(env_id)
+    text = str(value or "").strip()
+    if text.startswith(HUGGINGFACE_MODEL_SCHEME):
+        return RecordingIdentity(
+            env_id=env_id,
+            dataset_repo_id=normalize_dataset_repo_id(text),
+        )
+    return RecordingIdentity(env_id=env_id or text)
+
+
+def _identity_hf_repo_id(value):
+    identity = _coerce_recording_identity(value)
+    if identity.dataset_repo_id:
+        return identity.dataset_repo_id
+    return env_id_to_hf_repo_id(identity.env_id)
+
+
+def _policy_recording_identity(policy_source, dataset_repo=None):
+    """Build the dataset identity paired with a resolved HF policy source."""
+    return RecordingIdentity(
+        env_id=policy_source.env_id,
+        dataset_repo_id=dataset_repo or policy_source.repo_id,
+    )
+
+
 def hf_repo_id_to_env_id(hf_repo_id):
     """Convert HF repo_id back to original env_id."""
     prefix = CONFIG["dataset"]["repo_prefix"]
@@ -3129,9 +3387,21 @@ def hf_repo_id_to_env_id(hf_repo_id):
     return _decode_hf_repo_name(encoded_env_id)
 
 
-def get_local_dataset_path(env_id):
-    """Return the local storage path for a given environment's dataset."""
-    encoded_env_id = _encode_env_id_for_hf(env_id)
+def _get_recording_root(value):
+    identity = _coerce_recording_identity(value)
+    if identity.dataset_repo_id:
+        owner, repo = identity.dataset_repo_id.split("/", 1)
+        return os.path.join(CONFIG["storage"]["local_dir"], "repos", owner, repo)
+    return None
+
+
+def get_local_dataset_path(value):
+    """Return the local dataset path for an environment or repo-keyed identity."""
+    identity = _coerce_recording_identity(value)
+    recording_root = _get_recording_root(identity)
+    if recording_root:
+        return os.path.join(recording_root, "dataset")
+    encoded_env_id = _encode_env_id_for_hf(identity.env_id)
     return os.path.join(CONFIG["storage"]["local_dir"], encoded_env_id)
 
 
@@ -3153,6 +3423,23 @@ def _get_available_envs_from_local():
                 if _encode_env_id_for_hf(env_id) != entry:
                     continue
                 available.append(env_id)
+    return sorted(set(available))
+
+
+def _get_available_recording_refs_from_local():
+    """Return environment IDs and repo-keyed refs available on local disk."""
+    available = list(_get_available_envs_from_local())
+    repos_dir = os.path.join(CONFIG["storage"]["local_dir"], "repos")
+    if not os.path.isdir(repos_dir):
+        return sorted(set(available))
+    for owner in os.listdir(repos_dir):
+        owner_dir = os.path.join(repos_dir, owner)
+        if not os.path.isdir(owner_dir):
+            continue
+        for repo in os.listdir(owner_dir):
+            dataset_dir = os.path.join(owner_dir, repo, "dataset")
+            if os.path.exists(os.path.join(dataset_dir, "dataset_info.json")):
+                available.append(f"{HUGGINGFACE_MODEL_SCHEME}{owner}/{repo}")
     return sorted(set(available))
 
 
@@ -3181,38 +3468,76 @@ def _get_available_envs_from_hf():
     return sorted(set(available))
 
 
-def _get_metadata_path(env_id):
-    """Return the path to the metadata JSON file for a given environment."""
-    encoded_env_id = _encode_env_id_for_hf(env_id)
+def _get_available_recording_refs_from_hf():
+    """Return gymrec environment IDs and repo-keyed refs found on the Hub."""
+    try:
+        username = _current_hf_username()
+        datasets = HfApi().list_datasets(author=username)
+    except Exception:
+        return []
+
+    prefix = CONFIG["dataset"]["repo_prefix"]
+    available = []
+    api = HfApi()
+    for dataset_info in datasets:
+        repo_id = getattr(dataset_info, "id", None)
+        if not repo_id:
+            continue
+        repo_name = repo_id.split("/", 1)[-1]
+        if repo_name.startswith(prefix):
+            env_id = hf_repo_id_to_env_id(repo_id)
+            if env_id:
+                available.append(env_id)
+            continue
+        try:
+            files = api.list_repo_files(repo_id=repo_id, repo_type="dataset")
+        except Exception:
+            continue
+        if ENVIRONMENT_METADATA_FILENAME in files:
+            available.append(f"{HUGGINGFACE_MODEL_SCHEME}{repo_id}")
+    return sorted(set(available))
+
+
+def _get_metadata_path(value):
+    """Return the recording metadata sidecar path."""
+    identity = _coerce_recording_identity(value)
+    recording_root = _get_recording_root(identity)
+    if recording_root:
+        return os.path.join(recording_root, "metadata.json")
+    encoded_env_id = _encode_env_id_for_hf(identity.env_id)
     return os.path.join(CONFIG["storage"]["local_dir"], f"{encoded_env_id}_metadata.json")
 
 
-def _get_uploaded_episodes_path(env_id):
-    """Return the path to the uploaded episodes tracking file for a given environment."""
-    encoded_env_id = _encode_env_id_for_hf(env_id)
+def _get_uploaded_episodes_path(value):
+    """Return the uploaded-episode tracking path for a recording identity."""
+    identity = _coerce_recording_identity(value)
+    recording_root = _get_recording_root(identity)
+    if recording_root:
+        return os.path.join(recording_root, "uploaded.json")
+    encoded_env_id = _encode_env_id_for_hf(identity.env_id)
     return os.path.join(CONFIG["storage"]["local_dir"], f"{encoded_env_id}_uploaded.json")
 
 
-def _load_uploaded_episode_ids(env_id):
+def _load_uploaded_episode_ids(value):
     """Load the set of already-uploaded episode IDs from local tracking file."""
-    path = _get_uploaded_episodes_path(env_id)
+    path = _get_uploaded_episodes_path(value)
     if not os.path.exists(path):
         return set()
     with open(path) as f:
         return set(json.load(f))
 
 
-def _save_uploaded_episode_ids(env_id, episode_ids: set):
+def _save_uploaded_episode_ids(value, episode_ids: set):
     """Save the set of uploaded episode IDs to local tracking file."""
-    path = _get_uploaded_episodes_path(env_id)
+    path = _get_uploaded_episodes_path(value)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w") as f:
         json.dump(list(episode_ids), f)
 
 
-def _remote_dataset_episode_ids(env_id):
+def _remote_dataset_episode_ids(value):
     """Return episode ids currently present on the Hub, or None if unavailable."""
-    hf_repo_id = env_id_to_hf_repo_id(env_id)
+    hf_repo_id = _identity_hf_repo_id(value)
     api = HfApi()
     try:
         repo_exists, _, remote_files = _hf_repo_state(api, hf_repo_id, create=False)
@@ -3237,9 +3562,13 @@ def _remote_dataset_episode_ids(env_id):
         return None
 
 
-def _get_live_upload_queue_dir(env_id):
+def _get_live_upload_queue_dir(value):
     """Return the local resumable live-upload queue directory."""
-    encoded_env_id = _encode_env_id_for_hf(env_id)
+    identity = _coerce_recording_identity(value)
+    recording_root = _get_recording_root(identity)
+    if recording_root:
+        return os.path.join(recording_root, "live_pending")
+    encoded_env_id = _encode_env_id_for_hf(identity.env_id)
     return os.path.join(CONFIG["storage"]["local_dir"], f"{encoded_env_id}_live_pending")
 
 
@@ -3329,13 +3658,16 @@ def _copy_video_artifacts(src_root, dst_root):
         _copy_artifact_tree(src_root, dst_root, relative_dir)
 
 
-def save_dataset_locally(dataset, env_id, metadata=None, video_artifact_dir=None):
+def save_dataset_locally(dataset, value, metadata=None, video_artifact_dir=None):
     """Save dataset to local disk, appending to any existing data."""
-    path = get_local_dataset_path(env_id)
-    metadata_path = _get_metadata_path(env_id)
+    identity = _coerce_recording_identity(value)
+    path = get_local_dataset_path(identity)
+    metadata_path = _get_metadata_path(identity)
     dataset = _align_environment_metadata_columns(_strip_runtime_columns(dataset))
     new_storage_format = _dataset_storage_format(dataset)
-    new_episode_count = len(set(dataset["episode_id"])) if "episode_id" in dataset.column_names else 0
+    new_episode_count = (
+        len(set(dataset["episode_id"])) if "episode_id" in dataset.column_names else 0
+    )
     new_frame_count = len(dataset)
     new_collectors = set(dataset["collector"]) if "collector" in dataset.column_names else set()
     new_versions = (
@@ -3383,6 +3715,8 @@ def save_dataset_locally(dataset, env_id, metadata=None, video_artifact_dir=None
                 existing_metadata = json.load(f)
         # Update with new metadata (newer values take precedence)
         existing_metadata.update(metadata)
+        if identity.dataset_repo_id:
+            existing_metadata["dataset_repo_id"] = identity.dataset_repo_id
         existing_metadata["storage_format"] = new_storage_format
         # Add recording timestamp
         if "recordings" not in existing_metadata:
@@ -3405,6 +3739,12 @@ def save_dataset_locally(dataset, env_id, metadata=None, video_artifact_dir=None
             "action_encoding",
             "frameskip",
             "sticky_actions",
+            "policy_source_repo",
+            "policy_source_revision",
+            "policy_recipe_sha256",
+            "policy_checkpoint_sha256",
+            "policy_recipe_format_version",
+            "policy_model_format_version",
         ):
             if key in metadata:
                 recording_entry[key] = metadata[key]
@@ -3416,18 +3756,18 @@ def save_dataset_locally(dataset, env_id, metadata=None, video_artifact_dir=None
     return path
 
 
-def load_local_metadata(env_id):
+def load_local_metadata(value):
     """Load metadata from local disk. Returns None if not found."""
-    metadata_path = _get_metadata_path(env_id)
+    metadata_path = _get_metadata_path(value)
     if not os.path.exists(metadata_path):
         return None
     with open(metadata_path, "r") as f:
         return json.load(f)
 
 
-def load_local_dataset(env_id, attach_runtime=True):
+def load_local_dataset(value, attach_runtime=True):
     """Load dataset from local disk. Returns None if not found."""
-    path = get_local_dataset_path(env_id)
+    path = get_local_dataset_path(value)
     if not os.path.exists(path):
         return None
     dataset = load_from_disk(path)
@@ -3436,14 +3776,15 @@ def load_local_dataset(env_id, attach_runtime=True):
     return dataset
 
 
-def load_recorded_dataset(env_id):
+def load_recorded_dataset(value):
     """Load a recorded dataset from local disk first, then from the Hub."""
-    local_dataset = load_local_dataset(env_id)
+    identity = _coerce_recording_identity(value)
+    local_dataset = load_local_dataset(identity)
     if local_dataset is not None:
         return local_dataset, "local"
 
     try:
-        hf_repo_id = env_id_to_hf_repo_id(env_id)
+        hf_repo_id = _identity_hf_repo_id(identity)
         dataset = load_dataset(hf_repo_id, split="train")
     except Exception:
         return None, None
@@ -3453,10 +3794,27 @@ def load_recorded_dataset(env_id):
     return dataset, "hub"
 
 
-def _print_missing_dataset(env_id):
-    console.print(f"[{STYLE_FAIL}]No dataset found for {env_id}.[/]")
-    console.print(f"  Local path: [{STYLE_PATH}]{get_local_dataset_path(env_id)}[/]")
-    console.print(f"  Record a session first: [{STYLE_CMD}]{_gymrec_cmd('record', env_id)}[/]")
+def _recording_env_id(value, dataset=None, metadata=None):
+    """Recover a recording's logical environment from identity, metadata, or rows."""
+    identity = _coerce_recording_identity(value)
+    if identity.env_id:
+        return identity.env_id
+    metadata = metadata or load_local_metadata(identity) or {}
+    env_id = metadata.get("env_id") or metadata.get("logical_env_id")
+    if env_id:
+        return str(env_id)
+    dataset_metadata = _environment_metadata_from_dataset(dataset) if dataset is not None else {}
+    env_id = dataset_metadata.get("env_id")
+    return str(env_id) if env_id else None
+
+
+def _print_missing_dataset(value):
+    identity = _coerce_recording_identity(value)
+    console.print(f"[{STYLE_FAIL}]No dataset found for {identity.display_ref}.[/]")
+    console.print(f"  Local path: [{STYLE_PATH}]{get_local_dataset_path(identity)}[/]")
+    console.print(
+        f"  Record a session first: [{STYLE_CMD}]{_gymrec_cmd('record', identity.display_ref)}[/]"
+    )
 
 
 def _is_terminal_action(action):
@@ -3531,7 +3889,7 @@ def _human_record_env_make_kwargs(backend):
             "frameskip": HUMAN_RECORD_FRAMESKIP,
             "repeat_action_probability": HUMAN_RECORD_STICKY_ACTION_PROB,
         }
-    if backend in {"stable-retro", "supermariobrosnes-turbo"}:
+    if backend in {"stable-retro", "stable-retro-turbo", "supermariobrosnes-turbo"}:
         return {
             "frame_skip": HUMAN_RECORD_FRAMESKIP,
             "sticky_action_prob": HUMAN_RECORD_STICKY_ACTION_PROB,
@@ -3564,7 +3922,7 @@ def _env_make_kwargs_from_metadata(env_id, metadata, backend=None):
             kwargs["frameskip"] = max(frameskip, 1)
         if sticky is not None:
             kwargs["repeat_action_probability"] = sticky
-    elif backend in {"stable-retro", "supermariobrosnes-turbo"}:
+    elif backend in {"stable-retro", "stable-retro-turbo", "supermariobrosnes-turbo"}:
         if frameskip is not None:
             kwargs["frame_skip"] = max(frameskip, 1)
         if sticky is not None:
@@ -3634,9 +3992,7 @@ def _iter_playback_items(dataset, row_indices, verify=False):
         if verify:
             if position + 1 >= len(row_indices):
                 episode_key = _normalize_episode_id(row.get("episode_id"))
-                raise ValueError(
-                    f"Episode {episode_key} is missing the terminal observation row"
-                )
+                raise ValueError(f"Episode {episode_key} is missing the terminal observation row")
             next_row = dataset[row_indices[position + 1]]
             yield (
                 row.get("actions"),
@@ -3777,9 +4133,7 @@ def _get_video_row_observation(row):
     frame = np.array(frames[frame_index], copy=True)
     expected_hash = row.get("frame_sha256")
     if expected_hash and _sha256_rgb(frame) != expected_hash:
-        raise RuntimeError(
-            f"Decoded frame hash mismatch for {video_path} frame {frame_index}"
-        )
+        raise RuntimeError(f"Decoded frame hash mismatch for {video_path} frame {frame_index}")
     return frame
 
 
@@ -4063,7 +4417,7 @@ def _next_hf_shard_index(api, hf_repo_id, repo_exists, replace=False):
 
 
 def _upload_dataset_shard_to_hub(
-    env_id,
+    recording_identity,
     dataset,
     *,
     storage_format,
@@ -4075,19 +4429,19 @@ def _upload_dataset_shard_to_hub(
     base_wait=1.0,
 ):
     """Upload an already-materialized dataset shard and its artifacts to the Hub."""
-    hf_repo_id = env_id_to_hf_repo_id(env_id)
+    identity = _coerce_recording_identity(recording_identity)
+    env_id = _recording_env_id(identity, dataset=dataset) or "unknown"
+    hf_repo_id = _identity_hf_repo_id(identity)
     api = HfApi()
     episode_ids = set(episode_ids)
 
     for attempt in range(1, max_retries + 1):
         try:
-            repo_exists, parent_commit, remote_files = _hf_repo_state(
-                api, hf_repo_id, create=True
-            )
+            repo_exists, parent_commit, remote_files = _hf_repo_state(api, hf_repo_id, create=True)
             if repo_exists and not replace:
                 remote_format = _remote_storage_format_from_files(remote_files)
                 conflict_message = _remote_storage_conflict_message(
-                    env_id, hf_repo_id, storage_format, remote_format
+                    identity.display_ref, hf_repo_id, storage_format, remote_format
                 )
                 if conflict_message:
                     console.print(f"[{STYLE_FAIL}]{conflict_message}[/]")
@@ -4107,9 +4461,7 @@ def _upload_dataset_shard_to_hub(
                 upload_dataset = _strip_runtime_columns(dataset)
                 if repo_exists and not replace:
                     remote_columns = _remote_parquet_columns(hf_repo_id, remote_files)
-                    upload_dataset = _match_remote_parquet_schema(
-                        upload_dataset, remote_columns
-                    )
+                    upload_dataset = _match_remote_parquet_schema(upload_dataset, remote_columns)
                 upload_dataset.to_parquet(shard_path)
                 shard_name = (
                     "data/train-00000-of-00001.parquet"
@@ -4122,8 +4474,10 @@ def _upload_dataset_shard_to_hub(
 
                 sidecar_metadata = {
                     **_environment_metadata_from_dataset(dataset),
-                    **(load_local_metadata(env_id) or {}),
+                    **(load_local_metadata(identity) or {}),
                 }
+                if identity.dataset_repo_id:
+                    sidecar_metadata["dataset_repo_id"] = identity.dataset_repo_id
                 if sidecar_metadata:
                     sidecar_path = os.path.join(tmpdir, ENVIRONMENT_METADATA_FILENAME)
                     with open(sidecar_path, "w") as file_obj:
@@ -4170,6 +4524,7 @@ def _upload_dataset_shard_to_hub(
                                     )
 
                 card_content = _build_dataset_card_content(
+                    identity,
                     env_id,
                     hf_repo_id,
                     new_frames=len(upload_dataset),
@@ -4202,9 +4557,9 @@ def _upload_dataset_shard_to_hub(
                 )
 
             uploaded_episode_ids = (
-                episode_ids if replace else _load_uploaded_episode_ids(env_id) | episode_ids
+                episode_ids if replace else _load_uploaded_episode_ids(identity) | episode_ids
             )
-            _save_uploaded_episode_ids(env_id, uploaded_episode_ids)
+            _save_uploaded_episode_ids(identity, uploaded_episode_ids)
             console.print(
                 f"[{STYLE_SUCCESS}]Dataset uploaded: https://huggingface.co/datasets/{hf_repo_id}[/]"
             )
@@ -4229,11 +4584,14 @@ def _upload_dataset_shard_to_hub(
                     time.sleep(wait_time)
                     continue
                 console.print(f"[{STYLE_FAIL}]Max retries ({max_retries}) exceeded.[/]")
-                console.print(
-                    f"[{STYLE_INFO}]Another client may be uploading. Try again later.[/]"
-                )
+                console.print(f"[{STYLE_INFO}]Another client may be uploading. Try again later.[/]")
                 return False
             console.print(f"[{STYLE_FAIL}]Upload failed: {e}[/]")
+            if identity.dataset_repo_id:
+                console.print(
+                    f"[{STYLE_INFO}]If {hf_repo_id} is not writable, record with "
+                    f"[{STYLE_CMD}]--dataset-repo <writable-owner/repo>[/]."
+                )
             return False
 
     return False
@@ -4343,6 +4701,12 @@ def _dataset_from_recovered_live_records(package_dir, episode_id, records):
         "action_encoding",
         "frame_skip",
         "sticky_action_prob",
+        "policy_source_repo",
+        "policy_source_revision",
+        "policy_recipe_sha256",
+        "policy_checkpoint_sha256",
+        "policy_recipe_format_version",
+        "policy_model_format_version",
     )
     for column in environment_columns:
         if column in records[0]:
@@ -4409,22 +4773,23 @@ def _recover_live_recording_package(episode_id, entry):
     return _dataset_from_recovered_live_records(package_dir, episode_id, records)
 
 
-def drain_live_upload_queue(env_id, max_retries=5, base_wait=1.0):
+def drain_live_upload_queue(recording_identity, max_retries=5, base_wait=1.0):
     """Retry verified live-upload episode packages left from interrupted sessions."""
-    entries = list(_pending_live_upload_entries(env_id))
+    identity = _coerce_recording_identity(recording_identity)
+    entries = list(_pending_live_upload_entries(identity))
     if not entries:
         return True
 
     console.print(f"[{STYLE_INFO}]Draining {len(entries)} pending live-upload episode(s)...[/]")
     ok = True
-    already_uploaded = _remote_dataset_episode_ids(env_id)
+    already_uploaded = _remote_dataset_episode_ids(identity)
     if already_uploaded is None:
-        already_uploaded = _load_uploaded_episode_ids(env_id)
+        already_uploaded = _load_uploaded_episode_ids(identity)
     for episode_id, entry in entries:
         package_dir = entry["package_dir"]
         if episode_id in already_uploaded:
             _set_live_upload_manifest_entry(
-                env_id,
+                identity,
                 episode_id,
                 state="uploaded",
                 package_dir=package_dir,
@@ -4445,7 +4810,7 @@ def drain_live_upload_queue(env_id, max_retries=5, base_wait=1.0):
                 persist_dataset = False
             storage_format = _dataset_storage_format(dataset)
             success = _upload_live_episode_package(
-                env_id,
+                identity,
                 episode_id,
                 package_dir,
                 dataset,
@@ -4459,7 +4824,7 @@ def drain_live_upload_queue(env_id, max_retries=5, base_wait=1.0):
         except Exception as e:
             ok = False
             _set_live_upload_manifest_entry(
-                env_id,
+                identity,
                 episode_id,
                 state="failed",
                 package_dir=package_dir,
@@ -4471,8 +4836,9 @@ def drain_live_upload_queue(env_id, max_retries=5, base_wait=1.0):
     return ok
 
 
-def preflight_live_upload(env_id, storage_format):
+def preflight_live_upload(recording_identity, storage_format):
     """Validate live upload can reach the target Hub dataset before gameplay starts."""
+    identity = _coerce_recording_identity(recording_identity)
     if not ensure_hf_login():
         return False
     if storage_format == STORAGE_FORMAT_LOSSLESS_VIDEO:
@@ -4482,17 +4848,22 @@ def preflight_live_upload(env_id, storage_format):
             console.print(f"[{STYLE_FAIL}]Live upload preflight failed: {e}[/]")
             return False
 
-    hf_repo_id = env_id_to_hf_repo_id(env_id)
+    hf_repo_id = _identity_hf_repo_id(identity)
     api = HfApi()
     try:
         _, _, remote_files = _hf_repo_state(api, hf_repo_id, create=True)
     except Exception as e:
         console.print(f"[{STYLE_FAIL}]Live upload preflight failed: {e}[/]")
+        if identity.dataset_repo_id:
+            console.print(
+                f"[{STYLE_INFO}]Use [{STYLE_CMD}]--dataset-repo <writable-owner/repo>[/] "
+                f"when {hf_repo_id} is not writable."
+            )
         return False
 
     remote_format = _remote_storage_format_from_files(remote_files)
     conflict_message = _remote_storage_conflict_message(
-        env_id, hf_repo_id, storage_format, remote_format
+        identity.display_ref, hf_repo_id, storage_format, remote_format
     )
     if conflict_message:
         console.print(f"[{STYLE_FAIL}]{conflict_message}[/]")
@@ -4501,7 +4872,7 @@ def preflight_live_upload(env_id, storage_format):
     return True
 
 
-def upload_local_dataset(env_id, max_retries=5, base_wait=1.0, replace=False):
+def upload_local_dataset(recording_identity, max_retries=5, base_wait=1.0, replace=False):
     """Upload new episodes to HF Hub using append-only shard uploads.
 
     Only uploads episodes that have not been uploaded before (tracked in a local
@@ -4510,7 +4881,7 @@ def upload_local_dataset(env_id, max_retries=5, base_wait=1.0, replace=False):
     parent_commit in create_commit() to handle concurrent uploads safely.
 
     Args:
-        env_id: The environment ID to upload
+        recording_identity: Environment ID or hf:// dataset recording identity.
         max_retries: Maximum number of retry attempts on conflict (default: 5)
         base_wait: Base wait time between retries in seconds (default: 1.0)
         replace: Replace all remote dataset files with the local dataset.
@@ -4518,20 +4889,21 @@ def upload_local_dataset(env_id, max_retries=5, base_wait=1.0, replace=False):
     if not ensure_hf_login():
         return False
 
-    had_pending_live_uploads = any(True for _ in _pending_live_upload_entries(env_id))
-    pending_ok = drain_live_upload_queue(env_id, max_retries=max_retries, base_wait=base_wait)
-    local_dataset = load_local_dataset(env_id, attach_runtime=False)
+    identity = _coerce_recording_identity(recording_identity)
+    had_pending_live_uploads = any(True for _ in _pending_live_upload_entries(identity))
+    pending_ok = drain_live_upload_queue(identity, max_retries=max_retries, base_wait=base_wait)
+    local_dataset = load_local_dataset(identity, attach_runtime=False)
     if local_dataset is None:
         if not had_pending_live_uploads:
-            console.print(f"[{STYLE_FAIL}]No local dataset found for {env_id}[/]")
-            console.print(f"  Expected at: [{STYLE_PATH}]{get_local_dataset_path(env_id)}[/]")
+            console.print(f"[{STYLE_FAIL}]No local dataset found for {identity.display_ref}[/]")
+            console.print(f"  Expected at: [{STYLE_PATH}]{get_local_dataset_path(identity)}[/]")
             return False
         return pending_ok
     storage_format = _dataset_storage_format(local_dataset)
 
-    already_uploaded = _remote_dataset_episode_ids(env_id)
+    already_uploaded = _remote_dataset_episode_ids(identity)
     if already_uploaded is None:
-        already_uploaded = _load_uploaded_episode_ids(env_id)
+        already_uploaded = _load_uploaded_episode_ids(identity)
     new_indices = []
     new_episode_ids = set()
     for i, row in enumerate(local_dataset):
@@ -4544,11 +4916,11 @@ def upload_local_dataset(env_id, max_retries=5, base_wait=1.0, replace=False):
         if not replace:
             try:
                 api = HfApi()
-                hf_repo_id = env_id_to_hf_repo_id(env_id)
+                hf_repo_id = _identity_hf_repo_id(identity)
                 _, _, remote_files = _hf_repo_state(api, hf_repo_id, create=False)
                 remote_format = _remote_storage_format_from_files(remote_files)
                 conflict_message = _remote_storage_conflict_message(
-                    env_id, hf_repo_id, storage_format, remote_format
+                    identity.display_ref, hf_repo_id, storage_format, remote_format
                 )
                 if conflict_message:
                     console.print(f"[{STYLE_FAIL}]{conflict_message}[/]")
@@ -4569,10 +4941,10 @@ def upload_local_dataset(env_id, max_retries=5, base_wait=1.0, replace=False):
             f"[{STYLE_INFO}]Uploading {n_new_episodes} new episodes ({len(new_indices)} frames)...[/]"
         )
     local_ok = _upload_dataset_shard_to_hub(
-        env_id,
+        identity,
         new_dataset,
         storage_format=storage_format,
-        local_root=get_local_dataset_path(env_id),
+        local_root=get_local_dataset_path(identity),
         episode_ids=new_episode_ids,
         replace=replace,
         include_previews=True,
@@ -4582,8 +4954,9 @@ def upload_local_dataset(env_id, max_retries=5, base_wait=1.0, replace=False):
     return pending_ok and local_ok
 
 
-def minari_export(env_id, dataset_name=None, author=None):
+def minari_export(recording_identity, dataset_name=None, author=None):
     """Export a local HF dataset to Minari format for offline RL."""
+    identity = _coerce_recording_identity(recording_identity)
     try:
         import minari
         from minari.data_collector import EpisodeBuffer
@@ -4595,10 +4968,16 @@ def minari_export(env_id, dataset_name=None, author=None):
         console.print(f"Repository development: [{STYLE_CMD}]uv sync --extra minari[/]")
         return False
 
-    dataset = load_local_dataset(env_id)
+    dataset = load_local_dataset(identity)
     if dataset is None:
-        console.print(f"[{STYLE_FAIL}]No local dataset found for {env_id}[/]")
-        console.print(f"  Expected at: [{STYLE_PATH}]{get_local_dataset_path(env_id)}[/]")
+        console.print(f"[{STYLE_FAIL}]No local dataset found for {identity.display_ref}[/]")
+        console.print(f"  Expected at: [{STYLE_PATH}]{get_local_dataset_path(identity)}[/]")
+        return False
+    env_id = _recording_env_id(identity, dataset=dataset)
+    if not env_id:
+        console.print(
+            f"[{STYLE_FAIL}]Could not determine the environment for {identity.display_ref}.[/]"
+        )
         return False
 
     episode_keys, row_indices_by_episode = _ordered_episode_rows(dataset)
@@ -4731,6 +5110,18 @@ def _capture_env_metadata(env):
     }
     if env_make_kwargs:
         metadata["env_make_kwargs"] = env_make_kwargs
+    policy_bundle = getattr(env, "_gymrec_policy_bundle", None)
+    if isinstance(policy_bundle, dict):
+        metadata.update(
+            {
+                "policy_source_repo": policy_bundle.get("repo_id"),
+                "policy_source_revision": policy_bundle.get("revision"),
+                "policy_recipe_sha256": policy_bundle.get("recipe_sha256"),
+                "policy_checkpoint_sha256": policy_bundle.get("checkpoint_sha256"),
+                "policy_recipe_format_version": policy_bundle.get("recipe_format_version"),
+                "policy_model_format_version": policy_bundle.get("model_format_version"),
+            }
+        )
 
     # Action space info
     action_space = env.action_space
@@ -4789,8 +5180,8 @@ def _capture_env_metadata(env):
         metadata.setdefault("sticky_actions", 0.0)
         metadata["nes_button_order"] = list(NES_BUTTON_ORDER)
         metadata["action_encoding"] = NES_ACTION_ENCODING
-        metadata["frame_stack"] = 1
-        metadata["noop_reset_max"] = 0
+        metadata["frame_stack"] = int(env_make_kwargs.get("frame_stack", 1))
+        metadata["noop_reset_max"] = int(env_make_kwargs.get("noop_reset_max", 0))
 
     # ALE-specific: check unwrapped for sticky actions
     unwrapped = getattr(env, "unwrapped", None)
@@ -4885,9 +5276,15 @@ def _dataset_card_environment_lines(metadata, backend):
     if metadata.get("action_encoding"):
         lines.append(f"| Action Encoding | {metadata['action_encoding']} |")
     if metadata.get("nes_button_order"):
-        lines.append(
-            f"| NES Button Order | `{json.dumps(metadata['nes_button_order'])}` |"
-        )
+        lines.append(f"| NES Button Order | `{json.dumps(metadata['nes_button_order'])}` |")
+    if metadata.get("policy_source_repo"):
+        lines.append(f"| Policy Source | `{metadata['policy_source_repo']}` |")
+    if metadata.get("policy_source_revision"):
+        lines.append(f"| Policy Revision | `{metadata['policy_source_revision']}` |")
+    if metadata.get("policy_recipe_sha256"):
+        lines.append(f"| Policy Recipe SHA-256 | `{metadata['policy_recipe_sha256']}` |")
+    if metadata.get("policy_checkpoint_sha256"):
+        lines.append(f"| Policy Checkpoint SHA-256 | `{metadata['policy_checkpoint_sha256']}` |")
 
     for key, label in (
         ("frameskip", "Frameskip"),
@@ -4911,7 +5308,7 @@ def _dataset_card_environment_lines(metadata, backend):
         rmin, rmax = metadata["reward_range"]
         lines.append(f"| Reward Range | [{rmin}, {rmax}] |")
 
-    if backend in {"stable-retro", "supermariobrosnes-turbo"}:
+    if backend in {"stable-retro", "stable-retro-turbo", "supermariobrosnes-turbo"}:
         if metadata.get("retro_platform"):
             lines.append(f"| Platform | {metadata['retro_platform']} |")
         if metadata.get("retro_game"):
@@ -5027,6 +5424,9 @@ def render_dataset_card_content(
             '- **collector** (`string`): Who collected the data (`"human"`, `"random"`, or future agent names)',
             '- **gymrec_version** (`string`): Version of gymrec used to record (e.g. `"0.1.0+abc1234"`)',
             "- **storage_format** (`string`): Observation storage backend (`images` or `lossless-video`)",
+            "- **policy_source_repo** / **policy_source_revision** (`string` or `null`): Hugging Face policy bundle identity for agent-collected rows",
+            "- **policy_recipe_sha256** / **policy_checkpoint_sha256** (`string` or `null`): Validated rlab bundle content hashes",
+            "- **policy_recipe_format_version** / **policy_model_format_version** (`int` or `null`): Consumed rlab document versions",
             "",
             "## Usage",
             "",
@@ -5065,7 +5465,14 @@ def _read_existing_dataset_card_counts(repo_id):
         return 0, 0
 
 
-def _build_dataset_card_content(env_id, repo_id, new_frames, new_episodes, repo_exists):
+def _build_dataset_card_content(
+    recording_identity,
+    env_id,
+    repo_id,
+    new_frames,
+    new_episodes,
+    repo_exists,
+):
     """Build dataset card content string for an append-only upload.
 
     If the repo exists, downloads the current README and parses existing frame/episode
@@ -5080,7 +5487,7 @@ def _build_dataset_card_content(env_id, repo_id, new_frames, new_episodes, repo_
         total_frames += existing_frames
         total_episodes += existing_episodes
 
-    metadata = load_local_metadata(env_id)
+    metadata = load_local_metadata(recording_identity)
     collectors, gymrec_versions = _provenance_from_metadata(metadata)
     return render_dataset_card_content(
         env_id,
@@ -5103,8 +5510,7 @@ def _warn_unsupported_env_kwargs(env_id, kwargs):
         return
     keys = ", ".join(sorted(kwargs))
     console.print(
-        f"[yellow]Warning:[/] {env_id} does not accept env kwargs ({keys}); "
-        "using backend defaults."
+        f"[yellow]Warning:[/] {env_id} does not accept env kwargs ({keys}); using backend defaults."
     )
 
 
@@ -5181,7 +5587,7 @@ def _vector_info_to_lane_info(vector_info):
 
 
 class SuperMarioBrosNesTurboEnvAdapter(gym.Env):
-    """Expose a one-lane SMB turbo VectorEnv as an ordinary Gymnasium Env."""
+    """Expose a one-lane native Retro VectorEnv as an ordinary Gymnasium Env."""
 
     def __init__(self, vector_env):
         _lazy_init()
@@ -5193,8 +5599,8 @@ class SuperMarioBrosNesTurboEnvAdapter(gym.Env):
         self.metadata = dict(getattr(vector_env, "metadata", {}) or {})
         self.render_mode = getattr(vector_env, "render_mode", "rgb_array")
         self.autoreset_mode = getattr(vector_env, "autoreset_mode", None)
-        self.system = "Nes"
-        self.buttons = list(NES_BUTTON_ORDER)
+        self.system = getattr(vector_env, "system", "Nes")
+        self.buttons = list(getattr(vector_env, "buttons", NES_BUTTON_ORDER))
         self._needs_reset = True
 
     def reset(self, *, seed=None, options=None):
@@ -5206,14 +5612,21 @@ class SuperMarioBrosNesTurboEnvAdapter(gym.Env):
     def step(self, action):
         if self._needs_reset:
             raise RuntimeError("reset() must be called before step() or after a terminal step")
-        action = np.asarray(action, dtype=self.action_space.dtype)
-        if action.shape != self.action_space.shape or not self.action_space.contains(action):
-            raise ValueError(
-                f"Expected a Stable-Retro-compatible NES action with shape "
-                f"{self.action_space.shape}; got {action.shape}"
-            )
+        if isinstance(self.action_space, gym.spaces.Discrete):
+            action = int(np.asarray(action).reshape(-1)[0])
+            if not self.action_space.contains(action):
+                raise ValueError(f"Expected action in {self.action_space}; got {action}")
+            batched_action = np.asarray([action], dtype=self.action_space.dtype)
+        else:
+            action = np.asarray(action, dtype=self.action_space.dtype)
+            if action.shape != self.action_space.shape or not self.action_space.contains(action):
+                raise ValueError(
+                    f"Expected a Stable-Retro-compatible action with shape "
+                    f"{self.action_space.shape}; got {action.shape}"
+                )
+            batched_action = action[np.newaxis, ...]
         observations, rewards, terminations, truncations, infos = self.vector_env.step(
-            action[np.newaxis, ...]
+            batched_action
         )
         terminated = bool(terminations[0])
         truncated = bool(truncations[0])
@@ -5232,6 +5645,237 @@ class SuperMarioBrosNesTurboEnvAdapter(gym.Env):
 
     def close(self):
         self.vector_env.close()
+
+
+class MarioRecipeTaskEnv(gym.Wrapper):
+    """Apply the declarative rlab Mario reward and episode contract to one lane."""
+
+    def __init__(self, env, task):
+        super().__init__(env)
+        self.task = task
+        self.signals = task.get("signals") or {}
+        self.events = task.get("events") or {}
+        self.termination = task.get("termination") or {}
+        self.reward_config = task.get("reward") or {}
+        self._validate_contract()
+        self._gymrec_policy_observations = bool(getattr(env, "_gymrec_policy_observations", False))
+        self._episode_steps = 0
+        self._last_progress_step = 0
+
+    def _validate_contract(self):
+        expected_events = {
+            "life_loss": ("lives", "decrease"),
+            "level_change": ("level", "change"),
+            "stalled": ("x", "unchanged_for"),
+        }
+        unknown = sorted(set(self.events) - set(expected_events))
+        if unknown:
+            raise ValueError(f"Unsupported Mario recipe event(s): {', '.join(unknown)}")
+        for name, expected in expected_events.items():
+            if name not in self.events:
+                continue
+            rule = self.events[name]
+            actual = (rule.get("signal"), rule.get("operation"))
+            if actual != expected:
+                raise ValueError(
+                    f"Mario recipe event {name!r} requires signal={expected[0]!r}, "
+                    f"operation={expected[1]!r}"
+                )
+        reward_mode = self.reward_config.get("reward_mode", "native")
+        if reward_mode not in {"native", "bounded", "baseline", "score", "additive"}:
+            raise ValueError(f"Unsupported Mario recipe reward mode {reward_mode!r}")
+
+    @staticmethod
+    def _signal(info, source, *, pair=False):
+        names = (source,) if isinstance(source, str) else tuple(source)
+        try:
+            values = tuple(int(info[name]) for name in names)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Mario recipe signal {source!r} is absent from provider info"
+            ) from exc
+        if pair:
+            if len(values) != 2:
+                raise ValueError(f"Mario recipe pair signal {source!r} must contain two fields")
+            return values
+        if len(values) == 1:
+            return values[0]
+        if len(values) == 2:
+            return values[0] * 256 + values[1]
+        raise ValueError(f"Mario recipe signal {source!r} has unsupported width {len(values)}")
+
+    def _read_state(self, info):
+        return {
+            "x": self._signal(info, self.signals.get("x", ("xscrollHi", "xscrollLo"))),
+            "score": self._signal(info, self.signals.get("score", "score")),
+            "lives": self._signal(info, self.signals.get("lives", "lives")),
+            "level": self._signal(
+                info, self.signals.get("level", ("levelHi", "levelLo")), pair=True
+            ),
+        }
+
+    def reset(self, *, seed=None, options=None):
+        observation, info = self.env.reset(seed=seed, options=options)
+        state = self._read_state(info)
+        self._x = state["x"]
+        self._level_max_x = state["x"]
+        self._completed_level_base = 0
+        self._max_global_x = state["x"]
+        self._score = state["score"]
+        self._lives = state["lives"]
+        self._level = state["level"]
+        self._episode_steps = 0
+        self._last_progress_step = 0
+        return observation, info
+
+    def step(self, action):
+        observation, native_reward, provider_terminated, provider_truncated, info = self.env.step(
+            action
+        )
+        info = dict(info)
+        state = self._read_state(info)
+        lost_life = state["lives"] < self._lives
+        changed_level = state["level"] != self._level
+        completed = changed_level and not lost_life
+
+        if completed:
+            self._completed_level_base += self._level_max_x
+            self._level_max_x = 0
+        effective_x = 0 if changed_level else state["x"]
+        self._level_max_x = max(self._level_max_x, effective_x)
+        global_x = self._completed_level_base + effective_x
+        global_max_x = self._completed_level_base + self._level_max_x
+        progress_delta = max(global_max_x - self._max_global_x, 0)
+        self._max_global_x = max(self._max_global_x, global_max_x)
+        score_delta = max(state["score"] - self._score, 0)
+
+        no_progress_min_delta = int(self.termination.get("no_progress_min_delta", 0))
+        if progress_delta > no_progress_min_delta:
+            self._last_progress_step = self._episode_steps
+        self._episode_steps += 1
+        stalled_rule = self.events.get("stalled") or {}
+        stalled_steps = int(stalled_rule.get("steps", 0))
+        stalled = bool(
+            stalled_steps > 0 and self._episode_steps - self._last_progress_step >= stalled_steps
+        )
+
+        failure_events = set(self.termination.get("failure") or ())
+        success_events = set(self.termination.get("success") or ())
+        task_terminated = (
+            (lost_life and "life_loss" in failure_events)
+            or (completed and "level_change" in success_events)
+            or (stalled and "stalled" in failure_events)
+        )
+        max_episode_steps = int(self.termination.get("max_episode_steps", 0))
+        task_truncated = (stalled and "stalled" not in failure_events) or (
+            max_episode_steps > 0 and self._episode_steps >= max_episode_steps
+        )
+        if task_terminated:
+            task_truncated = False
+
+        terminated = bool(provider_terminated or task_terminated)
+        truncated = bool((provider_truncated or task_truncated) and not terminated)
+        reward = self._shape_reward(
+            float(native_reward),
+            progress_delta=progress_delta,
+            score_delta=score_delta,
+            completed=completed,
+            lost_life=lost_life,
+            done=terminated or truncated,
+        )
+
+        emitted_events = []
+        if lost_life and "life_loss" in self.events:
+            emitted_events.append("life_loss")
+        if changed_level and "level_change" in self.events:
+            emitted_events.append("level_change")
+        if stalled and "stalled" in self.events:
+            emitted_events.append("stalled")
+        outcome = "neutral"
+        if truncated:
+            outcome = "timeout"
+        if completed and not lost_life:
+            outcome = "success"
+        if (
+            lost_life
+            or (stalled and "stalled" in failure_events)
+            or (provider_terminated and not completed)
+        ):
+            outcome = "failure"
+        info.update(
+            {
+                "task_events": emitted_events,
+                "task_outcome": outcome,
+                "level_complete": completed,
+                "life_loss": lost_life,
+                "progress_delta": progress_delta,
+                "score_delta": score_delta,
+                "global_x_pos": global_x,
+                "global_max_x_pos": self._max_global_x,
+                "native_reward": float(native_reward),
+                "shaped_reward": reward,
+            }
+        )
+
+        self._x = effective_x
+        self._score = state["score"]
+        self._lives = state["lives"]
+        self._level = state["level"]
+        return observation, reward, terminated, truncated, info
+
+    def _shape_reward(
+        self,
+        native_reward,
+        *,
+        progress_delta,
+        score_delta,
+        completed,
+        lost_life,
+        done,
+    ):
+        config = self.reward_config
+        mode = str(config.get("reward_mode", "native"))
+        reward_scale = float(config.get("reward_scale", 10.0)) or 1.0
+        terminal_reward = float(config.get("terminal_reward", 50.0))
+        progress_cap = float(config.get("progress_reward_cap", 30.0))
+        capped_progress = min(float(progress_delta), progress_cap)
+        if mode == "native":
+            shaped = native_reward
+        elif mode == "bounded":
+            raw = (
+                terminal_reward if completed else -terminal_reward if lost_life else capped_progress
+            )
+            shaped = raw / reward_scale
+        elif mode == "baseline":
+            raw = native_reward + float(score_delta) / 40.0
+            if completed:
+                raw += terminal_reward
+            elif done:
+                raw -= terminal_reward
+            shaped = raw / reward_scale
+        else:
+            native_component = native_reward if config.get("use_native_reward", False) else 0.0
+            if mode == "score":
+                progress = (
+                    capped_progress
+                    if config.get("score_progress_clipped", False)
+                    else float(progress_delta)
+                )
+                score_component = 0.01 * float(score_delta)
+            else:
+                progress = float(progress_delta)
+                score_component = 0.0
+            shaped = (
+                native_component
+                + float(config.get("progress_reward_scale", 1.0)) * progress
+                + score_component
+                + (float(config.get("completion_reward", 0.0)) if completed else 0.0)
+                - (float(config.get("death_penalty", 25.0)) if lost_life else 0.0)
+            )
+        shaped -= float(config.get("time_penalty", 0.0))
+        if config.get("clip_rewards", False):
+            shaped = 1.0 if shaped > 0 else -1.0 if shaped < 0 else 0.0
+        return float(shaped)
 
 
 def _create_env__stableretro(env_id, state=None, env_make_kwargs=None):
@@ -5266,9 +5910,7 @@ def _create_env__stableretro(env_id, state=None, env_make_kwargs=None):
     env._gymrec_backend = "stable-retro"
     env._gymrec_stable_retro_state = state
     env._gymrec_state_name = state
-    env._gymrec_nes_controller = (
-        getattr(getattr(env, "unwrapped", None), "system", None) == "Nes"
-    )
+    env._gymrec_nes_controller = getattr(getattr(env, "unwrapped", None), "system", None) == "Nes"
     try:
         rom_path = retro.data.get_romfile_path(env_id, retro.data.Integrations.ALL)
         env._gymrec_rom_sha256 = _sha256_file(rom_path)
@@ -5280,41 +5922,93 @@ def _create_env__stableretro(env_id, state=None, env_make_kwargs=None):
 def _create_env__supermariobrosnes_turbo(env_id, state=None, env_make_kwargs=None):
     if env_id != SUPERMARIOBROS_NES_ENV_ID:
         raise ValueError(
-            "The supermariobrosnes-turbo backend only supports "
-            f"{SUPERMARIOBROS_NES_ENV_ID}."
+            f"The supermariobrosnes-turbo backend only supports {SUPERMARIOBROS_NES_ENV_ID}."
         )
 
     from supermariobrosnes_turbo import Actions, SuperMarioBrosNesTurboVecEnv
 
-    rom_path = resolve_supermariobrosnes_rom_path()
     state = state or "Level1-1"
     optional_kwargs = dict(env_make_kwargs or {})
-    frame_skip = max(int(optional_kwargs.get("frame_skip", 1)), 1)
-    sticky_action_prob = float(optional_kwargs.get("sticky_action_prob", 0.0))
+    rom_path = optional_kwargs.get("rom_path") or resolve_supermariobrosnes_rom_path()
+    optional_kwargs.update(
+        {
+            "num_envs": 1,
+            "rom_path": rom_path,
+            "state": state,
+        }
+    )
+    optional_kwargs.setdefault("num_threads", 1)
+    optional_kwargs.setdefault("render_mode", "rgb_array")
+    optional_kwargs.setdefault("use_restricted_actions", Actions.ALL)
+    optional_kwargs.setdefault("obs_layout", "hwc")
+    optional_kwargs.setdefault("frame_stack", 1)
+    optional_kwargs.setdefault("frame_skip", 1)
+    optional_kwargs.setdefault("sticky_action_prob", 0.0)
+    optional_kwargs.setdefault("noop_reset_max", 0)
+    optional_kwargs.setdefault("info_filter", "all")
     vector_env = SuperMarioBrosNesTurboVecEnv(
         SUPERMARIOBROS_NES_ENV_ID,
-        num_envs=1,
-        num_threads=1,
-        render_mode="rgb_array",
-        use_restricted_actions=Actions.ALL,
-        rom_path=rom_path,
-        state=state,
-        obs_layout="hwc",
-        frame_stack=1,
-        frame_skip=frame_skip,
-        sticky_action_prob=sticky_action_prob,
-        noop_reset_max=0,
-        info_filter="all",
+        **optional_kwargs,
     )
     env = SuperMarioBrosNesTurboEnvAdapter(vector_env)
     env._gymrec_backend = "supermariobrosnes-turbo"
     env._gymrec_nes_controller = True
     env._gymrec_state_name = state
     env._gymrec_rom_sha256 = SUPERMARIOBROS_NES_ROM_SHA256
+    env._gymrec_policy_observations = bool(
+        optional_kwargs.get("obs_grayscale")
+        or int(optional_kwargs.get("frame_stack", 1)) > 1
+        or optional_kwargs.get("obs_resize") is not None
+        or optional_kwargs.get("obs_crop") is not None
+        or optional_kwargs.get("obs_layout") != "hwc"
+    )
     env._gymrec_make_kwargs = {
-        "frame_skip": frame_skip,
-        "sticky_action_prob": sticky_action_prob,
+        key: value
+        for key, value in optional_kwargs.items()
+        if key not in {"num_envs", "rom_path", "state"}
     }
+    return env
+
+
+def _create_env__stable_retro_turbo(env_id, state=None, env_make_kwargs=None):
+    """Create the one-lane native RetroVecEnv declared by an rlab recipe."""
+    _ensure_stableretro_roms_path_imported()
+    import stable_retro as retro
+
+    optional_kwargs = dict(env_make_kwargs or {})
+    optional_kwargs.update({"num_envs": 1, "state": state or retro.State.DEFAULT})
+    optional_kwargs.setdefault("num_threads", 1)
+    optional_kwargs.setdefault("render_mode", "rgb_array")
+    optional_kwargs.setdefault("use_restricted_actions", retro.Actions.ALL)
+    optional_kwargs.setdefault("obs_layout", "hwc")
+    optional_kwargs.setdefault("frame_stack", 1)
+    optional_kwargs.setdefault("frame_skip", 1)
+    optional_kwargs.setdefault("sticky_action_prob", 0.0)
+    optional_kwargs.setdefault("noop_reset_max", 0)
+    optional_kwargs.setdefault("info_filter", "all")
+    vector_env = retro.RetroVecEnv(env_id, **optional_kwargs)
+    env = SuperMarioBrosNesTurboEnvAdapter(vector_env)
+    env._stable_retro = True
+    env._gymrec_backend = "stable-retro-turbo"
+    env._gymrec_state_name = state
+    env._gymrec_nes_controller = getattr(env, "system", None) == "Nes"
+    env._gymrec_policy_observations = bool(
+        optional_kwargs.get("obs_grayscale")
+        or int(optional_kwargs.get("frame_stack", 1)) > 1
+        or optional_kwargs.get("obs_resize") is not None
+        or optional_kwargs.get("obs_crop") is not None
+        or optional_kwargs.get("obs_layout") != "hwc"
+    )
+    env._gymrec_make_kwargs = {
+        key: value
+        for key, value in optional_kwargs.items()
+        if key not in {"num_envs", "rom_path", "state"}
+    }
+    try:
+        rom_path = retro.data.get_romfile_path(env_id, retro.data.Integrations.ALL)
+        env._gymrec_rom_sha256 = _sha256_file(rom_path)
+    except (FileNotFoundError, OSError, AttributeError):
+        pass
     return env
 
 
@@ -5382,6 +6076,7 @@ def create_env(
     backend=None,
     human_recording=False,
     metadata=None,
+    env_make_kwargs=None,
 ):
     """Create a Gymnasium environment with the appropriate backend."""
 
@@ -5389,17 +6084,34 @@ def create_env(
         stable_retro_envs = set(_get_stableretro_envs())
         backend = classify_env_id(env_id, stable_retro_envs=stable_retro_envs)
     backend = resolve_runtime_backend(env_id, requested=backend, metadata=metadata)
-    if human_recording:
-        env_make_kwargs = _human_record_env_make_kwargs(backend)
+    if env_make_kwargs is None:
+        if human_recording:
+            env_make_kwargs = _human_record_env_make_kwargs(backend)
+        else:
+            env_make_kwargs = _env_make_kwargs_from_metadata(env_id, metadata, backend=backend)
     else:
-        env_make_kwargs = _env_make_kwargs_from_metadata(env_id, metadata, backend=backend)
-    if backend in {"stable-retro", "supermariobrosnes-turbo"} and stable_retro_state is None:
+        env_make_kwargs = dict(env_make_kwargs)
+    if (
+        backend
+        in {
+            "stable-retro",
+            "stable-retro-turbo",
+            "supermariobrosnes-turbo",
+        }
+        and stable_retro_state is None
+    ):
         stable_retro_state = _stable_retro_state_from_metadata(metadata)
     if env_id == SUPERMARIOBROS_NES_ENV_ID and stable_retro_state is None:
         stable_retro_state = "Level1-1"
 
     if backend == "stable-retro":
         env = _create_env__stableretro(
+            env_id,
+            state=stable_retro_state,
+            env_make_kwargs=env_make_kwargs,
+        )
+    elif backend == "stable-retro-turbo":
+        env = _create_env__stable_retro_turbo(
             env_id,
             state=stable_retro_state,
             env_make_kwargs=env_make_kwargs,
@@ -5629,12 +6341,16 @@ def _terminal_menu_supported() -> bool:
 
 
 def _select_environment_text_fallback(entries, env_id_map, title: str) -> str:
-    selectable = [(entry, env_id) for entry, env_id in zip(entries, env_id_map, strict=False) if env_id]
+    selectable = [
+        (entry, env_id) for entry, env_id in zip(entries, env_id_map, strict=False) if env_id
+    ]
     if not selectable:
         console.print(f"[{STYLE_FAIL}]No environments found.[/]")
         raise SystemExit(1)
 
-    console.print(f"[bold]{title.strip()}[/]: [{STYLE_INFO}]{len(selectable)}[/] environments available")
+    console.print(
+        f"[bold]{title.strip()}[/]: [{STYLE_INFO}]{len(selectable)}[/] environments available"
+    )
     console.print(
         "[dim]Terminal menu is unavailable here. Type part of a name to search, or paste an exact env id.[/]"
     )
@@ -5696,12 +6412,11 @@ def select_environment_interactive(available_recordings_only: bool = False) -> s
 
     status_bar = "  ↑↓ navigate · / search · Enter select · Esc cancel"
     if available_recordings_only:
-        # Get envs with available recordings
-        local_envs = _get_available_envs_from_local()
-        hf_envs = _get_available_envs_from_hf()
-        all_recorded_envs = sorted(set(local_envs + hf_envs))
+        local_refs = _get_available_recording_refs_from_local()
+        hf_refs = _get_available_recording_refs_from_hf()
+        all_recording_refs = sorted(set(local_refs + hf_refs))
 
-        if not all_recorded_envs:
+        if not all_recording_refs:
             console.print(
                 f"[{STYLE_FAIL}]No recordings found.[/]\n"
                 f"  Local path: [{STYLE_PATH}]{CONFIG['storage']['local_dir']}[/]\n"
@@ -5709,12 +6424,20 @@ def select_environment_interactive(available_recordings_only: bool = False) -> s
             )
             raise SystemExit(1)
 
-        # Group by platform
-        atari_envs = [e for e in all_recorded_envs if _get_env_platform(e) == "Atari"]
-        retro_envs = [e for e in all_recorded_envs if _get_env_platform(e) == "Stable-Retro"]
-        vizdoom_envs = [e for e in all_recorded_envs if _get_env_platform(e) == "VizDoom"]
+        repo_refs = [ref for ref in all_recording_refs if ref.startswith(HUGGINGFACE_MODEL_SCHEME)]
+        env_refs = [
+            ref for ref in all_recording_refs if not ref.startswith(HUGGINGFACE_MODEL_SCHEME)
+        ]
+        atari_envs = [e for e in env_refs if _get_env_platform(e) == "Atari"]
+        retro_envs = [e for e in env_refs if _get_env_platform(e) == "Stable-Retro"]
+        vizdoom_envs = [e for e in env_refs if _get_env_platform(e) == "VizDoom"]
         entries, env_id_map = _build_environment_menu_entries(
-            (("Atari", atari_envs), ("Stable-Retro", retro_envs), ("VizDoom", vizdoom_envs))
+            (
+                ("HF Policy Dataset", repo_refs),
+                ("Atari", atari_envs),
+                ("Stable-Retro", retro_envs),
+                ("VizDoom", vizdoom_envs),
+            )
         )
         title = "  Select Recording\n"
     else:
@@ -5987,7 +6710,10 @@ def _add_env_id_arg(parser):
         type=str,
         nargs="?",
         default=None,
-        help="Gymnasium environment id, or a Hugging Face model ref for record (e.g. BreakoutNoFrameskip-v4 or hf://owner/repo)",
+        help=(
+            "Gymnasium environment id, or an hf://owner/repo model ref for record and "
+            "dataset ref for upload/playback/video/export"
+        ),
     )
 
 
@@ -6140,10 +6866,19 @@ async def main():
         help="Observation storage backend: images or lossless-video (default: config.toml)",
     )
     parser_record.add_argument(
+        "--dataset-repo",
+        type=str,
+        default=None,
+        help=(
+            "Hugging Face dataset target for policy recordings (owner/repo or "
+            "hf://owner/repo; default: the source policy repo name)"
+        ),
+    )
+    parser_record.add_argument(
         "--hf-file",
         type=str,
         default=None,
-        help="Checkpoint filename in a Hugging Face model repo (needed only if multiple .zip files exist)",
+        help="Assert the checkpoint filename selected by the model repo's model.json",
     )
     parser_record.add_argument(
         "--hf-revision",
@@ -6161,15 +6896,16 @@ async def main():
     hf_policy_mode.add_argument(
         "--deterministic",
         action="store_true",
-        default=False,
-        help="Use deterministic argmax SB3 actions for Hugging Face model refs (default: stochastic sampling)",
+        default=None,
+        help="Override recipe.json and use deterministic argmax SB3 actions",
     )
     hf_policy_mode.add_argument(
         "--stochastic",
         action="store_false",
         dest="deterministic",
-        help=argparse.SUPPRESS,
+        help="Override recipe.json and sample stochastic SB3 actions",
     )
+    parser_record.set_defaults(deterministic=None)
 
     parser_playback = subparsers.add_parser("playback", help="Replay a dataset")
     _add_roms_path_arg(parser_playback, default=argparse.SUPPRESS)
@@ -6276,6 +7012,7 @@ async def main():
             ("episodes", None),
             ("max_steps", None),
             ("storage", None),
+            ("dataset_repo", None),
             ("hf_file", None),
             ("hf_revision", None),
             ("device", "auto"),
@@ -6304,6 +7041,7 @@ async def main():
 
     env_id = args.env_id
     hf_policy_source = None
+    recording_identity = None
 
     if env_id is None:
         if args.command in ("playback", "video"):
@@ -6326,26 +7064,50 @@ async def main():
             filename=getattr(args, "hf_file", None),
             revision=getattr(args, "hf_revision", None),
             device=getattr(args, "device", "auto"),
-            deterministic=bool(getattr(args, "deterministic", False)),
+            deterministic=getattr(args, "deterministic", None),
         )
         env_id = hf_policy_source.env_id
+        try:
+            dataset_repo_id = normalize_dataset_repo_id(
+                getattr(args, "dataset_repo", None) or hf_policy_source.repo_id
+            )
+        except ValueError as exc:
+            console.print(f"[{STYLE_FAIL}]Error: {exc}[/]")
+            return
+        recording_identity = _policy_recording_identity(
+            hf_policy_source,
+            dataset_repo=dataset_repo_id,
+        )
         args.env_id = env_id
         args.agent = "hf"
         console.print(
             f"[{STYLE_INFO}]Resolved policy {hf_policy_source.collector} -> "
-            f"{env_id}"
+            f"{hf_policy_source.provider}:{env_id}"
             f"{' state=' + hf_policy_source.state if hf_policy_source.state else ''}, "
             f"action_set={hf_policy_source.action_set}, "
             f"frame_skip={hf_policy_source.frame_skip}, "
-            f"mode={'deterministic' if hf_policy_source.deterministic else 'stochastic'}[/]"
+            f"mode={'deterministic' if hf_policy_source.deterministic else 'stochastic'}, "
+            f"dataset={recording_identity.display_ref}[/]"
         )
+    else:
+        if args.command == "record" and getattr(args, "dataset_repo", None):
+            console.print(
+                f"[{STYLE_FAIL}]Error: --dataset-repo is only valid when recording "
+                "a Hugging Face policy ref.[/]"
+            )
+            return
+        try:
+            recording_identity = _coerce_recording_identity(env_id)
+        except ValueError as exc:
+            console.print(f"[{STYLE_FAIL}]Error: {exc}[/]")
+            return
 
     if args.command == "upload":
-        upload_local_dataset(env_id, replace=args.replace)
+        upload_local_dataset(recording_identity, replace=args.replace)
         return
 
     if args.command == "minari-export":
-        minari_export(env_id, dataset_name=args.name, author=args.author)
+        minari_export(recording_identity, dataset_name=args.name, author=args.author)
         return
 
     if hasattr(args, "scale") and args.scale is not None:
@@ -6360,31 +7122,60 @@ async def main():
         if plan_error:
             console.print(f"[{STYLE_FAIL}]Error: {plan_error}[/]")
             return
-        if record_plan.upload_live and not preflight_live_upload(env_id, storage_format):
+        if record_plan.upload_live and not preflight_live_upload(
+            recording_identity, storage_format
+        ):
             return
 
-    playback_metadata = load_local_metadata(env_id) if args.command == "playback" else None
+    playback_metadata = None
     loaded_dataset = None
     playback_source = None
     recorded_backend = None
-    if args.command == "playback":
-        loaded_dataset, playback_source = load_recorded_dataset(env_id)
+    if args.command in ("playback", "video"):
+        loaded_dataset, playback_source = load_recorded_dataset(recording_identity)
         if loaded_dataset is None:
-            _print_missing_dataset(env_id)
+            _print_missing_dataset(recording_identity)
             return
         dataset_metadata = _environment_metadata_from_dataset(loaded_dataset)
-        playback_metadata = {**dataset_metadata, **(playback_metadata or {})}
+        local_metadata = load_local_metadata(recording_identity) or {}
+        playback_metadata = {**dataset_metadata, **local_metadata}
+        env_id = _recording_env_id(
+            recording_identity,
+            dataset=loaded_dataset,
+            metadata=playback_metadata,
+        )
+        if not env_id:
+            console.print(
+                f"[{STYLE_FAIL}]Error: Could not determine the environment for "
+                f"{recording_identity.display_ref}.[/]"
+            )
+            return
+        recording_identity = recording_identity.with_env_id(env_id)
         recorded_backend = _capture_backend_from_dataset(loaded_dataset)
 
     env = None
     fps = args.fps
     if args.command == "playback" or args.command == "record":
         try:
-            selected_backend = resolve_runtime_backend(
-                env_id,
-                requested=getattr(args, "backend", None),
-                metadata=playback_metadata,
-                recorded_backend=recorded_backend,
+            requested_backend = getattr(args, "backend", None)
+            if (
+                hf_policy_source is not None
+                and requested_backend is not None
+                and requested_backend != hf_policy_source.backend
+            ):
+                raise ValueError(
+                    f"The policy recipe requires backend {hf_policy_source.backend!r}; "
+                    f"--backend {requested_backend!r} would change its environment contract."
+                )
+            selected_backend = (
+                hf_policy_source.backend
+                if hf_policy_source is not None
+                else resolve_runtime_backend(
+                    env_id,
+                    requested=requested_backend,
+                    metadata=playback_metadata,
+                    recorded_backend=recorded_backend,
+                )
             )
             env = create_env(
                 env_id,
@@ -6392,7 +7183,33 @@ async def main():
                 backend=selected_backend,
                 human_recording=bool(record_plan and record_plan.human),
                 metadata=playback_metadata,
+                env_make_kwargs=(
+                    hf_policy_source.env_make_kwargs if hf_policy_source is not None else None
+                ),
             )
+            if hf_policy_source is not None:
+                provider_env = env
+                env = MarioRecipeTaskEnv(provider_env, hf_policy_source.environment["task"])
+                env._env_id = env_id
+                env._gymrec_backend = hf_policy_source.backend
+                env._gymrec_state_name = hf_policy_source.state
+                env._gymrec_policy_observations = True
+                env._gymrec_make_kwargs = dict(
+                    getattr(provider_env, "_gymrec_make_kwargs", {}) or {}
+                )
+                env._gymrec_rom_sha256 = getattr(provider_env, "_gymrec_rom_sha256", None)
+                env._gymrec_nes_controller = bool(
+                    getattr(provider_env, "_gymrec_nes_controller", False)
+                )
+                env._stable_retro = bool(getattr(provider_env, "_stable_retro", False))
+                env._gymrec_policy_bundle = {
+                    "repo_id": hf_policy_source.repo_id,
+                    "revision": hf_policy_source.revision,
+                    "model_format_version": RLAB_MODEL_FORMAT_VERSION,
+                    "recipe_format_version": RLAB_RECIPE_FORMAT_VERSION,
+                    "checkpoint_sha256": hf_policy_source.checkpoint_sha256,
+                    "recipe_sha256": hf_policy_source.recipe_sha256,
+                }
         except (FileNotFoundError, ValueError) as exc:
             console.print(f"[{STYLE_FAIL}]Error: {exc}[/]")
             return
@@ -6402,12 +7219,14 @@ async def main():
             else:
                 fps = get_default_fps(env)
     elif args.command == "video" and fps is None:
-        fps = _get_default_fps_for_env_id(env_id, metadata=load_local_metadata(env_id))
+        fps = _get_default_fps_for_env_id(env_id, metadata=playback_metadata)
 
     if args.command == "record":
         recorder = None
         live_upload_manager = (
-            LiveEpisodeUploadManager(env_id, storage_format) if record_plan.upload_live else None
+            LiveEpisodeUploadManager(recording_identity, storage_format)
+            if record_plan.upload_live
+            else None
         )
 
         if record_plan.human:
@@ -6432,7 +7251,11 @@ async def main():
             )
 
             if hf_policy_source is not None:
-                policy = StableBaselines3Policy(env.action_space, hf_policy_source)
+                policy = StableBaselines3Policy(
+                    env.action_space,
+                    hf_policy_source,
+                    observation_space=env.observation_space,
+                )
             else:
                 policy = create_agent_policy(record_plan.agent, env)
             input_source = AgentInputSource(policy)
@@ -6444,6 +7267,9 @@ async def main():
                 collector=hf_policy_source.collector if hf_policy_source else record_plan.agent,
                 storage_format=storage_format,
                 live_upload_manager=live_upload_manager,
+                initial_seed=(
+                    hf_policy_source.evaluation.get("seed") if hf_policy_source else None
+                ),
             )
 
             total_steps_counter = [0]
@@ -6474,7 +7300,7 @@ async def main():
             if record_plan.upload_live:
                 console.print(
                     f"[{STYLE_INFO}]Live recording finished. Pending retries, if any: "
-                    f"[{STYLE_CMD}]{_gymrec_cmd('upload', env_id)}[/]"
+                    f"[{STYLE_CMD}]{_gymrec_cmd('upload', recording_identity.display_ref)}[/]"
                 )
             return
 
@@ -6483,14 +7309,14 @@ async def main():
                 recorder.close()
             console.print(
                 f"[{STYLE_INFO}]Live recording finished. Pending retries, if any: "
-                f"[{STYLE_CMD}]{_gymrec_cmd('upload', env_id)}[/]"
+                f"[{STYLE_CMD}]{_gymrec_cmd('upload', recording_identity.display_ref)}[/]"
             )
             return
 
         if recorder is not None:
             save_dataset_locally(
                 recorded_dataset,
-                env_id,
+                recording_identity,
                 metadata=recorder._env_metadata,
                 video_artifact_dir=(
                     recorder.temp_dir
@@ -6499,7 +7325,10 @@ async def main():
                 ),
             )
             recorder.close()  # cleanup temp files after dataset is saved
-        console.print(f"To play back: [{STYLE_CMD}]{_gymrec_cmd('playback', env_id)}[/]")
+        console.print(
+            f"To play back: "
+            f"[{STYLE_CMD}]{_gymrec_cmd('playback', recording_identity.display_ref)}[/]"
+        )
 
         if not args.dry_run:
             try:
@@ -6509,13 +7338,15 @@ async def main():
             except EOFError:
                 do_upload = False
             if do_upload:
-                if not upload_local_dataset(env_id):
+                if not upload_local_dataset(recording_identity):
                     console.print(
-                        f"To retry: [{STYLE_CMD}]{_gymrec_cmd('upload', env_id)}[/]"
+                        f"To retry: "
+                        f"[{STYLE_CMD}]{_gymrec_cmd('upload', recording_identity.display_ref)}[/]"
                     )
             else:
                 console.print(
-                    f"To upload later: [{STYLE_CMD}]{_gymrec_cmd('upload', env_id)}[/]"
+                    f"To upload later: "
+                    f"[{STYLE_CMD}]{_gymrec_cmd('upload', recording_identity.display_ref)}[/]"
                 )
     elif args.command == "playback":
         if playback_source == "local":
@@ -6536,21 +7367,13 @@ async def main():
             episodes=playback_episodes,
         )
     elif args.command == "video":
-        loaded_dataset, source = load_recorded_dataset(env_id)
-        if loaded_dataset is None:
-            _print_missing_dataset(env_id)
-            return
         total = len(loaded_dataset)
-        if source == "local":
+        if playback_source == "local":
             console.print(
-                f"[{STYLE_INFO}]Loading local dataset for video export "
-                f"({total} frames)[/]"
+                f"[{STYLE_INFO}]Loading local dataset for video export ({total} frames)[/]"
             )
         else:
-            console.print(
-                f"[{STYLE_INFO}]Loaded dataset from Hugging Face Hub "
-                f"({total} frames)[/]"
-            )
+            console.print(f"[{STYLE_INFO}]Loaded dataset from Hugging Face Hub ({total} frames)[/]")
 
         export_dataset_video(
             env_id,
