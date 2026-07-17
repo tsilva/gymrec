@@ -1,10 +1,11 @@
 import argparse
 import asyncio
+import copy
 import hashlib
 import importlib.metadata
 import json
 import os
-import secrets
+import re
 import shutil
 import subprocess
 import sys
@@ -18,7 +19,8 @@ from dataclasses import dataclass
 from urllib.parse import unquote, urlparse
 
 import gymnasium as gym
-from dotenv import find_dotenv, load_dotenv
+from dotenv import dotenv_values, find_dotenv
+from jinja2 import Environment, FileSystemLoader, StrictUndefined
 from rich.console import Console
 from rich.panel import Panel
 from rich.progress import (
@@ -33,6 +35,15 @@ from rich.progress import (
 from rich.prompt import Confirm, Prompt
 from rich.table import Table
 
+from provider_contract import (
+    SUPPORTED_PROVIDER_IDS,
+    EnvironmentContract,
+    build_environment_document,
+    create_session,
+    discover_providers,
+    validate_environment_document,
+)
+
 console = Console()
 
 STYLE_KEY = "bold cyan"
@@ -44,27 +55,37 @@ STYLE_SUCCESS = "bold green"
 STYLE_FAIL = "bold red"
 STYLE_INFO = "cyan"
 
+
+def _load_environment_files(project_path, cwd_path, environ=None):
+    """Load project and cwd dotenv files without overriding the process environment."""
+    target = os.environ if environ is None else environ
+    process_environment = dict(target)
+    for path in dict.fromkeys((project_path, cwd_path)):
+        if not path or not os.path.isfile(path):
+            continue
+        target.update(
+            {key: value for key, value in dotenv_values(path).items() if value is not None}
+        )
+    target.update(process_environment)
+    return target
+
+
 _project_dotenv = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
-load_dotenv(_project_dotenv, override=False)
-load_dotenv(find_dotenv(usecwd=True), override=True)
+_load_environment_files(_project_dotenv, find_dotenv(usecwd=True))
 
 _initialized = False
-_stableretro_roms_path_imported = set()
 
-HUMAN_RECORD_FRAMESKIP = 1
-HUMAN_RECORD_STICKY_ACTION_PROB = 0.0
 MAX_COMPATIBLE_SEED = 2**32 - 1
+DEFAULT_RECORD_SEED = 0
 
 
 def _get_gymrec_version():
     """Return version string like '0.1.0+abc1234' (or just '0.1.0' if git unavailable)."""
-    pyproject_path = os.path.join(os.path.dirname(__file__), "pyproject.toml")
-    try:
-        with open(pyproject_path, "rb") as f:
-            data = tomllib.load(f)
-        version = data.get("project", {}).get("version", "unknown")
-    except Exception:
-        version = "unknown"
+    version = _installed_package_version("gymrec") or "unknown"
+    project_dir = os.path.dirname(os.path.abspath(__file__))
+    pyproject_path = os.path.join(project_dir, "pyproject.toml")
+    if not os.path.isfile(pyproject_path):
+        return version
 
     try:
         result = subprocess.run(
@@ -72,7 +93,7 @@ def _get_gymrec_version():
             capture_output=True,
             text=True,
             timeout=2,
-            cwd=os.path.dirname(__file__),
+            cwd=project_dir,
         )
         if result.returncode == 0:
             git_hash = result.stdout.strip()
@@ -132,7 +153,7 @@ def _resolve_key(name, key_map):
 
 
 def _load_keymappings(pygame):
-    """Load keymappings from the bundled keymappings.toml file."""
+    """Load provider-neutral keyboard control profiles."""
     key_map = _build_key_name_map(pygame)
     config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "keymappings.toml")
     if not os.path.exists(config_path):
@@ -144,30 +165,22 @@ def _load_keymappings(pygame):
     with open(config_path, "rb") as f:
         config = tomllib.load(f)
 
-    for section in ("atari", "vizdoom", "stable_retro"):
-        if section not in config:
-            raise ValueError(f"keymappings.toml is missing required [{section}] section")
-
-    def parse_key_bindings(section):
-        return {
-            _resolve_key(key_name, key_map): action
-            for key_name, action in config.get(section, {}).items()
-        }
-
     start_key = _resolve_key(config.get("general", {}).get("start_key", "space"), key_map)
-    atari = parse_key_bindings("atari")
-    vizdoom = parse_key_bindings("vizdoom")
-    retro = {
-        console: {_resolve_key(key_name, key_map): action for key_name, action in bindings.items()}
-        for console, bindings in config["stable_retro"].items()
+    profiles = config.get("profiles")
+    if not isinstance(profiles, dict) or not profiles:
+        raise ValueError("keymappings.toml is missing required [profiles.*] sections")
+    parsed = {
+        profile: {
+            _resolve_key(key_name, key_map): str(control_label)
+            for key_name, control_label in bindings.items()
+        }
+        for profile, bindings in profiles.items()
     }
-
-    return start_key, atari, vizdoom, retro
+    return start_key, parsed
 
 
 DEFAULT_CONFIG = {
     "display": {"scale_factor": 2},
-    "fps_defaults": {"atari": 60, "vizdoom": 45, "retro": 90},
     "dataset": {
         "repo_prefix": "gymrec__",
         "license": "mit",
@@ -188,41 +201,10 @@ DEFAULT_CONFIG = {
 
 CONFIG = None
 
-RETRO_PLATFORMS = frozenset(
-    {
-        "Nes",
-        "GameBoy",
-        "Snes",
-        "GbAdvance",
-        "GbColor",
-        "Genesis",
-        "PCEngine",
-        "Saturn",
-        "32x",
-        "Sms",
-        "GameGear",
-        "SCD",
-        "Atari2600",
-    }
-)
-
-BACKEND_LABELS = {
-    "atari": "Atari (ALE-py)",
-    "vizdoom": "VizDoom",
-    "stable-retro": "Stable-Retro",
+PROVIDER_LABELS = {
     "stable-retro-turbo": "Stable-Retro TurboVecEnv",
     "supermariobrosnes-turbo": "SuperMarioBros-Nes-turbo",
 }
-
-SELECTABLE_RUNTIME_BACKENDS = (
-    "stable-retro",
-    "stable-retro-turbo",
-    "supermariobrosnes-turbo",
-)
-SUPERMARIOBROS_NES_ENV_ID = "SuperMarioBros-Nes-v0"
-SUPERMARIOBROS_NES_ROM_SHA256 = "f61548fdf1670cffefcc4f0b7bdcdd9eaba0c226e3b74f8666071496988248de"
-NES_BUTTON_ORDER = ("B", None, "SELECT", "START", "UP", "DOWN", "LEFT", "RIGHT", "A")
-NES_ACTION_ENCODING = "stable-retro-multibinary-9"
 
 HUGGINGFACE_MODEL_SCHEME = "hf://"
 HUGGINGFACE_MODEL_URL_HOST = "huggingface.co"
@@ -242,41 +224,19 @@ STORAGE_FORMAT_LOSSLESS_VIDEO = "lossless-video"
 STORAGE_FORMATS = (STORAGE_FORMAT_IMAGES, STORAGE_FORMAT_LOSSLESS_VIDEO)
 VIDEO_ARTIFACT_DIR = "videos"
 COLLECTOR_ARTIFACT_DIR = "collectors"
+ENVIRONMENT_ARTIFACT_DIR = "environments"
+ENVIRONMENT_DOCUMENT_FILENAME = "environment.json"
 COLLECTION_DOCUMENT_TYPE = "gymrec.collection"
-COLLECTION_FORMAT_VERSION = 1
+COLLECTION_FORMAT_VERSION = 2
+DATASET_FORMAT_VERSION = 2
 PREVIEW_VIDEO_ARTIFACT_DIR = "videos"
 CANONICAL_VIDEO_SUFFIX = ".rgb.mkv.bin"
 PREVIEW_VIDEO_SUFFIX = ".preview.mp4"
+DATASET_REPLAY_FILENAME = "replay.mp4"
 RUNTIME_VIDEO_BASE_COLUMN = "_gymrec_video_base_path"
 RUNTIME_HF_REPO_COLUMN = "_gymrec_hf_repo_id"
 ENVIRONMENT_METADATA_FILENAME = "gymrec-metadata.json"
 _VIDEO_DECODE_CACHE = {}
-
-NES_SIMPLE_ACTION_MASKS = {
-    "noop": (),
-    "right": (7,),
-    "right_b": (7, 0),
-    "right_a": (7, 8),
-    "right_a_b": (7, 8, 0),
-    "a": (8,),
-    "left": (6,),
-}
-
-STABLE_RETRO_DISCRETE_ACTION_SETS = {
-    "SuperMarioBros-Nes-v0": {
-        "simple": ("noop", "right", "right_b", "right_a", "right_a_b", "a", "left"),
-        "right": ("right", "right_b", "right_a", "right_a_b"),
-    }
-}
-
-
-def _is_nes_controller_env(env):
-    """Return whether an environment exposes the shared nine-button NES controller."""
-    if bool(getattr(env, "_gymrec_nes_controller", False)):
-        return True
-    if not bool(getattr(env, "_stable_retro", False)):
-        return False
-    return getattr(getattr(env, "unwrapped", None), "system", None) == "Nes"
 
 
 def _extract_observation_image(observation):
@@ -290,12 +250,20 @@ def _extract_observation_image(observation):
 
 def _normalize_storage_format(value):
     """Normalize and validate a configured storage format."""
-    value = str(value or STORAGE_FORMAT_IMAGES).strip().lower()
+    if value is None or not str(value).strip():
+        raise ValueError("Storage format is required")
+    value = str(value).strip().lower()
     if value not in STORAGE_FORMATS:
         raise ValueError(
             f"Unknown storage format '{value}'. Expected one of: {', '.join(STORAGE_FORMATS)}"
         )
     return value
+
+
+def _configured_storage_format(value=None):
+    """Resolve an explicit storage format or the single configured default."""
+    config = CONFIG or DEFAULT_CONFIG
+    return _normalize_storage_format(config["storage"]["format"] if value is None else value)
 
 
 def _observation_to_rgb_array(observation):
@@ -315,16 +283,18 @@ def _observation_to_rgb_array(observation):
     return np.ascontiguousarray(frame_array)
 
 
-def _recording_observation(env, observation):
-    """Return raw RGB gameplay when an env exposes preprocessed policy observations."""
-    if bool(getattr(env, "_gymrec_policy_observations", False)):
-        frame = env.render()
-        if frame is None:
-            raise RuntimeError(
-                "The recipe-selected environment returned no raw RGB render for recording"
-            )
-        return frame
-    return observation
+def _recording_observation(provider_session, observation):
+    """Return the provider-selected canonical recording frame."""
+    return provider_session.recording_observation(observation)
+
+
+def _provider_fps(provider_session):
+    fps = float(getattr(provider_session, "fps", 0) or 0)
+    if fps <= 0:
+        raise ValueError(
+            f"Environment provider {provider_session.provider_id!r} did not expose a valid fps"
+        )
+    return max(int(round(fps)), 1)
 
 
 def _sha256_rgb(frame_array):
@@ -332,8 +302,12 @@ def _sha256_rgb(frame_array):
     return hashlib.sha256(np.ascontiguousarray(frame_array).tobytes()).hexdigest()
 
 
-def _require_lossless_video_tools():
-    """Return ffmpeg/ffprobe paths or raise before starting a video-backed recording."""
+def _sha256_file(path):
+    with open(path, "rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def _require_video_tools(error_suffix):
     ffmpeg_path = shutil.which("ffmpeg")
     ffprobe_path = shutil.which("ffprobe")
     missing = []
@@ -342,10 +316,18 @@ def _require_lossless_video_tools():
     if ffprobe_path is None:
         missing.append("ffprobe")
     if missing:
-        raise RuntimeError(
-            f"{' and '.join(missing)} required for --storage {STORAGE_FORMAT_LOSSLESS_VIDEO}"
-        )
+        raise RuntimeError(f"{' and '.join(missing)} {error_suffix}")
     return ffmpeg_path, ffprobe_path
+
+
+def _require_lossless_video_tools():
+    """Return ffmpeg/ffprobe paths or raise before starting a video-backed recording."""
+    return _require_video_tools(f"required for --storage {STORAGE_FORMAT_LOSSLESS_VIDEO}")
+
+
+def _require_dataset_replay_tools():
+    """Return ffmpeg/ffprobe paths required to publish replay.mp4."""
+    return _require_video_tools("required to publish replay.mp4")
 
 
 def _encode_lossless_rgb_video(frames, output_path, fps, ffmpeg_path=None):
@@ -437,62 +419,168 @@ class _StreamingLosslessVideoWriter:
             self.process.stderr.close()
 
 
+class _StreamingBrowserPreviewWriter:
+    """Write a browser-safe H.264 MP4 without buffering an episode in memory."""
+
+    def __init__(self, output_path, fps, ffmpeg_path=None):
+        self.output_path = output_path
+        self.fps = fps
+        self.ffmpeg_path = ffmpeg_path or _require_dataset_replay_tools()[0]
+        self.process = None
+        self.shape = None
+
+    def _start(self, frame):
+        self.shape = tuple(frame.shape)
+        height, width = frame.shape[:2]
+        os.makedirs(os.path.dirname(self.output_path), exist_ok=True)
+        cmd = [
+            self.ffmpeg_path,
+            "-y",
+            "-loglevel",
+            "error",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgb24",
+            "-s",
+            f"{width}x{height}",
+            "-r",
+            str(max(int(round(float(self.fps))), 1)),
+            "-i",
+            "-",
+            "-an",
+            "-c:v",
+            "libx264",
+            "-tag:v",
+            "avc1",
+            "-vf",
+            "pad=ceil(iw/2)*2:ceil(ih/2)*2",
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
+            self.output_path,
+        ]
+        self.process = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    def write(self, frame):
+        frame = np.ascontiguousarray(frame, dtype=np.uint8)
+        if self.process is None:
+            self._start(frame)
+        elif tuple(frame.shape) != self.shape:
+            raise ValueError(f"All preview frames must have shape {self.shape}; got {frame.shape}")
+        self.process.stdin.write(frame.tobytes())
+
+    def close(self):
+        if self.process is None:
+            raise ValueError("Cannot encode an empty preview video")
+        try:
+            self.process.stdin.close()
+            stderr = self.process.stderr.read().decode("utf-8", errors="replace").strip()
+            return_code = self.process.wait()
+            if return_code != 0:
+                raise RuntimeError(stderr or f"ffmpeg exited with status {return_code}")
+        finally:
+            if self.process.stderr is not None:
+                self.process.stderr.close()
+
+    def abort(self):
+        if self.process is None:
+            return
+        if self.process.stdin is not None and not self.process.stdin.closed:
+            self.process.stdin.close()
+        self.process.wait()
+        if self.process.stderr is not None:
+            self.process.stderr.close()
+
+
 def _encode_browser_preview_video(frames, output_path, fps, ffmpeg_path=None):
     """Encode a lossy browser-safe preview MP4. This is never canonical data."""
-    if not frames:
-        raise ValueError("Cannot encode an empty preview video")
-    ffmpeg_path = ffmpeg_path or _require_lossless_video_tools()[0]
-
-    first = frames[0]
-    height, width = first.shape[:2]
-    for frame in frames:
-        if frame.shape != first.shape:
-            raise ValueError(f"All preview frames must have shape {first.shape}; got {frame.shape}")
-
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    cmd = [
-        ffmpeg_path,
-        "-y",
-        "-loglevel",
-        "error",
-        "-f",
-        "rawvideo",
-        "-pix_fmt",
-        "rgb24",
-        "-s",
-        f"{width}x{height}",
-        "-r",
-        str(max(int(round(float(fps))), 1)),
-        "-i",
-        "-",
-        "-an",
-        "-c:v",
-        "libx264",
-        "-vf",
-        "pad=ceil(iw/2)*2:ceil(ih/2)*2",
-        "-pix_fmt",
-        "yuv420p",
-        "-movflags",
-        "+faststart",
-        output_path,
-    ]
-    process = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+    writer = _StreamingBrowserPreviewWriter(output_path, fps, ffmpeg_path=ffmpeg_path)
     try:
         for frame in frames:
-            process.stdin.write(np.ascontiguousarray(frame).tobytes())
-        process.stdin.close()
-        stderr = process.stderr.read().decode("utf-8", errors="replace").strip()
-        return_code = process.wait()
-        if return_code != 0:
-            raise RuntimeError(stderr or f"ffmpeg exited with status {return_code}")
+            writer.write(frame)
+        writer.close()
     except Exception:
-        if process.stdin is not None and not process.stdin.closed:
-            process.stdin.close()
-        process.wait()
+        writer.abort()
         raise
-    finally:
-        if process.stderr is not None:
-            process.stderr.close()
+
+
+def _transcode_browser_preview_video(input_path, output_path, ffmpeg_path=None):
+    """Transcode an existing video to the browser-safe replay contract."""
+    ffmpeg_path = ffmpeg_path or _require_dataset_replay_tools()[0]
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    completed = subprocess.run(
+        [
+            ffmpeg_path,
+            "-y",
+            "-loglevel",
+            "error",
+            "-i",
+            os.path.abspath(input_path),
+            "-an",
+            "-c:v",
+            "libx264",
+            "-tag:v",
+            "avc1",
+            "-vf",
+            "pad=ceil(iw/2)*2:ceil(ih/2)*2",
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
+            output_path,
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(completed.stderr.strip() or f"ffmpeg exited with {completed.returncode}")
+
+
+def _verify_browser_preview_video(path, ffprobe_path=None):
+    """Validate the codec and streaming layout required by Hugging Face card playback."""
+    ffprobe_path = ffprobe_path or shutil.which("ffprobe")
+    if ffprobe_path is None:
+        raise RuntimeError("ffprobe is required to validate replay.mp4")
+    completed = subprocess.run(
+        [
+            ffprobe_path,
+            "-v",
+            "error",
+            "-count_frames",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=codec_name,codec_tag_string,pix_fmt,nb_read_frames:format=duration",
+            "-of",
+            "json",
+            str(path),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    probe = json.loads(completed.stdout)
+    streams = probe.get("streams")
+    if not isinstance(streams, list) or not streams:
+        raise ValueError("replay video does not contain a video stream")
+    stream = streams[0]
+    expected = {"codec_name": "h264", "codec_tag_string": "avc1", "pix_fmt": "yuv420p"}
+    for key, value in expected.items():
+        if stream.get(key) != value:
+            raise ValueError(f"replay video {key} must be {value!r}, got {stream.get(key)!r}")
+    duration = float(probe.get("format", {}).get("duration") or 0.0)
+    frame_count = int(stream.get("nb_read_frames") or 0)
+    if duration <= 0 or frame_count <= 0:
+        raise ValueError("replay video must have a positive duration and frame count")
+    with open(path, "rb") as file_obj:
+        data = file_obj.read()
+    moov = data.find(b"moov")
+    mdat = data.find(b"mdat")
+    if moov < 0 or mdat < 0 or moov > mdat:
+        raise ValueError("replay video must use faststart with moov before mdat")
+    return {"duration_seconds": duration, "frames": frame_count, **expected}
 
 
 def _decode_lossless_rgb_video(video_path, width, height, cache=True):
@@ -607,34 +695,6 @@ def _episode_progress(transient=False):
     )
 
 
-def _env_id_has_retro_platform(env_id):
-    """Return True when an env id contains a known Stable-Retro platform token."""
-    return any(f"-{platform}" in env_id for platform in RETRO_PLATFORMS)
-
-
-def classify_env_id(env_id, stable_retro_envs=None):
-    """Classify an environment id as atari, vizdoom, or stable-retro."""
-    if env_id.startswith("ALE/"):
-        return "atari"
-    if env_id.startswith(("Vizdoom", "vizdoom")):
-        return "vizdoom"
-    if (
-        stable_retro_envs is not None and env_id in stable_retro_envs
-    ) or _env_id_has_retro_platform(env_id):
-        return "stable-retro"
-    return "atari"
-
-
-def _capture_backend_from_dataset(dataset):
-    """Return the most recently appended runtime backend carried by a dataset."""
-    if dataset is None or "capture_backend" not in (getattr(dataset, "column_names", None) or []):
-        return None
-    for value in reversed(dataset["capture_backend"]):
-        if value:
-            return str(value)
-    return None
-
-
 def _first_dataset_value(dataset, column):
     if dataset is None or column not in (getattr(dataset, "column_names", None) or []):
         return None
@@ -645,83 +705,72 @@ def _first_dataset_value(dataset, column):
 
 
 def _environment_metadata_from_dataset(dataset):
-    """Recover environment provenance from current row columns or a Hub sidecar."""
-    metadata = {}
-    for column, metadata_key in (
-        ("logical_env_id", "env_id"),
-        ("capture_backend", "capture_backend"),
-        ("state_name", "state_name"),
-        ("rom_sha256", "rom_sha256"),
-        ("action_encoding", "action_encoding"),
-        ("frame_skip", "frameskip"),
-        ("sticky_action_prob", "sticky_actions"),
-    ):
-        value = _first_dataset_value(dataset, column)
-        if value is not None:
-            metadata[metadata_key] = value
-    button_order = _first_dataset_value(dataset, "nes_button_order")
-    if button_order is not None:
-        try:
-            metadata["nes_button_order"] = json.loads(button_order)
-        except (TypeError, json.JSONDecodeError):
-            metadata["nes_button_order"] = button_order
-    if "frameskip" in metadata or "sticky_actions" in metadata:
-        metadata["env_make_kwargs"] = {}
-        atari = metadata.get("capture_backend") == "atari"
-        if "frameskip" in metadata:
-            metadata["env_make_kwargs"]["frameskip" if atari else "frame_skip"] = int(
-                metadata["frameskip"]
-            )
-        if "sticky_actions" in metadata:
-            metadata["env_make_kwargs"][
-                "repeat_action_probability" if atari else "sticky_action_prob"
-            ] = float(metadata["sticky_actions"])
-    return metadata
+    return {
+        column: value
+        for column in (
+            "provider_id",
+            "env_id",
+            "environment_contract_id",
+            "storage_format",
+        )
+        if (value := _first_dataset_value(dataset, column)) is not None
+    }
 
 
-def resolve_runtime_backend(env_id, requested=None, metadata=None, recorded_backend=None):
-    """Resolve logical environment identity separately from its runtime provider."""
-    logical_backend = classify_env_id(env_id)
-    if logical_backend == "atari":
-        logical_backend = classify_env_id(env_id, stable_retro_envs=set(_get_stableretro_envs()))
-    candidate = requested
-    if candidate is None and metadata:
-        candidate = metadata.get("capture_backend")
-    if candidate is None:
-        candidate = recorded_backend
-    if candidate is None:
-        candidate = logical_backend
+def _canonicalize_environment_metadata(metadata):
+    return dict(metadata or {})
 
-    if candidate == "supermariobrosnes-turbo":
-        if env_id != SUPERMARIOBROS_NES_ENV_ID:
+
+def _playback_metadata(dataset, local_metadata=None):
+    return {
+        **_canonicalize_environment_metadata(local_metadata),
+        **_environment_metadata_from_dataset(dataset),
+    }
+
+
+def _merge_config(defaults, overrides, path=""):
+    """Merge a config mapping while rejecting unknown keys and incompatible types."""
+    if not isinstance(overrides, dict):
+        location = path or "configuration"
+        raise ValueError(f"{location} must be a TOML table")
+
+    unknown = sorted(set(overrides) - set(defaults))
+    if unknown:
+        location = f" in [{path}]" if path else ""
+        raise ValueError(f"Unknown configuration key{location}: {', '.join(unknown)}")
+
+    merged = copy.deepcopy(defaults)
+    for key, value in overrides.items():
+        key_path = f"{path}.{key}" if path else key
+        default = defaults[key]
+        if isinstance(default, dict):
+            merged[key] = _merge_config(default, value, key_path)
+            continue
+
+        expected_type = type(default)
+        valid_type = type(value) is expected_type
+        if isinstance(default, list):
+            valid_type = isinstance(value, list)
+            if valid_type and default:
+                item_type = type(default[0])
+                valid_type = all(type(item) is item_type for item in value)
+        if not valid_type:
             raise ValueError(
-                "The supermariobrosnes-turbo backend only supports "
-                f"{SUPERMARIOBROS_NES_ENV_ID}; got {env_id}."
+                f"Configuration key {key_path} must be {expected_type.__name__}, "
+                f"got {type(value).__name__}"
             )
-        return candidate
-    if candidate in {"stable-retro", "stable-retro-turbo"}:
-        if logical_backend != "stable-retro":
-            raise ValueError(f"The {candidate} backend does not support {env_id}.")
-        return candidate
-    if candidate in {"atari", "vizdoom"} and candidate == logical_backend:
-        return candidate
-    if requested is not None or recorded_backend is not None:
-        raise ValueError(f"Unknown runtime backend: {candidate}")
-    return logical_backend
+        merged[key] = value
+    return merged
 
 
 def _load_config():
-    """Load configuration from config.toml, falling back to defaults."""
-    import copy
-
+    """Load and validate configuration from config.toml."""
     config = copy.deepcopy(DEFAULT_CONFIG)
     config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.toml")
     if os.path.exists(config_path):
         with open(config_path, "rb") as f:
             user_config = tomllib.load(f)
-        for section in config:
-            if section in user_config:
-                config[section].update(user_config[section])
+        config = _merge_config(DEFAULT_CONFIG, user_config)
     config["storage"]["local_dir"] = os.path.abspath(
         os.path.expanduser(config["storage"]["local_dir"])
     )
@@ -731,143 +780,6 @@ def _load_config():
 def _gymrec_cmd(*parts):
     """Format a user-facing command with the installed CLI entrypoint."""
     return " ".join(("gymrec", *(str(part) for part in parts)))
-
-
-def _get_roms_path() -> str | None:
-    roms_path = os.environ.get("ROMS_PATH")
-    if not roms_path:
-        return None
-    return os.path.abspath(os.path.expanduser(roms_path))
-
-
-def _configure_atari_roms_path():
-    """Use ROMS_PATH as ALE-py's ROM directory unless ALE_ROMS_DIR is explicit."""
-    roms_path = _get_roms_path()
-    if roms_path and not os.environ.get("ALE_ROMS_DIR"):
-        os.environ["ALE_ROMS_DIR"] = (
-            os.path.dirname(roms_path) if os.path.isfile(roms_path) else roms_path
-        )
-
-
-def _roms_path_cache_file() -> str:
-    return os.path.expanduser("~/.gymrec/roms_path_imports.json")
-
-
-def _roms_path_fingerprint(path: str) -> dict:
-    file_count = 0
-    total_size = 0
-    newest_mtime_ns = 0
-
-    if os.path.isfile(path):
-        stat = os.stat(path)
-        return {
-            "file_count": 1,
-            "total_size": stat.st_size,
-            "newest_mtime_ns": stat.st_mtime_ns,
-        }
-
-    for root, _dirs, files in os.walk(path):
-        for filename in files:
-            filepath = os.path.join(root, filename)
-            try:
-                stat = os.stat(filepath)
-            except OSError:
-                continue
-            file_count += 1
-            total_size += stat.st_size
-            newest_mtime_ns = max(newest_mtime_ns, stat.st_mtime_ns)
-
-    return {
-        "file_count": file_count,
-        "total_size": total_size,
-        "newest_mtime_ns": newest_mtime_ns,
-    }
-
-
-def _load_roms_path_import_cache() -> dict:
-    cache_file = _roms_path_cache_file()
-    if not os.path.exists(cache_file):
-        return {}
-    try:
-        with open(cache_file, "r") as f:
-            return json.load(f)
-    except (OSError, json.JSONDecodeError):
-        return {}
-
-
-def _save_roms_path_import_cache(cache: dict):
-    cache_file = _roms_path_cache_file()
-    os.makedirs(os.path.dirname(cache_file), exist_ok=True)
-    with open(cache_file, "w") as f:
-        json.dump(cache, f, indent=2)
-
-
-def _roms_path_cache_entry_current(cache_entry, fingerprint) -> bool:
-    """Return True if source and Stable-Retro target imports still look current."""
-    if not isinstance(cache_entry, dict):
-        return False
-
-    cached_fingerprint = cache_entry.get("fingerprint")
-    stable_retro_games = cache_entry.get("stable_retro_games")
-    if cached_fingerprint != fingerprint or stable_retro_games is None:
-        return False
-
-    try:
-        import stable_retro as retro
-    except Exception:
-        return False
-
-    for game in stable_retro_games:
-        try:
-            retro.data.get_romfile_path(game, retro.data.Integrations.ALL)
-        except FileNotFoundError:
-            return False
-    return True
-
-
-def _ensure_stableretro_roms_path_imported(quiet: bool = True, force: bool = False) -> int:
-    """Import ROMS_PATH into Stable-Retro's integration store once per process."""
-    roms_path = _get_roms_path()
-    if not roms_path or (not force and roms_path in _stableretro_roms_path_imported):
-        return 0
-
-    _stableretro_roms_path_imported.add(roms_path)
-    if not os.path.exists(roms_path):
-        if not quiet:
-            console.print(f"[{STYLE_FAIL}]ROMS_PATH does not exist: {roms_path}[/]")
-        return 0
-
-    if quiet:
-        with console.status(
-            f"[{STYLE_INFO}]Checking ROMS_PATH game index: [{STYLE_PATH}]{roms_path}[/]"
-        ):
-            fingerprint = _roms_path_fingerprint(roms_path)
-    else:
-        fingerprint = _roms_path_fingerprint(roms_path)
-    cache = _load_roms_path_import_cache()
-    if not force and _roms_path_cache_entry_current(cache.get(roms_path), fingerprint):
-        return 0
-
-    if quiet:
-        console.print(f"[{STYLE_INFO}]Indexing games from ROMS_PATH: [{STYLE_PATH}]{roms_path}[/]")
-        with console.status(f"[{STYLE_INFO}]Scanning and importing matching ROMs...[/]"):
-            imported_games, stable_retro_games = _import_roms(
-                roms_path, quiet=quiet, source_label="ROMS_PATH", return_games=True
-            )
-    else:
-        imported_games, stable_retro_games = _import_roms(
-            roms_path, quiet=quiet, source_label="ROMS_PATH", return_games=True
-        )
-    cache[roms_path] = {
-        "fingerprint": fingerprint,
-        "stable_retro_games": stable_retro_games,
-    }
-    _save_roms_path_import_cache(cache)
-    if quiet:
-        console.print(
-            f"[{STYLE_SUCCESS}]Indexed {imported_games} Stable-Retro ROM(s) from ROMS_PATH[/]"
-        )
-    return imported_games
 
 
 def _lazy_init():
@@ -889,7 +801,7 @@ def _lazy_init():
         CommitOperationDelete, \
         hf_hub_download
     global Dataset, HFImage, Value, load_dataset, load_from_disk
-    global START_KEY, ATARI_KEY_BINDINGS, VIZDOOM_KEY_BINDINGS, STABLE_RETRO_KEY_BINDINGS
+    global START_KEY, CONTROL_PROFILES
 
     import numpy as np
     import pygame
@@ -914,9 +826,7 @@ def _lazy_init():
     )
     from PIL import Image as PILImage
 
-    START_KEY, ATARI_KEY_BINDINGS, VIZDOOM_KEY_BINDINGS, STABLE_RETRO_KEY_BINDINGS = (
-        _load_keymappings(pygame)
-    )
+    START_KEY, CONTROL_PROFILES = _load_keymappings(pygame)
     CONFIG = _load_config()
 
 
@@ -988,211 +898,32 @@ class InputSource(ABC):
 
 
 class HumanInputSource(InputSource):
-    """Human input via pygame keyboard events."""
+    """Translate pressed keys through the provider's advertised control profile."""
 
-    def __init__(self, env, key_lock, current_keys):
-        self.env = env
+    def __init__(self, provider_session, key_lock, current_keys):
+        self.provider_session = provider_session
         self.key_lock = key_lock
         self.current_keys = current_keys
-        self.key_to_action = None
-        self._atari_key_bindings_raw = ATARI_KEY_BINDINGS
-        self._atari_meaning_to_idx = None
-        self._atari_key_to_meaning = {}
-        self._vizdoom_buttons = None
-        self._vizdoom_vector_map = None
-        self.noop_action = 0
-
-    def _resolve_atari_key_mapping(self):
-        """Resolve meaning-based Atari key bindings to action indices."""
-        standard_meaning_to_idx = {
-            "NOOP": 0,
-            "FIRE": 1,
-            "UP": 2,
-            "RIGHT": 3,
-            "LEFT": 4,
-            "DOWN": 5,
-            "UPRIGHT": 6,
-            "UPLEFT": 7,
-            "DOWNRIGHT": 8,
-            "DOWNLEFT": 9,
-            "UPFIRE": 10,
-            "RIGHTFIRE": 11,
-            "LEFTFIRE": 12,
-            "DOWNFIRE": 13,
-            "UPRIGHTFIRE": 14,
-            "UPLEFTFIRE": 15,
-            "DOWNRIGHTFIRE": 16,
-            "DOWNLEFTFIRE": 17,
-        }
-
-        meaning_to_idx = None
+        profile = getattr(provider_session, "control_profile", None)
+        if not profile:
+            raise ValueError(
+                f"Environment provider {provider_session.provider_id!r} does not advertise "
+                "a human control profile"
+            )
         try:
-            meanings = self.env.unwrapped.get_action_meanings()
-            if meanings:
-                meaning_to_idx = {m.upper(): idx for idx, m in enumerate(meanings)}
-        except (AttributeError, TypeError):
-            pass
-
-        if meaning_to_idx is None:
-            meaning_to_idx = standard_meaning_to_idx
-
-        resolved = {}
-        for key, value in self._atari_key_bindings_raw.items():
-            if isinstance(value, str):
-                idx = meaning_to_idx.get(value.upper())
-                if idx is not None:
-                    resolved[key] = idx
-
-        self.key_to_action = resolved
-        self._atari_meaning_to_idx = meaning_to_idx
-        self._atari_key_to_meaning = {}
-        for key, value in self._atari_key_bindings_raw.items():
-            if isinstance(value, str):
-                self._atari_key_to_meaning[key] = value.upper()
-
-    def _get_atari_action(self):
-        """Return the Discrete action index for Atari environments."""
-        if self.key_to_action is None:
-            self._resolve_atari_key_mapping()
-
-        pressed_meanings = set()
-        for key in self.current_keys:
-            if key in self._atari_key_to_meaning:
-                pressed_meanings.add(self._atari_key_to_meaning[key])
-
-        if not pressed_meanings:
-            return self.noop_action
-
-        composite = ""
-        if "UP" in pressed_meanings:
-            composite += "UP"
-        elif "DOWN" in pressed_meanings:
-            composite += "DOWN"
-        if "RIGHT" in pressed_meanings:
-            composite += "RIGHT"
-        elif "LEFT" in pressed_meanings:
-            composite += "LEFT"
-        if "FIRE" in pressed_meanings:
-            composite += "FIRE"
-
-        if not composite:
-            return self.noop_action
-
-        if composite in self._atari_meaning_to_idx:
-            return self._atari_meaning_to_idx[composite]
-
-        for key in self.current_keys:
-            if key in self.key_to_action:
-                return self.key_to_action[key]
-        return self.noop_action
-
-    def _init_vizdoom_key_mapping(self):
-        """Map important action names to their button indices."""
-        available = [b.name for b in self.env.unwrapped.game.get_available_buttons()]
-        offset = self.env.unwrapped.num_delta_buttons
-
-        def idx(name):
-            if name in available:
-                return available.index(name) - offset
-            return None
-
-        mapping = {
-            "ATTACK": idx("ATTACK"),
-            "USE": idx("USE"),
-            "MOVE_LEFT": idx("MOVE_LEFT"),
-            "MOVE_RIGHT": idx("MOVE_RIGHT"),
-            "MOVE_FORWARD": idx("MOVE_FORWARD"),
-            "MOVE_BACKWARD": idx("MOVE_BACKWARD"),
-            "TURN_LEFT": idx("TURN_LEFT"),
-            "TURN_RIGHT": idx("TURN_RIGHT"),
-            "SPEED": idx("SPEED"),
-        }
-        for i in range(1, 8):
-            mapping[f"SELECT_WEAPON{i}"] = idx(f"SELECT_WEAPON{i}")
-
-        space = self.env.action_space
-        if isinstance(space, gym.spaces.Dict):
-            space = space.get("binary")
-        if isinstance(space, gym.spaces.Discrete):
-            self._vizdoom_vector_map = {
-                tuple(combo): i for i, combo in enumerate(self.env.unwrapped.button_map)
-            }
-        else:
-            self._vizdoom_vector_map = None
-
-        return {k: v for k, v in mapping.items() if v is not None}
-
-    def _get_vizdoom_action(self):
-        """Return the MultiBinary action vector for VizDoom environments."""
-        if self._vizdoom_buttons is None:
-            self._vizdoom_buttons = self._init_vizdoom_key_mapping()
-        n_buttons = self.env.unwrapped.num_binary_buttons
-        action = np.zeros(n_buttons, dtype=np.int32)
-
-        pressed = self.current_keys
-        alt = pygame.K_LALT in pressed or pygame.K_RALT in pressed
-
-        def press(name):
-            idx = self._vizdoom_buttons.get(name)
-            if idx is not None and idx < n_buttons:
-                action[idx] = 1
-
-        for key, name in VIZDOOM_KEY_BINDINGS.items():
-            if key in pressed:
-                if key == pygame.K_LEFT:
-                    press("MOVE_LEFT" if alt else name)
-                elif key == pygame.K_RIGHT:
-                    press("MOVE_RIGHT" if alt else name)
-                else:
-                    press(name)
-
-        space = self.env.action_space
-        if isinstance(space, gym.spaces.Dict):
-            binary_space = space.get("binary")
-            continuous_space = space.get("continuous")
-            if isinstance(binary_space, gym.spaces.Discrete):
-                if self._vizdoom_vector_map is None:
-                    self._vizdoom_vector_map = {
-                        tuple(c): i for i, c in enumerate(self.env.unwrapped.button_map)
-                    }
-                binary_action = self._vizdoom_vector_map.get(tuple(action), 0)
-            else:
-                binary_action = action
-
-            if continuous_space is not None:
-                cont_shape = continuous_space.shape
-                continuous_action = np.zeros(cont_shape, dtype=np.float32)
-                return {"binary": binary_action, "continuous": continuous_action}
-            return {"binary": binary_action}
-
-        if isinstance(space, gym.spaces.Discrete):
-            if self._vizdoom_vector_map is None:
-                self._vizdoom_vector_map = {
-                    tuple(c): i for i, c in enumerate(self.env.unwrapped.button_map)
-                }
-            return self._vizdoom_vector_map.get(tuple(action), 0)
-
-        return action
-
-    def _get_retro_action(self):
-        """Return a controller vector for Stable-Retro-compatible environments."""
-        action = np.zeros(self.env.action_space.n, dtype=np.int32)
-        platform = getattr(self.env.unwrapped, "system", None)
-        mapping = STABLE_RETRO_KEY_BINDINGS.get(platform, {})
-        for key in self.current_keys:
-            idx = mapping.get(key)
-            if idx is not None and idx < action.shape[0]:
-                action[idx] = 1
-        return action
+            self.key_to_label = CONTROL_PROFILES[profile]
+        except KeyError as exc:
+            raise ValueError(
+                f"No keyboard mapping is installed for provider control profile {profile!r}"
+            ) from exc
 
     def get_action(self, observation):
-        """Map pressed keys to actions for the current environment."""
+        del observation
         with self.key_lock:
-            if hasattr(self.env, "_vizdoom") and self.env._vizdoom:
-                return self._get_vizdoom_action()
-            if bool(getattr(self.env, "_stable_retro", False)) or _is_nes_controller_env(self.env):
-                return self._get_retro_action()
-            return self._get_atari_action()
+            labels = {
+                label for key, label in self.key_to_label.items() if key in self.current_keys
+            }
+        return self.provider_session.action_from_labels(labels)
 
 
 class AgentInputSource(InputSource):
@@ -1212,6 +943,11 @@ class AgentInputSource(InputSource):
     def get_action(self, observation):
         """Get action from policy."""
         return self.policy(observation)
+
+    @property
+    def policy_action(self):
+        """Return the policy-space action selected before any environment adapter."""
+        return getattr(self.policy, "last_policy_action", None)
 
     def observe_step(self, reward, terminated, truncated, info):
         """Forward step results to the policy when it needs feedback."""
@@ -1248,274 +984,14 @@ class BasePolicy(ABC):
 class RandomPolicy(BasePolicy):
     """Random policy that samples from the action space."""
 
+    def reset(self, **kwargs):
+        seed = kwargs.get("seed")
+        if seed is not None:
+            self.action_space.seed(int(seed))
+
     def __call__(self, observation):
         """Sample a random action from the action space."""
         return self.action_space.sample()
-
-
-class MarioRightJumpPolicy(BasePolicy):
-    """Policy for Super Mario Bros that biases toward moving right, running, and jumping.
-
-    Action probabilities for NES MultiBinary action space:
-    - RIGHT (index 7): 90% chance (increased - prioritize moving forward)
-    - B/Run (index 0): 70% chance (increased - hold B to run)
-    - A/Jump (index 8): 30% chance (decreased - jump less often)
-    - Other buttons: 10% chance each
-
-    NES button order: ["B", null, "SELECT", "START", "UP", "DOWN", "LEFT", "RIGHT", "A"]
-    """
-
-    def __init__(self, action_space):
-        super().__init__(action_space)
-        # NES button indices for stable-retro (fceumm core)
-        # Button order: ["B", null, "SELECT", "START", "UP", "DOWN", "LEFT", "RIGHT", "A"]
-        self.BUTTON_B = 0  # B button (run/fire)
-        # Index 1 is unused (null)
-        self.BUTTON_SELECT = 2
-        self.BUTTON_START = 3
-        self.BUTTON_UP = 4
-        self.BUTTON_DOWN = 5
-        self.BUTTON_LEFT = 6
-        self.BUTTON_RIGHT = 7  # Move right
-        self.BUTTON_A = 8  # A button (Jump)
-
-    def __call__(self, observation):
-        """Return biased action favoring right movement, running, and occasional jumping."""
-        import numpy as np
-
-        action = np.zeros(self.action_space.n, dtype=np.int32)
-
-        # Very high probability for RIGHT (90%) - prioritize moving forward
-        if np.random.random() < 0.90:
-            action[self.BUTTON_RIGHT] = 1
-
-        # High probability for B/Run (70%) - hold B to run fast
-        if np.random.random() < 0.70:
-            action[self.BUTTON_B] = 1
-
-        # Lower probability for JUMP/A (30%) - jump only occasionally
-        if np.random.random() < 0.30:
-            action[self.BUTTON_A] = 1
-
-        # Low probability for other buttons (10% each)
-        if np.random.random() < 0.10:
-            action[self.BUTTON_LEFT] = 1
-        if np.random.random() < 0.10:
-            action[self.BUTTON_DOWN] = 1
-        if np.random.random() < 0.10:
-            action[self.BUTTON_UP] = 1
-
-        return action
-
-
-class BreakoutCatcherPolicy(BasePolicy):
-    """Breakout policy that tracks the ball exactly and escapes reward stalls.
-
-    On ALE Breakout environments this reads paddle and ball state directly from
-    emulator RAM, which avoids the false detections and missed catches that come
-    from RGB-only heuristics. The controller predicts the descending intercept at
-    the paddle line, including wall reflections, then steers the paddle toward
-    that landing point with a small deadzone to avoid oscillation. Every
-    descending contact picks a small random paddle/ball offset, then widens that
-    variation if rewards stall long enough to break deterministic loops that
-    stop clearing bricks.
-
-    BreakoutNoFrameskip-v4 action space (Discrete):
-    - 0: NOOP
-    - 1: FIRE
-    - 2: RIGHT
-    - 3: LEFT
-    """
-
-    def __init__(self, action_space, env=None):
-        super().__init__(action_space, env=env)
-        # ALE Breakout action indices (Discrete(4)):
-        # 0: NOOP, 1: FIRE, 2: RIGHT, 3: LEFT
-        self.NOOP = 0
-        self.FIRE = 1
-        self.RIGHT = 2
-        self.LEFT = 3
-
-        self._prev_ball_pos = None
-        self._rng = np.random.default_rng()
-
-        # Breakout RAM addresses (ALE).
-        self._paddle_x_addr = 72
-        self._ball_x_addr = 99
-        self._ball_y_addr = 101
-
-        # Tuned against local ALE runs to prioritize zero-loss tracking over
-        # aggressive paddle movement that introduces oscillation near contact.
-        self._base_target_offset = -5
-        self._deadzone = 4
-        self._contact_y = 177
-        self._left_wall = 57
-        self._right_wall = 200
-        self._contact_window = 18
-
-        # Reward-aware loop breaking: always vary the paddle/ball contact point
-        # a little, then widen the range if the game has clearly stalled.
-        self._stall_steps = 0
-        self._stall_threshold = 1200
-        self._descent_offset = self._base_target_offset
-        self._descent_offset_committed = False
-        self._reward_since_last_contact = False
-
-        # RGB fallback for non-ALE environments or direct unit-style invocation.
-        self._sprite_color = np.array([200, 72, 72], dtype=np.uint8)
-        self._fallback_ball_y_min = 93
-        self._fallback_ball_y_max = 189
-        self._fallback_paddle_y_min = 189
-        self._fallback_paddle_y_max = 205
-        self._fallback_contact_y = 183
-        self._fallback_left_wall = 8
-        self._fallback_right_wall = 151
-
-    def reset(self):
-        self._prev_ball_pos = None
-        self._stall_steps = 0
-        self._descent_offset = self._base_target_offset
-        self._descent_offset_committed = False
-        self._reward_since_last_contact = False
-
-    def observe_step(self, reward, terminated, truncated, info):
-        if reward > 0:
-            self._stall_steps = 0
-            self._reward_since_last_contact = True
-        else:
-            self._stall_steps += 1
-
-        if terminated or truncated:
-            self.reset()
-
-    def __call__(self, observation):
-        """Return an action that keeps the paddle under the live ball."""
-        state = self._read_breakout_state(observation)
-
-        if state["ball_x"] is None or state["ball_y"] is None:
-            self._prev_ball_pos = None
-            self._descent_offset = self._base_target_offset
-            self._descent_offset_committed = False
-            return self.FIRE
-
-        target_x = state["ball_x"]
-        descending = False
-        if self._prev_ball_pos is not None:
-            dx = state["ball_x"] - self._prev_ball_pos[0]
-            dy = state["ball_y"] - self._prev_ball_pos[1]
-            descending = dy > 0
-
-            if descending and state["ball_y"] >= state["contact_y"] - self._contact_window:
-                if not self._descent_offset_committed:
-                    self._descent_offset = self._choose_contact_offset()
-                    self._descent_offset_committed = True
-            elif dy < 0:
-                self._descent_offset = self._base_target_offset
-                self._descent_offset_committed = False
-                self._reward_since_last_contact = False
-
-            if dy > 0 and state["ball_y"] < state["contact_y"] and dx != 0:
-                steps_to_contact = (state["contact_y"] - state["ball_y"]) / dy
-                target_x = self._reflect_x(
-                    round(state["ball_x"] + (dx * steps_to_contact)),
-                    state["left_wall"],
-                    state["right_wall"],
-                )
-        else:
-            self._descent_offset = self._base_target_offset
-
-        self._prev_ball_pos = (state["ball_x"], state["ball_y"])
-        target_x += self._descent_offset
-
-        if state["paddle_x"] < target_x - self._deadzone:
-            return self.RIGHT
-        if state["paddle_x"] > target_x + self._deadzone:
-            return self.LEFT
-        return self.NOOP
-
-    def _choose_contact_offset(self):
-        """Pick a safe contact offset, with wider variation after stalls."""
-        if self._stall_steps < self._stall_threshold:
-            candidates = [-7, -5, -3, 0]
-            probabilities = [0.24, 0.46, 0.22, 0.08]
-        elif self._stall_steps < self._stall_threshold * 2:
-            candidates = [-9, -7, -5, -3, 0, 3]
-            probabilities = [0.14, 0.22, 0.28, 0.18, 0.12, 0.06]
-        elif self._stall_steps < self._stall_threshold * 4:
-            candidates = [-11, -8, -5, -2, 2, 5, 8]
-            probabilities = [0.10, 0.16, 0.22, 0.16, 0.14, 0.12, 0.10]
-        else:
-            candidates = [-12, -9, -6, -3, 0, 3, 6, 9]
-            probabilities = [0.09, 0.12, 0.15, 0.16, 0.16, 0.12, 0.10, 0.10]
-
-        # If the last descent still produced no reward, bias slightly away from
-        # the previous contact point to avoid repeating the same bounce.
-        if not self._reward_since_last_contact:
-            candidates = [c for c in candidates if c != self._descent_offset] or candidates
-            probabilities = None
-
-        return int(self._rng.choice(candidates, p=probabilities))
-
-    def _read_breakout_state(self, observation):
-        ram_state = self._read_ram_state()
-        if ram_state is not None:
-            return ram_state
-        return self._read_rgb_state(observation)
-
-    def _read_ram_state(self):
-        ale = getattr(getattr(self.env, "unwrapped", None), "ale", None)
-        if ale is None or not hasattr(ale, "getRAM"):
-            return None
-
-        ram = ale.getRAM()
-        return {
-            "ball_x": int(ram[self._ball_x_addr]) or None,
-            "ball_y": int(ram[self._ball_y_addr]) or None,
-            "paddle_x": int(ram[self._paddle_x_addr]),
-            "contact_y": self._contact_y,
-            "left_wall": self._left_wall,
-            "right_wall": self._right_wall,
-        }
-
-    def _read_rgb_state(self, observation):
-        obs = np.asarray(observation)
-
-        paddle_region = obs[self._fallback_paddle_y_min : self._fallback_paddle_y_max, :, :]
-        paddle_mask = np.all(paddle_region == self._sprite_color, axis=2)
-        _, paddle_cols = np.where(paddle_mask)
-        paddle_x = float(np.mean(paddle_cols)) if len(paddle_cols) else 80.0
-
-        ball_region = obs[self._fallback_ball_y_min : self._fallback_ball_y_max, :, :]
-        ball_mask = np.all(ball_region == self._sprite_color, axis=2)
-        ball_rows, ball_cols = np.where(ball_mask)
-        ball_x = None
-        ball_y = None
-        if len(ball_cols):
-            unique_rows = sorted(np.unique(ball_rows + self._fallback_ball_y_min), reverse=True)
-            for row in unique_rows:
-                row_cols = ball_cols[(ball_rows + self._fallback_ball_y_min) == row]
-                if 1 <= len(row_cols) <= 6:
-                    ball_x = float(np.mean(row_cols))
-                    ball_y = float(row)
-                    break
-
-        return {
-            "ball_x": ball_x,
-            "ball_y": ball_y,
-            "paddle_x": paddle_x,
-            "contact_y": self._fallback_contact_y,
-            "left_wall": self._fallback_left_wall,
-            "right_wall": self._fallback_right_wall,
-        }
-
-    @staticmethod
-    def _reflect_x(x, left_wall, right_wall):
-        while x < left_wall or x > right_wall:
-            if x > right_wall:
-                x = right_wall - (x - right_wall)
-            elif x < left_wall:
-                x = left_wall + (left_wall - x)
-        return x
 
 
 @dataclass(frozen=True)
@@ -1533,17 +1009,20 @@ class HFPolicySource:
     release_manifest_document: dict | None
     evaluation: dict
     environment: dict
-    provider: str
-    backend: str
-    env_id: str
-    state: str | None
-    action_set: str
-    frame_skip: int
-    frame_stack: int
-    observation_size: int
-    obs_crop: tuple[int, int, int, int] | None
     deterministic: bool = False
     device: str = "auto"
+
+    @property
+    def environment_contract(self) -> EnvironmentContract:
+        return EnvironmentContract.parse(self.environment, label="recipe.eval.environment")
+
+    @property
+    def provider(self) -> str:
+        return self.environment_contract.provider_id
+
+    @property
+    def env_id(self) -> str:
+        return self.environment_contract.environment_id
 
     @property
     def collector(self) -> str:
@@ -1556,27 +1035,6 @@ class HFPolicySource:
     @property
     def recipe_sha256(self) -> str:
         return str(self.model_document["recipe"]["sha256"])
-
-    @property
-    def env_make_kwargs(self) -> dict:
-        """Compile the resolved evaluation environment into native provider kwargs."""
-        environment = self.environment
-        kwargs = dict(environment.get("env_args") or {})
-        observation_size = int(environment["observation_size"])
-        kwargs.update(
-            {
-                "obs_resize": (observation_size, observation_size),
-                "obs_crop": tuple(int(value) for value in environment["obs_crop"]),
-                "obs_crop_mode": str(environment["obs_crop_mode"]),
-                "obs_crop_fill": int(environment["obs_crop_fill"]),
-                "obs_resize_algorithm": str(environment["obs_resize_algorithm"]),
-                "frame_skip": int(environment["frame_skip"]),
-                "maxpool_last_two": bool(environment["max_pool_frames"]),
-                "sticky_action_prob": float(environment["sticky_action_prob"]),
-            }
-        )
-        return kwargs
-
 
 @dataclass(frozen=True)
 class CollectorContract:
@@ -1593,11 +1051,26 @@ class CollectorContract:
         return f"{COLLECTOR_ARTIFACT_DIR}/{self.contract_id}"
 
 
+@dataclass(frozen=True)
+class EnvironmentArtifact:
+    contract_id: str
+    document: dict
+
+    @property
+    def relative_dir(self) -> str:
+        return f"{ENVIRONMENT_ARTIFACT_DIR}/{self.contract_id}"
+
+
+def _environment_artifact(contract, provider_session):
+    contract_id, document = build_environment_document(contract, provider_session)
+    return EnvironmentArtifact(contract_id=contract_id, document=document)
+
+
 class StableBaselines3Policy(BasePolicy):
     """Run an SB3 policy against recipe-native provider observations."""
 
-    def __init__(self, action_space, source: HFPolicySource, observation_space=None):
-        super().__init__(action_space)
+    def __init__(self, source: HFPolicySource, provider_session):
+        super().__init__(provider_session.env.action_space)
         try:
             from stable_baselines3 import PPO
         except ImportError as exc:
@@ -1613,6 +1086,8 @@ class StableBaselines3Policy(BasePolicy):
                 f"got {checkpoint.get('algorithm_id')!r}"
             )
         self.source = source
+        self.provider_session = provider_session
+        self.last_policy_action = None
         self.model = PPO.load(
             source.model_path,
             device=source.device,
@@ -1623,34 +1098,13 @@ class StableBaselines3Policy(BasePolicy):
                 "clip_range_vf": None,
             },
         )
-        self._action_masks = (
-            _stable_retro_action_masks(source.env_id, source.action_set)
-            if isinstance(action_space, gym.spaces.MultiBinary)
-            else ()
-        )
-        model_observation_shape = getattr(
-            getattr(self.model, "observation_space", None), "shape", None
-        )
-        provider_observation_shape = getattr(observation_space, "shape", None)
-        if (
-            model_observation_shape is not None
-            and provider_observation_shape is not None
-            and tuple(model_observation_shape) != tuple(provider_observation_shape)
-        ):
-            raise SystemExit(
-                "Recipe-native provider observation shape does not match the policy: "
-                f"provider={tuple(provider_observation_shape)}, "
-                f"model={tuple(model_observation_shape)}"
-            )
-        if self._action_masks:
-            model_action_count = getattr(getattr(self.model, "action_space", None), "n", None)
-            if model_action_count != len(self._action_masks):
-                raise SystemExit(
-                    "Recipe action set does not match the policy action space: "
-                    f"recipe={len(self._action_masks)}, model={model_action_count}"
-                )
+        try:
+            provider_session.validate_policy(self.model)
+        except ValueError as exc:
+            raise SystemExit(f"Policy is incompatible with its environment provider: {exc}") from exc
 
     def reset(self, **kwargs):
+        self.last_policy_action = None
         seed = kwargs.get("seed")
         if seed is not None:
             seed = int(seed)
@@ -1664,32 +1118,15 @@ class StableBaselines3Policy(BasePolicy):
         del reward, terminated, truncated, info
 
     def __call__(self, observation):
-        action, _ = self.model.predict(observation, deterministic=self.source.deterministic)
-        return self._copy_action(self._to_env_action(action))
-
-    def _to_env_action(self, action):
-        action_array = np.asarray(action)
-        action_index = int(action_array.reshape(-1)[0])
-
-        if isinstance(self.action_space, gym.spaces.Discrete):
-            return action_index
-
-        if isinstance(self.action_space, gym.spaces.MultiBinary):
-            if action_index < 0 or action_index >= len(self._action_masks):
-                raise ValueError(
-                    f"Policy returned action {action_index}, but action set "
-                    f"{self.source.action_set!r} has {len(self._action_masks)} actions"
-                )
-            native_action = np.zeros(self.action_space.n, dtype=np.int32)
-            for button_index in self._action_masks[action_index]:
-                if button_index < self.action_space.n:
-                    native_action[button_index] = 1
-            return native_action
-
-        raise ValueError(
-            "Hugging Face SB3 policy recording currently supports Discrete and "
-            "MultiBinary action spaces only."
+        policy_observation = self.provider_session.policy_observation(observation)
+        action, _ = self.model.predict(
+            policy_observation, deterministic=self.source.deterministic
         )
+        raw_action = np.asarray(action)
+        self.last_policy_action = (
+            int(raw_action.reshape(-1)[0]) if raw_action.size == 1 else raw_action.tolist()
+        )
+        return self._copy_action(self.provider_session.adapt_policy_action(action))
 
     @staticmethod
     def _copy_action(action):
@@ -1729,44 +1166,14 @@ def _space_contract(space):
     return contract
 
 
-def build_collector_contract(source, env, *, inference_device):
-    """Build the immutable, seed-independent collector execution contract."""
-    declared_kwargs = source.env_make_kwargs
-    actual_kwargs = dict(getattr(env, "_gymrec_make_kwargs", {}) or {})
-    declared = {
-        "backend": source.backend,
-        "game": source.env_id,
-        "state": source.state,
-        "action_set": source.action_set,
-        "environment": source.environment,
-        "env_make_kwargs": declared_kwargs,
-    }
-    effective = {
-        "backend": getattr(env, "_gymrec_backend", None),
-        "game": getattr(env, "_env_id", None),
-        "state": getattr(env, "_gymrec_state_name", None),
-        "action_set": source.action_set,
-        "task": source.environment["task"],
-        "env_make_kwargs": actual_kwargs,
-        "policy_observations": "provider-native",
-        "recorded_observations": "raw-rgb-render",
-        "recorded_actions": NES_ACTION_ENCODING,
-        "observation_space": _space_contract(env.observation_space),
-        "action_space": _space_contract(env.action_space),
-    }
-    differences = []
-    for key, declared_value, effective_value in (
-        ("backend", source.backend, effective["backend"]),
-        ("game", source.env_id, effective["game"]),
-        ("state", source.state, effective["state"]),
-        ("task", source.environment["task"], effective["task"]),
-        ("env_make_kwargs", declared_kwargs, actual_kwargs),
-    ):
-        if _canonical_json_bytes(declared_value) != _canonical_json_bytes(effective_value):
-            differences.append(
-                {"field": key, "declared": declared_value, "effective": effective_value}
-            )
-
+def build_collector_contract(
+    source,
+    provider_session,
+    *,
+    environment_contract_id,
+    inference_device,
+):
+    """Build the immutable, seed-independent policy collector contract."""
     mode = "deterministic" if source.deterministic else "stochastic"
     source_document = {
         "repo_id": source.repo_id,
@@ -1802,10 +1209,13 @@ def build_collector_contract(source, env, *, inference_device):
             },
         },
         "execution": {
-            "declared": declared,
-            "effective": effective,
-            "declared_effective_differences": differences,
-            "exact_contract_parity": not differences,
+            "environment_contract_id": environment_contract_id,
+            "policy_observations": "provider-selected",
+            "recorded_observations": "provider-selected-rgb",
+            "recorded_actions": "exact-env-step-input",
+            "recorded_policy_actions": "unadapted-policy-output",
+            "action_space": _space_contract(provider_session.env.action_space),
+            "observation_space": _space_contract(provider_session.env.observation_space),
         },
         "runtime": {
             "inference_device": str(inference_device),
@@ -1819,7 +1229,7 @@ def build_collector_contract(source, env, *, inference_device):
                     source.provider,
                 )
             },
-            "gymrec_policy_adapter_version": 1,
+            "gymrec_policy_adapter_version": 3,
         },
     }
     contract_id = hashlib.sha256(_canonical_json_bytes(collection_document)).hexdigest()
@@ -1865,6 +1275,23 @@ def _materialize_collector_contract(contract, root):
     else:
         with open(collection_path, "wb") as file_obj:
             file_obj.write(collection_bytes)
+    return destination
+
+
+def _materialize_environment_artifact(artifact, root):
+    if artifact is None:
+        raise ValueError("Recording requires an immutable environment artifact")
+    destination = os.path.join(root, artifact.relative_dir)
+    os.makedirs(destination, exist_ok=True)
+    document_path = os.path.join(destination, ENVIRONMENT_DOCUMENT_FILENAME)
+    payload = _canonical_json_bytes(artifact.document) + b"\n"
+    if os.path.exists(document_path):
+        with open(document_path, "rb") as stream:
+            if stream.read() != payload:
+                raise ValueError(f"Environment contract conflict for {artifact.contract_id}")
+    else:
+        with open(document_path, "wb") as stream:
+            stream.write(payload)
     return destination
 
 
@@ -1948,16 +1375,6 @@ def _metadata_str(metadata, *paths, default=None):
         if value:
             return str(value)
     return default
-
-
-def _stable_retro_action_masks(env_id, action_set):
-    action_sets = STABLE_RETRO_DISCRETE_ACTION_SETS.get(env_id, {})
-    if action_set not in action_sets:
-        valid = ", ".join(sorted(action_sets)) or "none"
-        raise SystemExit(
-            f"Unsupported action_set {action_set!r} for {env_id}; supported sets: {valid}"
-        )
-    return tuple(NES_SIMPLE_ACTION_MASKS[name] for name in action_sets[action_set])
 
 
 def _download_huggingface_policy_file(repo_id, revision, filename):
@@ -2113,41 +1530,8 @@ def _validate_release_manifest(
     return manifest_path
 
 
-def _normalize_training_environment(model_document, *, repo_id):
-    environment = _metadata_value(
-        model_document, ("provenance", "training_metadata", "environment")
-    )
-    if not isinstance(environment, dict):
-        return None
-    qualified_env_id = environment.get("env_id")
-    if not isinstance(qualified_env_id, str) or ":" not in qualified_env_id:
-        raise SystemExit(f"{repo_id}/model.json training environment has an invalid env_id")
-    provider, game = qualified_env_id.split(":", 1)
-    preprocessing = environment.get("preprocessing")
-    if not isinstance(preprocessing, dict):
-        raise SystemExit(f"{repo_id}/model.json training environment is missing preprocessing")
-    resize = preprocessing.get("obs_resize")
-    if not isinstance(resize, list) or len(resize) != 2 or resize[0] != resize[1]:
-        raise SystemExit(f"{repo_id}/model.json training environment requires a square obs_resize")
-    provider_args = dict(environment.get("provider_args") or {})
-    return {
-        "env_provider": provider,
-        "game": game,
-        "state": environment.get("state"),
-        "frame_skip": preprocessing.get("frame_skip"),
-        "max_pool_frames": preprocessing.get("max_pool_frames"),
-        "observation_size": resize[0],
-        "obs_crop": preprocessing.get("obs_crop"),
-        "obs_crop_mode": preprocessing.get("obs_crop_mode"),
-        "obs_crop_fill": preprocessing.get("obs_crop_fill"),
-        "obs_resize_algorithm": preprocessing.get("obs_resize_algorithm"),
-        "sticky_action_prob": preprocessing.get("sticky_action_prob"),
-        "env_args": provider_args,
-        "task": environment.get("task"),
-    }
-
-
 def _recipe_evaluation_environment(recipe_document, model_document, *, repo_id):
+    del model_document
     recipe = recipe_document.get("recipe")
     if not isinstance(recipe, dict):
         raise SystemExit(f"{repo_id}/recipe.json is missing recipe")
@@ -2160,36 +1544,15 @@ def _recipe_evaluation_environment(recipe_document, model_document, *, repo_id):
     if not isinstance(evaluation, dict):
         raise SystemExit(f"{repo_id}/recipe.json is missing recipe.eval")
     environment = evaluation.get("environment")
-    if environment is None:
-        environment = _normalize_training_environment(model_document, repo_id=repo_id)
     if not isinstance(environment, dict):
         raise SystemExit(
-            f"{repo_id}/recipe.json omits recipe.eval.environment and model.json has no "
-            "standardized training environment fallback"
+            f"{repo_id}/recipe.json must declare recipe.eval.environment; "
+            "training-environment fallback is not supported"
         )
-    required = {
-        "env_provider",
-        "frame_skip",
-        "game",
-        "max_pool_frames",
-        "obs_crop",
-        "obs_crop_fill",
-        "obs_crop_mode",
-        "obs_resize_algorithm",
-        "observation_size",
-        "sticky_action_prob",
-        "task",
-    }
-    missing = sorted(required - set(environment))
-    if missing:
-        raise SystemExit(
-            f"{repo_id}/recipe.json evaluation environment is missing: {', '.join(missing)}"
-        )
-    if not isinstance(environment.get("env_args", {}), dict):
-        raise SystemExit(f"{repo_id}/recipe.json environment.env_args must be an object")
-    obs_crop = environment["obs_crop"]
-    if not isinstance(obs_crop, list) or len(obs_crop) != 4:
-        raise SystemExit(f"{repo_id}/recipe.json environment.obs_crop must contain four integers")
+    try:
+        EnvironmentContract.parse(environment, label=f"{repo_id}/recipe.json environment")
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     action_sampling = evaluation.get("action_sampling")
     if action_sampling not in {"stochastic", "deterministic"}:
         raise SystemExit(
@@ -2301,27 +1664,6 @@ def resolve_huggingface_policy_source(
     evaluation, environment = _recipe_evaluation_environment(
         recipe_document, model_document, repo_id=repo_id
     )
-    provider = str(environment["env_provider"])
-    backend_by_provider = {
-        "supermariobrosnes-turbo": "supermariobrosnes-turbo",
-        "stable-retro-turbo": "stable-retro-turbo",
-    }
-    if provider not in backend_by_provider:
-        raise SystemExit(
-            f"Unsupported rlab evaluation env_provider {provider!r}; supported providers: "
-            + ", ".join(sorted(backend_by_provider))
-        )
-    task = environment["task"]
-    if not isinstance(task, dict) or task.get("id") != "mario":
-        raise SystemExit(
-            f"Unsupported rlab evaluation task {getattr(task, 'get', lambda *_: None)('id')!r}; "
-            "gymrec currently supports recipe task 'mario'"
-        )
-    action = task.get("action")
-    if not isinstance(action, dict) or not action.get("set"):
-        raise SystemExit(f"{repo_id}/recipe.json task.action.set is required")
-    env_args = environment.get("env_args", {})
-    frame_stack = int(env_args.get("frame_stack", 1))
     action_sampling = evaluation["action_sampling"]
     resolved_deterministic = (
         action_sampling == "deterministic" if deterministic is None else bool(deterministic)
@@ -2341,15 +1683,6 @@ def resolve_huggingface_policy_source(
         release_manifest_document=release_manifest_document,
         evaluation=evaluation,
         environment=environment,
-        provider=provider,
-        backend=backend_by_provider[provider],
-        env_id=str(environment["game"]),
-        state=str(environment["state"]) if environment.get("state") is not None else None,
-        action_set=str(action["set"]),
-        frame_skip=max(int(environment["frame_skip"]), 1),
-        frame_stack=max(frame_stack, 1),
-        observation_size=int(environment["observation_size"]),
-        obs_crop=tuple(int(value) for value in environment["obs_crop"]),
         deterministic=resolved_deterministic,
         device=device,
     )
@@ -2357,8 +1690,6 @@ def resolve_huggingface_policy_source(
 
 AGENT_POLICY_FACTORIES = {
     "random": lambda env: RandomPolicy(env.action_space),
-    "mario": lambda env: MarioRightJumpPolicy(env.action_space),
-    "breakout": lambda env: BreakoutCatcherPolicy(env.action_space, env=env),
 }
 
 
@@ -2391,6 +1722,7 @@ def _upload_live_episode_package(
     dataset,
     *,
     storage_format,
+    fps,
     max_retries,
     base_wait,
     persist_dataset,
@@ -2404,6 +1736,7 @@ def _upload_live_episode_package(
         "package_dir": package_dir,
         "storage_format": storage_format,
         "frames": len(dataset),
+        "fps": fps,
     }
     identity = _coerce_recording_identity(recording_identity)
     _set_live_upload_manifest_entry(identity, episode_id, state="pending", **manifest_kwargs)
@@ -2415,6 +1748,7 @@ def _upload_live_episode_package(
         episode_ids={episode_id},
         replace=False,
         include_previews=False,
+        preview_fps=fps,
         max_retries=max_retries,
         base_wait=base_wait,
     )
@@ -2441,6 +1775,8 @@ class LiveEpisodeUploadManager:
         recording_identity,
         storage_format,
         collector_contract=None,
+        environment_artifact=None,
+        fps=None,
         max_retries=5,
         base_wait=1.0,
     ):
@@ -2448,17 +1784,20 @@ class LiveEpisodeUploadManager:
         self.env_id = self.identity.display_ref
         self.storage_format = storage_format
         self.collector_contract = collector_contract
+        self.environment_artifact = environment_artifact
+        self.fps = fps
         self.max_retries = max_retries
         self.base_wait = base_wait
         self.queue_dir = _get_live_upload_queue_dir(self.identity)
 
     def begin_episode(self, episode_uuid):
-        episode_id = episode_uuid.hex
+        episode_id = str(episode_uuid)
         package_dir = os.path.join(self.queue_dir, episode_id)
         if os.path.exists(package_dir):
             shutil.rmtree(package_dir)
         os.makedirs(package_dir, exist_ok=True)
         _materialize_collector_contract(self.collector_contract, package_dir)
+        _materialize_environment_artifact(self.environment_artifact, package_dir)
         package = LiveEpisodePackage(episode_id=episode_id, package_dir=package_dir)
         _set_live_upload_manifest_entry(
             self.identity,
@@ -2467,6 +1806,7 @@ class LiveEpisodeUploadManager:
             package_dir=package.package_dir,
             storage_format=self.storage_format,
             frames=0,
+            fps=self.fps,
         )
         return package
 
@@ -2477,10 +1817,18 @@ class LiveEpisodeUploadManager:
             package.package_dir,
             dataset,
             storage_format=self.storage_format,
+            fps=self.fps,
             max_retries=self.max_retries,
             base_wait=self.base_wait,
             persist_dataset=True,
         )
+
+    def discard_episode(self, package):
+        """Remove an unfinished episode without publishing a synthetic boundary."""
+        shutil.rmtree(package.package_dir, ignore_errors=True)
+        manifest = _load_live_upload_manifest(self.identity)
+        manifest.get("episodes", {}).pop(package.episode_id, None)
+        _save_live_upload_manifest(self.identity, manifest)
 
 
 def create_agent_policy(agent_type, env):
@@ -2491,94 +1839,149 @@ def create_agent_policy(agent_type, env):
         raise ValueError(f"Unknown agent type: {agent_type}") from None
 
 
-def _recording_dataset_from_dict(data, storage_format):
-    """Build a Dataset with the canonical gymrec recording feature casts."""
-    dataset = Dataset.from_dict(data)
-    if storage_format == STORAGE_FORMAT_IMAGES:
-        dataset = dataset.cast_column("observations", HFImage())
-    dataset = dataset.cast_column("episode_id", Value("binary"))
-    dataset = dataset.cast_column("session_id", Value("binary"))
-    for column in (
-        "logical_env_id",
-        "capture_backend",
-        "state_name",
-        "rom_sha256",
-        "nes_button_order",
-        "action_encoding",
+@dataclass(frozen=True)
+class DatasetField:
+    name: str
+    type_label: str
+    description: str
+    cast: str | None = None
+
+    def card_line(self):
+        return f"- **{self.name}** (`{self.type_label}`): {self.description}"
+
+
+COMMON_DATASET_FIELDS = (
+    DatasetField("episode_id", "string", "Canonical UUID for the episode", "string"),
+    DatasetField("step_index", "int64", "Zero-based row index within the episode", "int64"),
+    DatasetField("seed", "int64", "Environment reset seed for this episode", "int64"),
+    DatasetField(
+        "actions",
+        "environment action or null",
+        "Exact action passed to `env.step`; null on the terminal-observation row",
+    ),
+    DatasetField(
+        "policy_actions",
+        "policy action or null",
+        "Original policy output before provider adaptation; null when unavailable",
+    ),
+    DatasetField("rewards", "float64 or null", "Step reward; null on terminal rows", "float64"),
+    DatasetField(
+        "terminations",
+        "bool or null",
+        "Natural termination flag; null on terminal rows",
+        "bool",
+    ),
+    DatasetField("truncations", "bool or null", "Truncation flag; null on terminal rows", "bool"),
+    DatasetField(
+        "infos",
+        "string or null",
+        "Environment info as JSON; null on terminal rows",
+        "string",
+    ),
+    DatasetField("session_id", "string", "Canonical UUID for one `gymrec record` run", "string"),
+    DatasetField(
+        "dataset_format_version",
+        "int64",
+        "Version of the canonical gymrec row schema",
+        "int64",
+    ),
+    DatasetField(
+        "collector", "string", "Collector name, built-in agent, or immutable policy ref", "string"
+    ),
+    DatasetField("gymrec_version", "string", "gymrec version used for collection", "string"),
+    DatasetField("storage_format", "string", "Observation storage backend", "string"),
+    DatasetField(
+        "provider_id",
+        "string",
+        "Environment provider distribution that produced the transition",
+        "string",
+    ),
+    DatasetField(
+        "env_id", "string", "Provider-owned logical environment identifier", "string"
+    ),
+    DatasetField(
+        "environment_contract_id",
+        "string",
+        "SHA-256 key for the immutable environment document",
+        "string",
+    ),
+    DatasetField(
         "collector_contract_id",
-        "policy_mode",
-    ):
-        if column in dataset.column_names:
-            dataset = dataset.cast_column(column, Value("string"))
-    if "frame_skip" in dataset.column_names:
-        dataset = dataset.cast_column("frame_skip", Value("int64"))
-    if "sticky_action_prob" in dataset.column_names:
-        dataset = dataset.cast_column("sticky_action_prob", Value("float64"))
-    if "policy_seed" in dataset.column_names:
-        dataset = dataset.cast_column("policy_seed", Value("int64"))
-    return dataset
+        "string or null",
+        "SHA-256 key for immutable collector documents",
+        "string",
+    ),
+    DatasetField(
+        "policy_mode", "string or null", "Deterministic or stochastic policy mode", "string"
+    ),
+    DatasetField("policy_seed", "int64 or null", "Episode policy seed", "int64"),
+)
 
+IMAGE_DATASET_FIELDS = (
+    DatasetField("observations", "Image", "Lossless RGB environment observation", "image"),
+)
 
-CANONICAL_COMMON_COLUMNS = (
-    "episode_id",
-    "seed",
-    "actions",
-    "rewards",
-    "terminations",
-    "truncations",
-    "infos",
-    "session_id",
-    "collector",
-    "gymrec_version",
-    "storage_format",
-    "logical_env_id",
-    "capture_backend",
-    "state_name",
-    "rom_sha256",
-    "nes_button_order",
-    "action_encoding",
-    "frame_skip",
-    "sticky_action_prob",
-    "collector_contract_id",
-    "policy_mode",
-    "policy_seed",
+VIDEO_DATASET_FIELDS = (
+    DatasetField("video_path", "string", "Relative canonical lossless RGB stream path", "string"),
+    DatasetField("frame_sha256", "string", "SHA-256 of decoded raw RGB frame bytes", "string"),
+    DatasetField("frame_width", "int64", "Decoded RGB frame width", "int64"),
+    DatasetField("frame_height", "int64", "Decoded RGB frame height", "int64"),
+)
+
+TRANSITION_DATASET_FIELD_NAMES = frozenset(
+    {"actions", "policy_actions", "rewards", "terminations", "truncations", "infos"}
+)
+COMMON_DATASET_FIELD_NAMES = tuple(field.name for field in COMMON_DATASET_FIELDS)
+ROW_CONTEXT_FIELD_NAMES = tuple(
+    name for name in COMMON_DATASET_FIELD_NAMES if name not in TRANSITION_DATASET_FIELD_NAMES
 )
 
 
-def _canonical_columns(storage_format):
-    storage_columns = (
-        ("observations",)
-        if storage_format == STORAGE_FORMAT_IMAGES
-        else (
-            "video_path",
-            "frame_index",
-            "frame_sha256",
-            "frame_width",
-            "frame_height",
-            "episode_num_observations",
-        )
+def _canonical_dataset_row(**values):
+    """Build a complete canonical common row and reject unknown fields."""
+    unknown = sorted(set(values) - set(COMMON_DATASET_FIELD_NAMES))
+    if unknown:
+        raise ValueError(f"Unknown canonical dataset row field(s): {', '.join(unknown)}")
+    row = {name: None for name in COMMON_DATASET_FIELD_NAMES}
+    row.update(values)
+    return row
+
+
+def _dataset_fields(storage_format):
+    storage_format = _normalize_storage_format(storage_format)
+    storage_fields = (
+        IMAGE_DATASET_FIELDS if storage_format == STORAGE_FORMAT_IMAGES else VIDEO_DATASET_FIELDS
     )
-    return set(CANONICAL_COMMON_COLUMNS) | set(storage_columns)
+    return (*COMMON_DATASET_FIELDS, *storage_fields)
+
+
+def _recording_dataset_from_dict(data, storage_format):
+    """Build a Dataset using the canonical ordered field and cast specification."""
+    dataset = Dataset.from_dict(data)
+    for field in _dataset_fields(storage_format):
+        if field.name not in dataset.column_names or field.cast is None:
+            continue
+        feature = HFImage() if field.cast == "image" else Value(field.cast)
+        dataset = dataset.cast_column(field.name, feature)
+    return dataset
 
 
 def _canonical_column_order(storage_format):
-    storage_columns = (
-        ("observations",)
-        if storage_format == STORAGE_FORMAT_IMAGES
-        else (
-            "video_path",
-            "frame_index",
-            "frame_sha256",
-            "frame_width",
-            "frame_height",
-            "episode_num_observations",
-        )
-    )
-    return [*CANONICAL_COMMON_COLUMNS, *storage_columns]
+    return [field.name for field in _dataset_fields(storage_format)]
+
+
+def _canonical_columns(storage_format):
+    return set(_canonical_column_order(storage_format))
 
 
 def _validate_canonical_dataset_schema(dataset, *, label="dataset"):
-    storage_format = _dataset_storage_format(dataset)
+    try:
+        storage_format = _dataset_storage_format(dataset)
+    except ValueError as exc:
+        raise ValueError(
+            f"{label} does not use the current canonical gymrec schema ({exc}). "
+            "Legacy datasets are not migrated or aligned."
+        ) from exc
     expected = _canonical_columns(storage_format)
     actual_columns = _strip_runtime_columns(dataset).column_names
     actual = set(actual_columns)
@@ -2596,6 +1999,97 @@ def _validate_canonical_dataset_schema(dataset, *, label="dataset"):
             f"{label} does not use the current canonical gymrec schema ({'; '.join(details)}). "
             "Legacy datasets are not migrated or aligned."
         )
+    versions = set(dataset["dataset_format_version"])
+    if versions != {DATASET_FORMAT_VERSION}:
+        raise ValueError(
+            f"{label} uses dataset_format_version {sorted(versions, key=str)!r}; "
+            f"expected {DATASET_FORMAT_VERSION}. Legacy datasets are not migrated or aligned."
+        )
+    for column in ("episode_id", "session_id"):
+        for value in set(dataset[column]):
+            try:
+                canonical = str(uuid.UUID(str(value)))
+            except (TypeError, ValueError, AttributeError) as exc:
+                raise ValueError(f"{label} has invalid {column} {value!r}") from exc
+            if value != canonical:
+                raise ValueError(
+                    f"{label} has non-canonical {column} {value!r}; expected {canonical!r}"
+                )
+    episode_keys, row_indices_by_episode = _ordered_episode_rows(dataset)
+    for episode_key in episode_keys:
+        row_indices = row_indices_by_episode[episode_key]
+        step_indices = [int(dataset[index]["step_index"]) for index in row_indices]
+        expected_steps = list(range(len(row_indices)))
+        if step_indices != expected_steps:
+            raise ValueError(
+                f"{label} episode {episode_key} has step_index values {step_indices}; "
+                f"expected {expected_steps}"
+            )
+        terminal_steps = [
+            step_index
+            for step_index, row_index in enumerate(row_indices)
+            if _is_terminal_action(dataset[row_index].get("actions"))
+        ]
+        if terminal_steps != [len(row_indices) - 1]:
+            raise ValueError(
+                f"{label} episode {episode_key} must have exactly one terminal-observation "
+                "row at the final step"
+            )
+        terminal_row = dataset[row_indices[-1]]
+        non_null_terminal_fields = sorted(
+            field for field in TRANSITION_DATASET_FIELD_NAMES if terminal_row.get(field) is not None
+        )
+        if non_null_terminal_fields:
+            raise ValueError(
+                f"{label} episode {episode_key} terminal-observation row has non-null "
+                f"transition fields: {', '.join(non_null_terminal_fields)}"
+            )
+        for row_index in row_indices[:-1]:
+            row = dataset[row_index]
+            missing_transition_fields = sorted(
+                field
+                for field in ("actions", "rewards", "terminations", "truncations", "infos")
+                if row.get(field) is None
+            )
+            if missing_transition_fields:
+                raise ValueError(
+                    f"{label} episode {episode_key} step {row.get('step_index')} has null "
+                    f"transition fields: {', '.join(missing_transition_fields)}"
+                )
+    return dataset
+
+
+def _validate_environment_artifacts(dataset, root, *, label="dataset"):
+    contract_ids = set(dataset["environment_contract_id"])
+    for contract_id in sorted(contract_ids):
+        if (
+            not isinstance(contract_id, str)
+            or len(contract_id) != 64
+            or any(char not in "0123456789abcdef" for char in contract_id.lower())
+        ):
+            raise ValueError(f"{label} has an invalid environment_contract_id {contract_id!r}")
+        if not root:
+            raise ValueError(f"{label} is missing environment artifacts for {contract_id}")
+        relative_path = (
+            f"{ENVIRONMENT_ARTIFACT_DIR}/{contract_id}/{ENVIRONMENT_DOCUMENT_FILENAME}"
+        )
+        path = os.path.join(root, relative_path)
+        if not os.path.isfile(path):
+            raise ValueError(f"{label} is missing {relative_path}")
+        with open(path) as stream:
+            document = json.load(stream)
+        validate_environment_document(document, expected_id=contract_id)
+        matching_rows = [
+            index
+            for index, value in enumerate(dataset["environment_contract_id"])
+            if value == contract_id
+        ]
+        if any(
+            dataset[index]["provider_id"] != document["provider_id"]
+            or dataset[index]["env_id"] != document["environment_id"]
+            for index in matching_rows
+        ):
+            raise ValueError(f"{label} rows conflict with environment contract {contract_id}")
     return dataset
 
 
@@ -2654,10 +2148,109 @@ def _validate_collector_artifacts(dataset, root, *, label="dataset"):
     return dataset
 
 
+def _load_dataset_collector_documents(dataset, *, label="dataset"):
+    """Load and validate the immutable collector documents needed at playback time."""
+    contract_ids = sorted(
+        {value for value in dataset["collector_contract_id"] if value is not None}
+    )
+    if not contract_ids:
+        return {}
+
+    local_root = _first_dataset_value(dataset, RUNTIME_VIDEO_BASE_COLUMN)
+    hf_repo_id = _first_dataset_value(dataset, RUNTIME_HF_REPO_COLUMN)
+    documents = {}
+    for contract_id in contract_ids:
+        relative_path = f"{COLLECTOR_ARTIFACT_DIR}/{contract_id}/collection.json"
+        if local_root:
+            path = os.path.join(local_root, relative_path)
+        elif hf_repo_id:
+            path = hf_hub_download(
+                repo_id=hf_repo_id,
+                repo_type="dataset",
+                filename=relative_path,
+            )
+        else:
+            raise ValueError(f"{label} has no source for collector {contract_id}")
+        if not os.path.isfile(path):
+            raise ValueError(f"{label} is missing {relative_path}")
+        document = _load_json_document(path, label=f"collector {contract_id}/collection.json")
+        if (
+            document.get("document_type") != COLLECTION_DOCUMENT_TYPE
+            or document.get("format_version") != COLLECTION_FORMAT_VERSION
+        ):
+            raise ValueError(f"{label} has an unsupported collector contract {contract_id}")
+        actual_id = hashlib.sha256(_canonical_json_bytes(document)).hexdigest()
+        if actual_id != contract_id:
+            raise ValueError(
+                f"{label} collector contract hash mismatch: {actual_id} != {contract_id}"
+            )
+        documents[contract_id] = document
+    return documents
+
+
+def _load_dataset_environment_documents(dataset, *, label="dataset"):
+    contract_ids = sorted(set(dataset["environment_contract_id"]))
+    local_root = _first_dataset_value(dataset, RUNTIME_VIDEO_BASE_COLUMN)
+    hf_repo_id = _first_dataset_value(dataset, RUNTIME_HF_REPO_COLUMN)
+    documents = {}
+    for contract_id in contract_ids:
+        relative_path = (
+            f"{ENVIRONMENT_ARTIFACT_DIR}/{contract_id}/{ENVIRONMENT_DOCUMENT_FILENAME}"
+        )
+        if local_root:
+            path = os.path.join(local_root, relative_path)
+        elif hf_repo_id:
+            path = hf_hub_download(
+                repo_id=hf_repo_id,
+                repo_type="dataset",
+                filename=relative_path,
+            )
+        else:
+            raise ValueError(f"{label} has no source for environment {contract_id}")
+        with open(path) as stream:
+            document = json.load(stream)
+        validate_environment_document(document, expected_id=contract_id)
+        documents[contract_id] = document
+    return documents
+
+
+def _session_from_environment_document(document, *, render_mode):
+    expected_version = (document.get("provenance") or {}).get("version")
+    provider_id = document["provider_id"]
+    actual_version = _installed_package_version(provider_id)
+    if actual_version != expected_version:
+        raise ValueError(
+            f"Environment contract requires {provider_id}=={expected_version}; "
+            f"installed version is {actual_version or 'missing'}"
+        )
+    contract = EnvironmentContract.parse(
+        {
+            "contract_version": document["provider_contract_version"],
+            "provider_id": provider_id,
+            "environment_id": document["environment_id"],
+            "config": document["effective_config"],
+        },
+        label="recorded environment",
+    )
+    session = create_session(contract, render_mode=render_mode)
+    if _canonical_json_bytes(session.provenance) != _canonical_json_bytes(document["provenance"]):
+        session.env.close()
+        raise ValueError("Installed provider assets do not match the recorded environment contract")
+    if _canonical_json_bytes(_space_contract(session.env.action_space)) != _canonical_json_bytes(
+        document["action_space"]
+    ):
+        session.env.close()
+        raise ValueError("Installed provider action space does not match the recording")
+    if _canonical_json_bytes(_space_contract(session.env.observation_space)) != _canonical_json_bytes(
+        document["observation_space"]
+    ):
+        session.env.close()
+        raise ValueError("Installed provider observation space does not match the recording")
+    return contract, session
+
+
 class DatasetRecorderWrapper(gym.Wrapper):
-    """
-    Gymnasium wrapper for recording and replaying Atari gameplay as Hugging Face datasets.
-    """
+    """Record and replay the final Gymnasium contract exposed by a provider session."""
 
     def __init__(
         self,
@@ -2668,16 +2261,15 @@ class DatasetRecorderWrapper(gym.Wrapper):
         storage_format=None,
         live_upload_manager=None,
         initial_seed=None,
-        initial_policy_seed=None,
         collector_contract=None,
+        provider_session=None,
+        environment_artifact=None,
     ):
         _lazy_init()
         super().__init__(env)
 
         self.recording = False
-        self.storage_format = _normalize_storage_format(
-            storage_format or CONFIG["storage"].get("format", STORAGE_FORMAT_IMAGES)
-        )
+        self.storage_format = _configured_storage_format(storage_format)
         self._ffmpeg_path = None
         if self.storage_format == STORAGE_FORMAT_LOSSLESS_VIDEO:
             self._ffmpeg_path, _ = _require_lossless_video_tools()
@@ -2688,10 +2280,11 @@ class DatasetRecorderWrapper(gym.Wrapper):
         self.collector = collector
         self.live_upload_manager = live_upload_manager
         self.initial_seed = int(initial_seed) if initial_seed is not None else None
-        self.initial_policy_seed = (
-            int(initial_policy_seed) if initial_policy_seed is not None else None
-        )
         self.collector_contract = collector_contract
+        if provider_session is None or environment_artifact is None:
+            raise ValueError("DatasetRecorderWrapper requires a provider session and environment artifact")
+        self.provider_session = provider_session
+        self.environment_artifact = environment_artifact
         self._gymrec_version = _get_gymrec_version()
 
         if not headless:
@@ -2701,29 +2294,14 @@ class DatasetRecorderWrapper(gym.Wrapper):
         self.current_keys = set()
         self.key_lock = threading.Lock()
 
-        self.episode_ids = []
-        self.seeds = []
-        self.policy_seeds = []
-        self.frames = []
-        self.actions = []
-        self.rewards = []
-        self.terminations = []
-        self.truncations = []
-        self.infos = []
-        self.session_ids = []
-        self.video_paths = []
-        self.frame_indices = []
-        self.frame_sha256s = []
-        self.frame_widths = []
-        self.frame_heights = []
-        self.episode_num_observations = []
+        self._recording_rows = []
         self._current_episode_uuid = None
         self._current_episode_seed = None
-        self._current_policy_seed = None
         self._session_uuid = None
 
         self.temp_dir = tempfile.mkdtemp()
         _materialize_collector_contract(self.collector_contract, self.temp_dir)
+        _materialize_environment_artifact(self.environment_artifact, self.temp_dir)
         self.video_artifact_dir = os.path.join(self.temp_dir, VIDEO_ARTIFACT_DIR)
         self._current_episode_video_frames = []
         self._current_episode_video_hashes = []
@@ -2746,75 +2324,34 @@ class DatasetRecorderWrapper(gym.Wrapper):
         return self.live_upload_manager is not None
 
     def _clear_recording_buffers(self):
-        self.episode_ids.clear()
-        self.seeds.clear()
-        self.policy_seeds.clear()
-        self.frames.clear()
-        self.actions.clear()
-        self.rewards.clear()
-        self.terminations.clear()
-        self.truncations.clear()
-        self.infos.clear()
-        self.session_ids.clear()
-        self.video_paths.clear()
-        self.frame_indices.clear()
-        self.frame_sha256s.clear()
-        self.frame_widths.clear()
-        self.frame_heights.clear()
-        self.episode_num_observations.clear()
+        self._recording_rows.clear()
         self._current_episode_video_frames.clear()
         self._current_episode_video_hashes.clear()
 
+    def _recording_context_row(self, episode_uuid, step_index):
+        contract = self.collector_contract
+        return _canonical_dataset_row(
+            episode_id=str(episode_uuid),
+            step_index=int(step_index),
+            seed=self._current_episode_seed,
+            session_id=str(self._session_uuid),
+            dataset_format_version=DATASET_FORMAT_VERSION,
+            collector=self.collector,
+            gymrec_version=self._gymrec_version,
+            storage_format=self.storage_format,
+            provider_id=self.provider_session.provider_id,
+            env_id=self.provider_session.environment_id,
+            environment_contract_id=self.environment_artifact.contract_id,
+            collector_contract_id=contract.contract_id if contract else None,
+            policy_mode=contract.policy_mode if contract else None,
+            policy_seed=self._current_policy_seed if contract else None,
+        )
+
     def _build_recorded_dataset(self):
-        env_metadata = getattr(self, "_env_metadata", None) or {}
-        collector_contract = getattr(self, "collector_contract", None)
-        row_count = len(self.frames)
         data = {
-            "episode_id": self.episode_ids,
-            "seed": self.seeds,
-            "actions": self.actions,
-            "rewards": self.rewards,
-            "terminations": self.terminations,
-            "truncations": self.truncations,
-            "infos": self.infos,
-            "session_id": self.session_ids,
-            "collector": [self.collector] * len(self.frames),
-            "gymrec_version": [self._gymrec_version] * len(self.frames),
-            "storage_format": [self.storage_format] * len(self.frames),
-            "logical_env_id": [env_metadata.get("env_id")] * row_count,
-            "capture_backend": [env_metadata.get("capture_backend")] * row_count,
-            "state_name": [env_metadata.get("state_name")] * row_count,
-            "rom_sha256": [env_metadata.get("rom_sha256")] * row_count,
-            "nes_button_order": [
-                json.dumps(env_metadata.get("nes_button_order"))
-                if env_metadata.get("nes_button_order") is not None
-                else None
-            ]
-            * row_count,
-            "action_encoding": [env_metadata.get("action_encoding")] * row_count,
-            "frame_skip": [env_metadata.get("frameskip")] * row_count,
-            "sticky_action_prob": [env_metadata.get("sticky_actions")] * row_count,
-            "collector_contract_id": [
-                collector_contract.contract_id if collector_contract else None
-            ]
-            * row_count,
-            "policy_mode": [collector_contract.policy_mode if collector_contract else None]
-            * row_count,
-            "policy_seed": getattr(self, "policy_seeds", [None] * row_count),
+            field.name: [row.get(field.name) for row in self._recording_rows]
+            for field in _dataset_fields(self.storage_format)
         }
-        if self.storage_format == STORAGE_FORMAT_IMAGES:
-            data["observations"] = self.frames
-        else:
-            data.update(
-                {
-                    "video_path": self.video_paths,
-                    "frame_index": self.frame_indices,
-                    "frame_sha256": self.frame_sha256s,
-                    "frame_width": self.frame_widths,
-                    "frame_height": self.frame_heights,
-                    "episode_num_observations": self.episode_num_observations,
-                }
-            )
         return _recording_dataset_from_dict(data, self.storage_format)
 
     def _start_live_episode(self, episode_uuid):
@@ -2837,14 +2374,15 @@ class DatasetRecorderWrapper(gym.Wrapper):
             os.fsync(f.fileno())
 
     def _write_live_step_journal(self, next_observation):
-        if not self._live_upload_enabled or self._live_episode is None or not self.actions:
+        if not self._live_upload_enabled or self._live_episode is None or not self._recording_rows:
             return
-        row_index = len(self.actions) - 1
-        if row_index < 0 or row_index >= len(self.rewards):
+        row_index = len(self._recording_rows) - 1
+        row = self._recording_rows[row_index]
+        if row["rewards"] is None:
             return
 
         terminal_frame = _observation_to_rgb_array(
-            _recording_observation(self.env, next_observation)
+            _recording_observation(self.provider_session, next_observation)
         )
         PILImage.fromarray(terminal_frame).save(
             self._live_episode.terminal_candidate_path,
@@ -2852,40 +2390,15 @@ class DatasetRecorderWrapper(gym.Wrapper):
             lossless=True,
             method=6,
         )
+        journal_row = dict(row)
+        if self.storage_format == STORAGE_FORMAT_IMAGES:
+            journal_row["observations"] = self._relative_live_package_path(row["observations"])
+
         record = {
             "type": "step",
             "row_index": row_index,
-            "episode_id": self._current_episode_uuid.hex,
-            "seed": self.seeds[row_index],
-            "action": self.actions[row_index],
-            "reward": self.rewards[row_index],
-            "termination": self.terminations[row_index],
-            "truncation": self.truncations[row_index],
-            "info": self.infos[row_index],
-            "session_id": self._session_uuid.hex,
-            "collector": self.collector,
-            "gymrec_version": self._gymrec_version,
-            "storage_format": self.storage_format,
-            "logical_env_id": (self._env_metadata or {}).get("env_id"),
-            "capture_backend": (self._env_metadata or {}).get("capture_backend"),
-            "state_name": (self._env_metadata or {}).get("state_name"),
-            "rom_sha256": (self._env_metadata or {}).get("rom_sha256"),
-            "nes_button_order": (
-                json.dumps((self._env_metadata or {}).get("nes_button_order"))
-                if (self._env_metadata or {}).get("nes_button_order") is not None
-                else None
-            ),
-            "action_encoding": (self._env_metadata or {}).get("action_encoding"),
-            "frame_skip": (self._env_metadata or {}).get("frameskip"),
-            "sticky_action_prob": (self._env_metadata or {}).get("sticky_actions"),
-            "collector_contract_id": (
-                self.collector_contract.contract_id if self.collector_contract else None
-            ),
-            "policy_mode": (
-                self.collector_contract.policy_mode if self.collector_contract else None
-            ),
-            "policy_seed": self.policy_seeds[row_index],
-            "fps": self._fps or get_default_fps(self.env),
+            "row": journal_row,
+            "fps": self._fps or _provider_fps(self.provider_session),
             "terminal_candidate_path": self._relative_live_package_path(
                 self._live_episode.terminal_candidate_path
             ),
@@ -2893,18 +2406,6 @@ class DatasetRecorderWrapper(gym.Wrapper):
             "terminal_candidate_width": int(terminal_frame.shape[1]),
             "terminal_candidate_height": int(terminal_frame.shape[0]),
         }
-        if self.storage_format == STORAGE_FORMAT_IMAGES:
-            record["observation_path"] = self._relative_live_package_path(self.frames[row_index])
-        else:
-            record.update(
-                {
-                    "video_path": self.video_paths[row_index],
-                    "frame_index": self.frame_indices[row_index],
-                    "frame_sha256": self.frame_sha256s[row_index],
-                    "frame_width": self.frame_widths[row_index],
-                    "frame_height": self.frame_heights[row_index],
-                }
-            )
         self._write_jsonl_record(self._live_episode.journal_path, record)
 
     def _ensure_screen(self, frame):
@@ -2927,7 +2428,7 @@ class DatasetRecorderWrapper(gym.Wrapper):
         if self._live_upload_enabled and self._live_episode is not None:
             base_dir = self._live_episode.frame_dir
         os.makedirs(base_dir, exist_ok=True)
-        path = os.path.join(base_dir, f"frame_{len(self.frames):05d}.webp")
+        path = os.path.join(base_dir, f"frame_{len(self._recording_rows):05d}.webp")
         img = PILImage.fromarray(frame_uint8)
         img.save(path, format="WEBP", lossless=True, method=6)
         return path
@@ -2935,11 +2436,9 @@ class DatasetRecorderWrapper(gym.Wrapper):
     def _record_observation(self, episode_uuid, frame):
         """Record an observation through the configured storage backend."""
         if self.storage_format == STORAGE_FORMAT_IMAGES:
-            self.frames.append(self._save_frame_image(frame))
-            return
+            return {"observations": self._save_frame_image(frame)}
 
         frame_array = _observation_to_rgb_array(frame)
-        frame_index = len(self._current_episode_video_hashes)
         frame_hash = _sha256_rgb(frame_array)
         video_relpath = f"{VIDEO_ARTIFACT_DIR}/{episode_uuid.hex}{CANONICAL_VIDEO_SUFFIX}"
 
@@ -2950,20 +2449,19 @@ class DatasetRecorderWrapper(gym.Wrapper):
             if self._live_video_writer is None:
                 self._live_video_writer = _StreamingLosslessVideoWriter(
                     video_path,
-                    self._fps or get_default_fps(self.env),
+                    self._fps or _provider_fps(self.provider_session),
                     ffmpeg_path=self._ffmpeg_path,
                 )
             self._live_video_writer.write(frame_array)
         else:
             self._current_episode_video_frames.append(frame_array.copy())
         self._current_episode_video_hashes.append(frame_hash)
-        self.frames.append(None)
-        self.video_paths.append(video_relpath)
-        self.frame_indices.append(frame_index)
-        self.frame_sha256s.append(frame_hash)
-        self.frame_heights.append(int(frame_array.shape[0]))
-        self.frame_widths.append(int(frame_array.shape[1]))
-        self.episode_num_observations.append(None)
+        return {
+            "video_path": video_relpath,
+            "frame_sha256": frame_hash,
+            "frame_height": int(frame_array.shape[0]),
+            "frame_width": int(frame_array.shape[1]),
+        }
 
     def _finalize_video_episode(self, episode_uuid):
         """Encode and verify the current episode's canonical observation video."""
@@ -2974,14 +2472,13 @@ class DatasetRecorderWrapper(gym.Wrapper):
 
         video_relpath = f"{VIDEO_ARTIFACT_DIR}/{episode_uuid.hex}{CANONICAL_VIDEO_SUFFIX}"
         expected_hashes = list(self._current_episode_video_hashes)
-        frame_count = len(expected_hashes)
 
         if self._live_upload_enabled:
             if self._live_video_writer is None:
                 raise RuntimeError("Live video episode has no active ffmpeg writer")
             video_path = self._live_video_writer.output_path
-            width = self.frame_widths[-1]
-            height = self.frame_heights[-1]
+            width = self._recording_rows[-1]["frame_width"]
+            height = self._recording_rows[-1]["frame_height"]
             self._live_video_writer.close()
             self._live_video_writer = None
             _verify_lossless_rgb_video_stream(
@@ -2991,9 +2488,6 @@ class DatasetRecorderWrapper(gym.Wrapper):
                 expected_hashes,
                 ffmpeg_path=self._ffmpeg_path,
             )
-            start_index = len(self.episode_num_observations) - frame_count
-            for row_index in range(start_index, len(self.episode_num_observations)):
-                self.episode_num_observations[row_index] = frame_count
             self._current_episode_video_hashes.clear()
             return
 
@@ -3003,7 +2497,7 @@ class DatasetRecorderWrapper(gym.Wrapper):
         _encode_lossless_rgb_video(
             self._current_episode_video_frames,
             video_path,
-            self._fps or get_default_fps(self.env),
+            self._fps or _provider_fps(self.provider_session),
             ffmpeg_path=self._ffmpeg_path,
         )
         height, width = self._current_episode_video_frames[0].shape[:2]
@@ -3015,13 +2509,10 @@ class DatasetRecorderWrapper(gym.Wrapper):
             ffmpeg_path=self._ffmpeg_path,
         )
 
-        start_index = len(self.episode_num_observations) - frame_count
-        for row_index in range(start_index, len(self.episode_num_observations)):
-            self.episode_num_observations[row_index] = frame_count
         _encode_browser_preview_video(
             self._current_episode_video_frames,
             preview_path,
-            self._fps or get_default_fps(self.env),
+            self._fps or _provider_fps(self.provider_session),
             ffmpeg_path=self._ffmpeg_path,
         )
         self._current_episode_video_frames.clear()
@@ -3035,49 +2526,57 @@ class DatasetRecorderWrapper(gym.Wrapper):
         elif isinstance(action, dict):
             return {k: (v.tolist() if isinstance(v, np.ndarray) else v) for k, v in action.items()}
         else:
-            return [int(action)]
+            return int(action)
 
-    def _record_frame(self, episode_uuid, frame, action):
+    def _record_frame(self, episode_uuid, step_index, frame, action, policy_action=None):
         """Save a frame and action to temporary storage."""
         if not self.recording:
             return
 
-        self.episode_ids.append(episode_uuid.bytes)
-        self.seeds.append(self._current_episode_seed)
-        self.policy_seeds.append(
-            self._current_policy_seed if self.collector_contract is not None else None
+        row = self._recording_context_row(episode_uuid, step_index)
+        row.update(
+            {
+                "actions": self._normalize_action(action),
+                "policy_actions": (
+                    self._normalize_action(policy_action) if policy_action is not None else None
+                ),
+                "rewards": None,
+                "terminations": None,
+                "truncations": None,
+                "infos": None,
+                **self._record_observation(episode_uuid, frame),
+            }
         )
-        self._record_observation(episode_uuid, frame)
-        self.actions.append(self._normalize_action(action))
-        self.session_ids.append(self._session_uuid.bytes)
+        self._recording_rows.append(row)
 
-    def _record_terminal_observation(self, episode_uuid, frame):
+    def _record_terminal_observation(self, episode_uuid, step_index, frame):
         """Record a terminal observation row (Minari N+1 pattern).
 
         The N+1 observation captures the final state after the last step.
-        It has an empty action and null values for reward/termination/truncation/info
+        It has null action/transition values
         since no step was taken.
         """
         if not self.recording:
             return
 
-        self.episode_ids.append(episode_uuid.bytes)
-        self.seeds.append(self._current_episode_seed)
-        self.policy_seeds.append(
-            self._current_policy_seed if self.collector_contract is not None else None
+        row = self._recording_context_row(episode_uuid, step_index)
+        row.update(
+            {
+                "actions": None,
+                "policy_actions": None,
+                "rewards": None,
+                "terminations": None,
+                "truncations": None,
+                "infos": None,
+                **self._record_observation(episode_uuid, frame),
+            }
         )
-        self._record_observation(episode_uuid, frame)
-        self.actions.append([])
-        self.rewards.append(None)
-        self.terminations.append(None)
-        self.truncations.append(None)
-        self.infos.append(None)
-        self.session_ids.append(self._session_uuid.bytes)
+        self._recording_rows.append(row)
         self._finalize_video_episode(episode_uuid)
         self._finish_live_episode()
 
     def _finish_live_episode(self):
-        if not self._live_upload_enabled or not self.frames:
+        if not self._live_upload_enabled or not self._recording_rows:
             return
         package = self._live_episode
         if package is None:
@@ -3219,87 +2718,32 @@ class DatasetRecorderWrapper(gym.Wrapper):
         self.screen.blit(text, (bg_x + padding, bg_y + padding))
 
     def _print_keymappings(self):
-        """Print the current key mappings to the console."""
+        """Print the provider-neutral keyboard control profile."""
         table = Table(show_header=True, header_style="bold", box=None, padding=(0, 2))
         table.add_column("Key", justify="right", style=STYLE_KEY)
-        table.add_column("Action", style=STYLE_ACTION)
-        table.add_column("Index", style=STYLE_PATH)
+        table.add_column("Control", style=STYLE_ACTION)
         input_source = (
             self.input_source
             if isinstance(self.input_source, HumanInputSource)
-            else HumanInputSource(self.env, self.key_lock, self.current_keys)
+            else HumanInputSource(self.provider_session, self.key_lock, self.current_keys)
         )
-
-        if hasattr(self.env, "_vizdoom") and self.env._vizdoom:
-            env_type = "VizDoom"
-            vizdoom_buttons = input_source._init_vizdoom_key_mapping()
-            for key, action_name in VIZDOOM_KEY_BINDINGS.items():
-                btn_idx = vizdoom_buttons.get(action_name)
-                idx_str = f"btn {btn_idx}" if btn_idx is not None else ""
-                table.add_row(pygame.key.name(key), action_name, idx_str)
-            ml_idx = vizdoom_buttons.get("MOVE_LEFT")
-            mr_idx = vizdoom_buttons.get("MOVE_RIGHT")
-            table.add_row("alt+left", "MOVE_LEFT", f"btn {ml_idx}" if ml_idx is not None else "")
-            table.add_row("alt+right", "MOVE_RIGHT", f"btn {mr_idx}" if mr_idx is not None else "")
-        elif bool(getattr(self.env, "_stable_retro", False)) or _is_nes_controller_env(self.env):
-            platform = getattr(self.env.unwrapped, "system", None)
-            backend = getattr(self.env, "_gymrec_backend", "stable-retro")
-            env_type = f"{BACKEND_LABELS.get(backend, backend)} ({platform})"
-            buttons = getattr(self.env.unwrapped, "buttons", None)
-            mapping = STABLE_RETRO_KEY_BINDINGS.get(platform, {})
-            # Group keys: D-pad first, then action buttons, then special (SELECT/START)
-            dpad_keys = {pygame.K_UP, pygame.K_DOWN, pygame.K_LEFT, pygame.K_RIGHT}
-            special_labels = {"SELECT", "START"}
-            group_dpad = []
-            group_action = []
-            group_special = []
-            for key, idx in mapping.items():
-                label = buttons[idx] if buttons and idx < len(buttons) else f"button {idx}"
-                row = (pygame.key.name(key), label, f"idx {idx}")
-                if key in dpad_keys:
-                    group_dpad.append(row)
-                elif label.upper() in special_labels:
-                    group_special.append(row)
-                else:
-                    group_action.append(row)
-            for row in group_dpad:
-                table.add_row(*row)
-            if group_dpad and group_action:
-                table.add_section()
-            for row in group_action:
-                table.add_row(*row)
-            if group_action and group_special:
-                table.add_section()
-            for row in group_special:
-                table.add_row(*row)
-        else:
-            env_type = "Atari"
-            if input_source.key_to_action is None:
-                input_source._resolve_atari_key_mapping()
-            try:
-                meanings = self.env.unwrapped.get_action_meanings()
-            except (AttributeError, TypeError):
-                meanings = None
-            for key, action_idx in input_source.key_to_action.items():
-                label = (
-                    meanings[action_idx]
-                    if meanings and action_idx < len(meanings)
-                    else f"action {action_idx}"
-                )
-                table.add_row(pygame.key.name(key), label, f"action {action_idx}")
-
+        for key, label in input_source.key_to_label.items():
+            table.add_row(pygame.key.name(key), label)
         table.add_section()
-        table.add_row("[dim]escape[/]", "[dim]Exit[/]", "")
-        table.add_row("[dim]+/-[/]", "[dim]Adjust FPS (±5)[/]", "")
-
+        table.add_row("[dim]escape[/]", "[dim]Exit[/]")
+        table.add_row("[dim]+/-[/]", "[dim]Adjust FPS (±5)[/]")
+        provider_label = PROVIDER_LABELS.get(
+            self.provider_session.provider_id, self.provider_session.provider_id
+        )
         console.print(
             Panel(
                 table,
-                title=f"[{STYLE_ENV}]{env_type}[/] Key Mappings",
+                title=f"[{STYLE_ENV}]{provider_label}[/] Key Mappings",
                 border_style=STYLE_INFO,
                 expand=False,
             )
         )
+
 
     def _wait_for_start(self, start_key: int = None) -> bool:
         """Display overlay prompting the user to start.
@@ -3341,7 +2785,6 @@ class DatasetRecorderWrapper(gym.Wrapper):
         self,
         fps=None,
         max_episodes=None,
-        max_steps=None,
         progress_callback=None,
         step_callback=None,
     ):
@@ -3350,14 +2793,12 @@ class DatasetRecorderWrapper(gym.Wrapper):
         Args:
             fps: Frames per second for rendering (ignored if headless)
             max_episodes: Maximum number of episodes to record (None = unlimited for human, 1 for agent)
-            max_steps: Maximum steps per episode (truncates episode after N steps)
             progress_callback: Optional callable(episode_number, steps_in_episode) called after each episode
             step_callback: Optional callable(episode_number, step_number) called during each step for live updates
         """
         if fps is None:
-            fps = get_default_fps(self.env)
+            fps = _provider_fps(self.provider_session)
         self._max_episodes = max_episodes
-        self._max_steps_per_episode = max_steps
         self._progress_callback = progress_callback
         self._step_callback = step_callback
         self.recording = True
@@ -3381,20 +2822,24 @@ class DatasetRecorderWrapper(gym.Wrapper):
         Supports both human input (pygame) and agent input via InputSource abstraction.
         """
         if fps is None:
-            fps = get_default_fps(self.env)
+            fps = _provider_fps(self.provider_session)
         self._fps = fps
 
         self._clear_recording_buffers()
 
-        # Capture environment metadata for dataset card
-        self._env_metadata = _capture_env_metadata(self.env)
+        self._env_metadata = {
+            "provider_id": self.provider_session.provider_id,
+            "env_id": self.provider_session.environment_id,
+            "environment_contract_id": self.environment_artifact.contract_id,
+            "fps": self._fps,
+        }
 
         self._session_uuid = uuid.uuid4()
         self._current_episode_uuid = uuid.uuid4()
         if self.initial_seed is None:
             raise RuntimeError("Recording requires an explicit base environment seed")
         self._current_episode_seed = self.initial_seed
-        self._current_policy_seed = self.initial_policy_seed
+        self._current_policy_seed = self._current_episode_seed
         seed = self._current_episode_seed
         self._episode_count = 1
         self._cumulative_reward = 0.0
@@ -3404,7 +2849,9 @@ class DatasetRecorderWrapper(gym.Wrapper):
         # Setup input source
         if self.input_source is None:
             # Default to human input
-            self.input_source = HumanInputSource(self.env, self.key_lock, self.current_keys)
+            self.input_source = HumanInputSource(
+                self.provider_session, self.key_lock, self.current_keys
+            )
         elif hasattr(self.input_source, "reset"):
             self.input_source.reset(seed=self._current_policy_seed, observation=obs)
 
@@ -3430,23 +2877,30 @@ class DatasetRecorderWrapper(gym.Wrapper):
 
             # Get action from input source
             action = self.input_source.get_action(obs)
+            policy_action = getattr(self.input_source, "policy_action", None)
 
             self._record_frame(
                 self._current_episode_uuid,
-                _recording_observation(self.env, obs),
+                step,
+                _recording_observation(self.provider_session, obs),
                 action,
+                policy_action=policy_action,
             )
             obs, reward, terminated, truncated, info = self.env.step(action)
             if hasattr(self.input_source, "observe_step"):
                 self.input_source.observe_step(reward, terminated, truncated, info)
             self._cumulative_reward += float(reward)
             if self.recording:
-                self.rewards.append(float(reward))
-                self.terminations.append(bool(terminated))
-                self.truncations.append(bool(truncated))
-                self.infos.append(json.dumps(info, default=_json_default))
+                self._recording_rows[-1].update(
+                    {
+                        "rewards": float(reward),
+                        "terminations": bool(terminated),
+                        "truncations": bool(truncated),
+                        "infos": json.dumps(info, default=_json_default),
+                    }
+                )
 
-            self._render_frame(_recording_observation(self.env, obs))
+            self._render_frame(_recording_observation(self.provider_session, obs))
 
             # Frame pacing: skip if headless (run at max speed)
             if not self.headless:
@@ -3466,23 +2920,13 @@ class DatasetRecorderWrapper(gym.Wrapper):
             if self._step_callback is not None:
                 self._step_callback(self._episode_count, step)
 
-            # Truncate episode if max_steps reached
-            if (
-                self._max_steps_per_episode is not None
-                and step >= self._max_steps_per_episode
-                and not terminated
-                and not truncated
-            ):
-                truncated = True
-                if self.recording and self.truncations:
-                    self.truncations[-1] = True
-
             self._write_live_step_journal(obs)
 
             if terminated or truncated:
                 self._record_terminal_observation(
                     self._current_episode_uuid,
-                    _recording_observation(self.env, obs),
+                    step,
+                    _recording_observation(self.provider_session, obs),
                 )
 
                 if self._progress_callback is not None:
@@ -3494,11 +2938,7 @@ class DatasetRecorderWrapper(gym.Wrapper):
 
                 self._current_episode_uuid = uuid.uuid4()
                 self._current_episode_seed = self.initial_seed + self._episode_count
-                self._current_policy_seed = (
-                    self.initial_policy_seed + self._episode_count
-                    if self.initial_policy_seed is not None
-                    else None
-                )
+                self._current_policy_seed = self._current_episode_seed
                 seed = self._current_episode_seed
                 self._start_live_episode(self._current_episode_uuid)
                 obs, _ = self.env.reset(seed=seed)
@@ -3507,19 +2947,32 @@ class DatasetRecorderWrapper(gym.Wrapper):
                 self._episode_count += 1
                 self._cumulative_reward = 0.0
                 step = 0
-                self._render_frame(_recording_observation(self.env, obs))
+                self._render_frame(_recording_observation(self.provider_session, obs))
 
-        # Record terminal observation on user exit (ESC) or when max_episodes reached
-        if self.recording and self.frames and self.actions[-1] != []:
-            # Mark last real step as truncated: user exited mid-episode.
-            # Minari requires at least one True in terminations or truncations per episode.
-            self.truncations[-1] = True
-            self._record_terminal_observation(
-                self._current_episode_uuid,
-                _recording_observation(self.env, obs),
-            )
+        # A user exit is not an environment boundary. Discard the partial episode
+        # instead of inventing a gymrec-owned truncation.
+        if (
+            self.recording
+            and self._recording_rows
+            and self._recording_rows[-1]["actions"] is not None
+        ):
+            incomplete_episode_id = str(self._current_episode_uuid)
+            self._recording_rows = [
+                row
+                for row in self._recording_rows
+                if row["episode_id"] != incomplete_episode_id
+            ]
+            self._current_episode_video_frames.clear()
+            self._current_episode_video_hashes.clear()
 
-        if self.recording and self.frames:
+        if self._live_episode is not None:
+            if self._live_video_writer is not None:
+                self._live_video_writer.abort()
+                self._live_video_writer = None
+            self.live_upload_manager.discard_episode(self._live_episode)
+            self._live_episode = None
+
+        if self.recording and self._recording_rows:
             self._recorded_dataset = self._build_recorded_dataset()
 
     def _convert_action(self, action):
@@ -3528,7 +2981,7 @@ class DatasetRecorderWrapper(gym.Wrapper):
             if isinstance(self.env.action_space, gym.spaces.Discrete) and len(action) == 1:
                 return action[0]
             else:
-                return np.array(action, dtype=np.int32)
+                return np.array(action, dtype=self.env.action_space.dtype)
         elif isinstance(action, dict):
             new_action = {}
             space = self.env.action_space
@@ -3547,7 +3000,7 @@ class DatasetRecorderWrapper(gym.Wrapper):
 
     async def replay(self, actions=None, fps=None, total=None, verify=False, episodes=None):
         if fps is None:
-            fps = get_default_fps(self.env)
+            fps = _provider_fps(self.provider_session)
         self._fps = fps
         self._playback_frame_index = 0
         self._playback_total = total
@@ -3578,15 +3031,17 @@ class DatasetRecorderWrapper(gym.Wrapper):
                     items = episode.get("items", [])
                     reset_kwargs = {} if seed is None else {"seed": int(seed)}
                     obs, _ = self.env.reset(**reset_kwargs)
-                    self._ensure_screen(obs)
-                    self._render_frame(obs)
-                    if not printed_keymappings:
-                        self._print_keymappings()
-                        printed_keymappings = True
+                    display_obs = _recording_observation(self.provider_session, obs)
+                    if not self.headless:
+                        self._ensure_screen(display_obs)
+                        self._render_frame(display_obs)
+                        if not printed_keymappings:
+                            self._print_keymappings()
+                            printed_keymappings = True
 
                     for item in items:
                         frame_start = time.monotonic()
-                        if not self._input_loop():
+                        if not self.headless and not self._input_loop():
                             stop_replay = True
                             break
 
@@ -3606,10 +3061,12 @@ class DatasetRecorderWrapper(gym.Wrapper):
 
                         action = self._convert_action(action)
                         obs, reward, terminated, truncated, _ = self.env.step(action)
-                        self._render_frame(obs)
+                        display_obs = _recording_observation(self.provider_session, obs)
+                        if not self.headless:
+                            self._render_frame(display_obs)
 
                         if verify:
-                            obs_image = _extract_observation_image(obs)
+                            obs_image = _extract_observation_image(display_obs)
                             if obs_image.dtype != np.uint8:
                                 obs_image = obs_image.astype(np.uint8)
                             recorded_array = np.array(recorded_image, dtype=np.uint8)
@@ -3738,11 +3195,12 @@ def _decode_hf_repo_name(repo_name):
 
     Reverse of _encode_env_id_for_hf().
     """
-    # Must decode in reverse order to handle overlapping patterns correctly
-    decoded = repo_name.replace("_slash_", "/")
-    decoded = decoded.replace("_dash_", "-")
-    decoded = decoded.replace("_underscore_", "_")
-    return decoded
+    replacements = {"slash": "/", "dash": "-", "underscore": "_"}
+    return re.sub(
+        r"_(slash|dash|underscore)_",
+        lambda match: replacements[match.group(1)],
+        repo_name,
+    )
 
 
 def env_id_to_hf_repo_id(env_id):
@@ -3794,6 +3252,15 @@ class RecordingIdentity:
         return RecordingIdentity(env_id=str(env_id), dataset_repo_id=self.dataset_repo_id)
 
 
+@dataclass(frozen=True)
+class RecordingPaths:
+    root: str | None
+    dataset: str
+    metadata: str
+    uploaded: str
+    live_queue: str
+
+
 def _coerce_recording_identity(value, *, env_id=None):
     if isinstance(value, RecordingIdentity):
         return value.with_env_id(env_id)
@@ -3821,6 +3288,31 @@ def _policy_recording_identity(policy_source, dataset_repo=None):
     )
 
 
+def _recording_paths(value):
+    """Derive every local path for one recording identity in one place."""
+    identity = _coerce_recording_identity(value)
+    local_dir = CONFIG["storage"]["local_dir"]
+    if identity.dataset_repo_id:
+        owner, repo = identity.dataset_repo_id.split("/", 1)
+        root = os.path.join(local_dir, "repos", owner, repo)
+        return RecordingPaths(
+            root=root,
+            dataset=os.path.join(root, "dataset"),
+            metadata=os.path.join(root, "metadata.json"),
+            uploaded=os.path.join(root, "uploaded.json"),
+            live_queue=os.path.join(root, "live_pending"),
+        )
+
+    encoded_env_id = _encode_env_id_for_hf(identity.env_id)
+    return RecordingPaths(
+        root=None,
+        dataset=os.path.join(local_dir, encoded_env_id),
+        metadata=os.path.join(local_dir, f"{encoded_env_id}_metadata.json"),
+        uploaded=os.path.join(local_dir, f"{encoded_env_id}_uploaded.json"),
+        live_queue=os.path.join(local_dir, f"{encoded_env_id}_live_pending"),
+    )
+
+
 def hf_repo_id_to_env_id(hf_repo_id):
     """Convert HF repo_id back to original env_id."""
     prefix = CONFIG["dataset"]["repo_prefix"]
@@ -3838,21 +3330,12 @@ def hf_repo_id_to_env_id(hf_repo_id):
 
 
 def _get_recording_root(value):
-    identity = _coerce_recording_identity(value)
-    if identity.dataset_repo_id:
-        owner, repo = identity.dataset_repo_id.split("/", 1)
-        return os.path.join(CONFIG["storage"]["local_dir"], "repos", owner, repo)
-    return None
+    return _recording_paths(value).root
 
 
 def get_local_dataset_path(value):
     """Return the local dataset path for an environment or repo-keyed identity."""
-    identity = _coerce_recording_identity(value)
-    recording_root = _get_recording_root(identity)
-    if recording_root:
-        return os.path.join(recording_root, "dataset")
-    encoded_env_id = _encode_env_id_for_hf(identity.env_id)
-    return os.path.join(CONFIG["storage"]["local_dir"], encoded_env_id)
+    return _recording_paths(value).dataset
 
 
 def _get_available_envs_from_local():
@@ -3893,31 +3376,6 @@ def _get_available_recording_refs_from_local():
     return sorted(set(available))
 
 
-def _get_available_envs_from_hf():
-    """Get list of env_ids that have HF Hub recordings."""
-    try:
-        username = _current_hf_username()
-    except Exception:
-        return []
-
-    prefix = CONFIG["dataset"]["repo_prefix"]
-    available = []
-
-    try:
-        api = HfApi()
-        # List all datasets for this user
-        datasets = api.list_datasets(author=username)
-        for ds in datasets:
-            if ds.id and ds.id.startswith(f"{username}/{prefix}"):
-                env_id = hf_repo_id_to_env_id(ds.id)
-                if env_id:
-                    available.append(env_id)
-    except Exception:
-        pass
-
-    return sorted(set(available))
-
-
 def _get_available_recording_refs_from_hf():
     """Return gymrec environment IDs and repo-keyed refs found on the Hub."""
     try:
@@ -3950,22 +3408,12 @@ def _get_available_recording_refs_from_hf():
 
 def _get_metadata_path(value):
     """Return the recording metadata sidecar path."""
-    identity = _coerce_recording_identity(value)
-    recording_root = _get_recording_root(identity)
-    if recording_root:
-        return os.path.join(recording_root, "metadata.json")
-    encoded_env_id = _encode_env_id_for_hf(identity.env_id)
-    return os.path.join(CONFIG["storage"]["local_dir"], f"{encoded_env_id}_metadata.json")
+    return _recording_paths(value).metadata
 
 
 def _get_uploaded_episodes_path(value):
     """Return the uploaded-episode tracking path for a recording identity."""
-    identity = _coerce_recording_identity(value)
-    recording_root = _get_recording_root(identity)
-    if recording_root:
-        return os.path.join(recording_root, "uploaded.json")
-    encoded_env_id = _encode_env_id_for_hf(identity.env_id)
-    return os.path.join(CONFIG["storage"]["local_dir"], f"{encoded_env_id}_uploaded.json")
+    return _recording_paths(value).uploaded
 
 
 def _load_uploaded_episode_ids(value):
@@ -3985,41 +3433,63 @@ def _save_uploaded_episode_ids(value, episode_ids: set):
         json.dump(list(episode_ids), f)
 
 
-def _remote_dataset_episode_ids(value):
-    """Return episode ids currently present on the Hub, or None if unavailable."""
+@dataclass(frozen=True)
+class RemoteDatasetState:
+    revision: str | None
+    episode_ids: frozenset[str]
+    frames: int
+
+    @property
+    def episodes(self):
+        return len(self.episode_ids)
+
+
+def _remote_dataset_state(
+    value,
+    *,
+    revision=None,
+    repo_exists=None,
+    remote_files=None,
+):
+    """Return row-derived statistics for one exact Hub dataset revision."""
     hf_repo_id = _identity_hf_repo_id(value)
-    api = HfApi()
-    try:
-        repo_exists, _, remote_files = _hf_repo_state(api, hf_repo_id, create=False)
-    except Exception:
-        return None
+    if repo_exists is None or remote_files is None:
+        try:
+            repo_exists, resolved_revision, remote_files = _hf_repo_state(
+                HfApi(), hf_repo_id, create=False
+            )
+        except Exception:
+            return None
+        revision = revision or resolved_revision
     if not repo_exists:
-        return set()
+        return RemoteDatasetState(revision, frozenset(), 0)
     has_data_shard = any(
         path.startswith("data/") and path.endswith(".parquet") for path in remote_files
     )
     if not has_data_shard:
-        return set()
+        return RemoteDatasetState(revision, frozenset(), 0)
 
     try:
-        dataset = load_dataset(hf_repo_id, split="train", streaming=True)
-        return {
-            _normalize_episode_id(row["episode_id"])
-            for row in dataset
-            if row.get("episode_id") is not None
-        }
+        dataset = load_dataset(
+            hf_repo_id,
+            split="train",
+            streaming=True,
+            revision=revision,
+        )
+        episode_ids = set()
+        frames = 0
+        for row in dataset:
+            frames += 1
+            if row.get("episode_id") is not None:
+                episode_ids.add(_normalize_episode_id(row["episode_id"]))
+        return RemoteDatasetState(revision, frozenset(episode_ids), frames)
     except Exception:
         return None
 
 
 def _get_live_upload_queue_dir(value):
     """Return the local resumable live-upload queue directory."""
-    identity = _coerce_recording_identity(value)
-    recording_root = _get_recording_root(identity)
-    if recording_root:
-        return os.path.join(recording_root, "live_pending")
-    encoded_env_id = _encode_env_id_for_hf(identity.env_id)
-    return os.path.join(CONFIG["storage"]["local_dir"], f"{encoded_env_id}_live_pending")
+    return _recording_paths(value).live_queue
 
 
 def _get_live_upload_manifest_path(env_id):
@@ -4052,6 +3522,7 @@ def _set_live_upload_manifest_entry(
     package_dir,
     storage_format,
     frames,
+    fps=None,
     error=None,
 ):
     manifest = _load_live_upload_manifest(env_id)
@@ -4067,6 +3538,8 @@ def _set_live_upload_manifest_entry(
         }
     )
     entry.setdefault("created_at", now)
+    if fps is not None:
+        entry["fps"] = max(int(round(float(fps))), 1)
     if error:
         entry["error"] = str(error)
     elif "error" in entry:
@@ -4107,6 +3580,7 @@ def _copy_video_artifacts(src_root, dst_root):
 def _copy_dataset_artifacts(src_root, dst_root):
     _copy_video_artifacts(src_root, dst_root)
     _copy_artifact_tree(src_root, dst_root, COLLECTOR_ARTIFACT_DIR)
+    _copy_artifact_tree(src_root, dst_root, ENVIRONMENT_ARTIFACT_DIR)
 
 
 def save_dataset_locally(dataset, value, metadata=None, video_artifact_dir=None):
@@ -4116,22 +3590,21 @@ def save_dataset_locally(dataset, value, metadata=None, video_artifact_dir=None)
     metadata_path = _get_metadata_path(identity)
     dataset = _strip_runtime_columns(dataset)
     _validate_canonical_dataset_schema(dataset, label="New recording")
+    _validate_environment_artifacts(dataset, video_artifact_dir, label="New recording")
     _validate_collector_artifacts(dataset, video_artifact_dir, label="New recording")
     new_storage_format = _dataset_storage_format(dataset)
     new_episode_count = (
         len(set(dataset["episode_id"])) if "episode_id" in dataset.column_names else 0
     )
     new_frame_count = len(dataset)
-    new_collectors = set(dataset["collector"]) if "collector" in dataset.column_names else set()
-    new_versions = (
-        set(dataset["gymrec_version"]) if "gymrec_version" in dataset.column_names else set()
-    )
-
     existing_video_dir = path
     if os.path.exists(path):
         # Load existing dataset - UUIDs are already unique, no offsetting needed
         existing_dataset = load_from_disk(path, keep_in_memory=True)
         _validate_canonical_dataset_schema(existing_dataset, label=f"Existing dataset at {path}")
+        _validate_environment_artifacts(
+            existing_dataset, path, label=f"Existing dataset at {path}"
+        )
         _validate_collector_artifacts(existing_dataset, path, label=f"Existing dataset at {path}")
         existing_storage_format = _dataset_storage_format(existing_dataset)
         if existing_storage_format != new_storage_format:
@@ -4166,7 +3639,9 @@ def save_dataset_locally(dataset, value, metadata=None, video_artifact_dir=None)
         if os.path.exists(metadata_path):
             with open(metadata_path, "r") as f:
                 existing_metadata = json.load(f)
-        # Update with new metadata (newer values take precedence)
+        # Update descriptive metadata while preserving one canonical vocabulary.
+        existing_metadata = _canonicalize_environment_metadata(existing_metadata)
+        metadata = _canonicalize_environment_metadata(metadata)
         existing_metadata.update(metadata)
         if identity.dataset_repo_id:
             existing_metadata["dataset_repo_id"] = identity.dataset_repo_id
@@ -4180,21 +3655,6 @@ def save_dataset_locally(dataset, value, metadata=None, video_artifact_dir=None)
             "frames": new_frame_count,
             "storage_format": new_storage_format,
         }
-        if new_collectors:
-            recording_entry["collectors"] = sorted(new_collectors)
-        if new_versions:
-            recording_entry["gymrec_versions"] = sorted(new_versions)
-        for key in (
-            "capture_backend",
-            "state_name",
-            "rom_sha256",
-            "nes_button_order",
-            "action_encoding",
-            "frameskip",
-            "sticky_actions",
-        ):
-            if key in metadata:
-                recording_entry[key] = metadata[key]
         existing_metadata["recordings"].append(recording_entry)
         with open(metadata_path, "w") as f:
             json.dump(existing_metadata, f, indent=2, default=_json_default)
@@ -4219,6 +3679,7 @@ def load_local_dataset(value, attach_runtime=True):
         return None
     dataset = load_from_disk(path)
     _validate_canonical_dataset_schema(dataset, label=f"Local dataset at {path}")
+    _validate_environment_artifacts(dataset, path, label=f"Local dataset at {path}")
     _validate_collector_artifacts(dataset, path, label=f"Local dataset at {path}")
     if attach_runtime:
         dataset = _attach_video_runtime_source(dataset, local_base_path=path)
@@ -4249,7 +3710,7 @@ def _recording_env_id(value, dataset=None, metadata=None):
     if identity.env_id:
         return identity.env_id
     metadata = metadata or load_local_metadata(identity) or {}
-    env_id = metadata.get("env_id") or metadata.get("logical_env_id")
+    env_id = metadata.get("env_id")
     if env_id:
         return str(env_id)
     dataset_metadata = _environment_metadata_from_dataset(dataset) if dataset is not None else {}
@@ -4272,15 +3733,19 @@ def _is_terminal_action(action):
 
 
 def _dataset_storage_format(dataset):
-    """Infer a dataset's observation storage format from columns and values."""
+    """Return the required, uniform observation storage format declared by a dataset."""
     column_names = getattr(dataset, "column_names", None) or []
-    if "storage_format" in column_names and len(dataset) > 0:
-        for value in dataset["storage_format"]:
-            if value:
-                return _normalize_storage_format(value)
-    if "video_path" in column_names:
-        return STORAGE_FORMAT_LOSSLESS_VIDEO
-    return STORAGE_FORMAT_IMAGES
+    if "storage_format" not in column_names:
+        raise ValueError("Dataset is missing the required storage_format column")
+
+    values = list(dataset["storage_format"])
+    if not values or any(value in (None, "") for value in values):
+        raise ValueError("Dataset must declare storage_format on every row")
+
+    formats = {_normalize_storage_format(value) for value in values}
+    if len(formats) != 1:
+        raise ValueError("Dataset contains mixed storage_format values")
+    return formats.pop()
 
 
 def _is_video_row(row):
@@ -4315,94 +3780,19 @@ def _is_step_row(row):
     return not _is_terminal_action(row.get("actions"))
 
 
-def _get_default_fps_for_env_id(env_id, metadata=None):
-    """Infer a sensible FPS without instantiating the environment."""
-    if metadata and metadata.get("fps") is not None:
-        try:
-            return max(int(round(float(metadata["fps"]))), 1)
-        except (TypeError, ValueError):
-            pass
-
-    backend = classify_env_id(env_id)
-    if backend == "stable-retro":
-        return CONFIG["fps_defaults"]["retro"]
-    if backend == "vizdoom":
-        return CONFIG["fps_defaults"]["vizdoom"]
-    return CONFIG["fps_defaults"]["atari"]
-
-
-def _human_record_env_make_kwargs(backend):
-    """Return deterministic control kwargs for human recording on supported backends."""
-    if backend == "atari":
-        return {
-            "frameskip": HUMAN_RECORD_FRAMESKIP,
-            "repeat_action_probability": HUMAN_RECORD_STICKY_ACTION_PROB,
-        }
-    if backend in {"stable-retro", "stable-retro-turbo", "supermariobrosnes-turbo"}:
-        return {
-            "frame_skip": HUMAN_RECORD_FRAMESKIP,
-            "sticky_action_prob": HUMAN_RECORD_STICKY_ACTION_PROB,
-        }
-    return {}
-
-
-def _env_make_kwargs_from_metadata(env_id, metadata, backend=None):
-    """Rebuild environment creation kwargs from saved recording metadata."""
-    if not metadata:
-        return {}
-
-    saved_kwargs = metadata.get("env_make_kwargs")
-    if isinstance(saved_kwargs, dict):
-        return dict(saved_kwargs)
-
-    backend = backend or metadata.get("backend") or classify_env_id(env_id)
-    try:
-        frameskip = _metadata_int(metadata, ("frameskip",), default=None)
-    except (TypeError, ValueError):
-        frameskip = None
-    try:
-        sticky = _metadata_float(metadata, ("sticky_actions",), default=None)
-    except (TypeError, ValueError):
-        sticky = None
-    kwargs = {}
-
-    if backend == "atari":
-        if frameskip is not None:
-            kwargs["frameskip"] = max(frameskip, 1)
-        if sticky is not None:
-            kwargs["repeat_action_probability"] = sticky
-    elif backend in {"stable-retro", "stable-retro-turbo", "supermariobrosnes-turbo"}:
-        if frameskip is not None:
-            kwargs["frame_skip"] = max(frameskip, 1)
-        if sticky is not None:
-            kwargs["sticky_action_prob"] = sticky
-
-    return kwargs
-
-
-def _stable_retro_state_from_metadata(metadata):
-    if not metadata:
-        return None
-    return _metadata_str(
-        metadata,
-        ("state_name",),
-        ("stable_retro_state",),
-        ("retro_state",),
-        ("state",),
-        default=None,
-    )
-
-
 def _normalize_episode_id(eid):
-    """Normalize episode identifiers to a stable string key."""
+    """Normalize episode identifiers to a canonical readable UUID when possible."""
     if isinstance(eid, bytes):
         try:
-            return uuid.UUID(bytes=eid).hex
+            return str(uuid.UUID(bytes=eid))
         except ValueError:
             return eid.hex()
     if isinstance(eid, uuid.UUID):
-        return eid.hex
-    return str(eid)
+        return str(eid)
+    try:
+        return str(uuid.UUID(str(eid)))
+    except (ValueError, AttributeError):
+        return str(eid)
 
 
 def _ordered_episode_rows(dataset):
@@ -4416,6 +3806,10 @@ def _ordered_episode_rows(dataset):
             row_indices_by_episode[key] = []
             episode_keys.append(key)
         row_indices_by_episode[key].append(row_index)
+
+    if "step_index" in (getattr(dataset, "column_names", None) or []):
+        for row_indices in row_indices_by_episode.values():
+            row_indices.sort(key=lambda index: int(dataset[index]["step_index"]))
 
     return episode_keys, row_indices_by_episode
 
@@ -4468,9 +3862,13 @@ def _dataset_playback_episodes(dataset, verify=False):
                 step_count += 1
         if step_count == 0:
             continue
+        contract_ids = {dataset[index]["environment_contract_id"] for index in row_indices}
+        if len(contract_ids) != 1:
+            raise ValueError(f"Episode {episode_key} spans multiple environment contracts")
 
         episodes.append(
             {
+                "environment_contract_id": contract_ids.pop(),
                 "seed": _episode_reset_seed(dataset, row_indices),
                 "items": _iter_playback_items(dataset, row_indices, verify=verify),
             }
@@ -4573,7 +3971,7 @@ def _get_video_row_observation(row):
     video_path = _resolve_video_path(row)
     width = int(row.get("frame_width"))
     height = int(row.get("frame_height"))
-    frame_index = int(row.get("frame_index"))
+    frame_index = int(row.get("step_index"))
     frames = _decode_lossless_rgb_video(video_path, width, height)
     if frame_index < 0 or frame_index >= len(frames):
         raise IndexError(
@@ -4763,6 +4161,84 @@ def _preview_video_relpath(episode_stem):
     return f"{PREVIEW_VIDEO_ARTIFACT_DIR}/{episode_stem}{PREVIEW_VIDEO_SUFFIX}"
 
 
+def _dataset_replay_url(repo_id):
+    return f"https://huggingface.co/datasets/{repo_id}/resolve/main/{DATASET_REPLAY_FILENAME}"
+
+
+def _dataset_card_has_replay(card_content):
+    """Return whether a dataset card contains the playable root replay contract."""
+    return "<video" in card_content and DATASET_REPLAY_FILENAME in card_content
+
+
+def _remote_dataset_publication_needs_repair(repo_id, revision, remote_files):
+    """Return whether replay.mp4 or its card player is missing at a pinned revision."""
+    if DATASET_REPLAY_FILENAME not in remote_files or "README.md" not in remote_files:
+        return True
+    readme_path = hf_hub_download(
+        repo_id=repo_id,
+        repo_type="dataset",
+        revision=revision,
+        filename="README.md",
+    )
+    with open(readme_path) as file_obj:
+        return not _dataset_card_has_replay(file_obj.read())
+
+
+def _materialize_dataset_replay(dataset, local_root, output_path, fps):
+    """Create the root replay from the first complete episode in dataset order."""
+    episode_keys, rows_by_episode = _ordered_episode_rows(dataset)
+    if not episode_keys:
+        raise ValueError("Cannot publish replay.mp4 from an empty dataset")
+    row_indices = None
+    for episode_key in episode_keys:
+        candidate_indices = rows_by_episode[episode_key]
+        if len(candidate_indices) < 2:
+            continue
+        candidate_rows = [dataset[index] for index in candidate_indices]
+        if not _is_terminal_action(candidate_rows[-1].get("actions")):
+            continue
+        step_rows = [row for row in candidate_rows[:-1] if _is_step_row(row)]
+        if step_rows and any(
+            bool(row.get("terminations")) or bool(row.get("truncations")) for row in step_rows
+        ):
+            row_indices = candidate_indices
+            break
+    if row_indices is None:
+        raise ValueError("Cannot publish replay.mp4 without a complete episode")
+
+    storage_format = _dataset_storage_format(dataset)
+    if storage_format == STORAGE_FORMAT_LOSSLESS_VIDEO:
+        first_row = dataset[row_indices[0]]
+        video_relpath = first_row.get("video_path")
+        if not video_relpath:
+            raise ValueError("Representative episode is missing its canonical video path")
+        canonical_path = os.path.join(local_root, video_relpath)
+        if not os.path.isfile(canonical_path):
+            raise FileNotFoundError(f"Missing representative video artifact: {canonical_path}")
+        video_name = os.path.basename(video_relpath)
+        if not video_name.endswith(CANONICAL_VIDEO_SUFFIX):
+            raise ValueError(f"Unsupported canonical video path for replay: {video_relpath}")
+        episode_stem = video_name[: -len(CANONICAL_VIDEO_SUFFIX)]
+        preview_path = os.path.join(local_root, _preview_video_relpath(episode_stem))
+        if os.path.isfile(preview_path):
+            shutil.copy2(preview_path, output_path)
+        else:
+            _transcode_browser_preview_video(canonical_path, output_path)
+    else:
+        writer = _StreamingBrowserPreviewWriter(output_path, fps)
+        try:
+            for row_index in row_indices:
+                frame = _observation_to_rgb_array(_get_row_observation(dataset[row_index]))
+                writer.write(frame)
+            writer.close()
+        except Exception:
+            writer.abort()
+            raise
+
+    _verify_browser_preview_video(output_path)
+    return output_path
+
+
 def _remote_storage_format_from_files(file_paths):
     """Infer the remote dataset storage layout from committed Hub files."""
     has_data_shard = any(
@@ -4864,6 +4340,36 @@ def _collector_upload_operations(
     return operations
 
 
+def _environment_upload_operations(
+    dataset,
+    *,
+    local_root,
+    hf_repo_id,
+    remote_files,
+    revision,
+):
+    operations = []
+    for contract_id in sorted(set(dataset["environment_contract_id"])):
+        repo_path = (
+            f"{ENVIRONMENT_ARTIFACT_DIR}/{contract_id}/{ENVIRONMENT_DOCUMENT_FILENAME}"
+        )
+        local_path = os.path.join(local_root, repo_path)
+        if not os.path.isfile(local_path):
+            raise FileNotFoundError(f"Missing environment contract: {local_path}")
+        if repo_path in remote_files:
+            remote_path = hf_hub_download(
+                repo_id=hf_repo_id,
+                repo_type="dataset",
+                revision=revision,
+                filename=repo_path,
+            )
+            if _sha256_file(remote_path) != _sha256_file(local_path):
+                raise ValueError(f"Remote environment contract conflict at {repo_path}")
+            continue
+        operations.append(CommitOperationAdd(path_in_repo=repo_path, path_or_fileobj=local_path))
+    return operations
+
+
 def _hf_repo_state(api, hf_repo_id, create=False):
     """Return repo existence, parent commit, and file list, optionally creating the repo."""
     repo_exists = False
@@ -4910,6 +4416,9 @@ def _upload_dataset_shard_to_hub(
     episode_ids,
     replace=False,
     include_previews=True,
+    preview_fps=None,
+    publish_data=True,
+    remote_state=None,
     max_retries=5,
     base_wait=1.0,
 ):
@@ -4921,11 +4430,16 @@ def _upload_dataset_shard_to_hub(
     episode_ids = set(episode_ids)
     upload_dataset = _strip_runtime_columns(dataset)
     _validate_canonical_dataset_schema(upload_dataset, label="Upload shard")
+    _validate_environment_artifacts(upload_dataset, local_root, label="Upload shard")
     _validate_collector_artifacts(upload_dataset, local_root, label="Upload shard")
+    local_metadata = load_local_metadata(identity) or {}
+    preview_fps = preview_fps or local_metadata.get("fps")
+    if preview_fps is None:
+        raise ValueError("Upload requires recorded provider fps metadata")
 
     for attempt in range(1, max_retries + 1):
         try:
-            repo_exists, parent_commit, remote_files = _hf_repo_state(api, hf_repo_id, create=True)
+            repo_exists, parent_commit, remote_files = _hf_repo_state(api, hf_repo_id, create=False)
             if repo_exists and not replace:
                 remote_format = _remote_storage_format_from_files(remote_files)
                 conflict_message = _remote_storage_conflict_message(
@@ -4940,6 +4454,24 @@ def _upload_dataset_shard_to_hub(
                     storage_format,
                 )
 
+            if replace:
+                current_remote_state = RemoteDatasetState(parent_commit, frozenset(), 0)
+            elif not repo_exists:
+                current_remote_state = RemoteDatasetState(parent_commit, frozenset(), 0)
+            else:
+                current_remote_state = remote_state
+                if current_remote_state is None or current_remote_state.revision != parent_commit:
+                    current_remote_state = _remote_dataset_state(
+                        identity,
+                        revision=parent_commit,
+                        repo_exists=repo_exists,
+                        remote_files=remote_files,
+                    )
+                if current_remote_state is None:
+                    raise RuntimeError(
+                        f"Could not read remote dataset rows at revision {parent_commit}"
+                    )
+
             next_shard_idx = _next_hf_shard_index(api, hf_repo_id, repo_exists, replace)
             operations = []
             if replace:
@@ -4950,86 +4482,111 @@ def _upload_dataset_shard_to_hub(
                 )
 
             with tempfile.TemporaryDirectory() as tmpdir:
-                shard_path = os.path.join(tmpdir, "shard.parquet")
-                upload_dataset.to_parquet(shard_path)
-                shard_name = (
-                    "data/train-00000-of-00001.parquet"
-                    if replace
-                    else f"data/train-{next_shard_idx:05d}-of-{next_shard_idx + 1:05d}.parquet"
-                )
-                operations.append(
-                    CommitOperationAdd(path_in_repo=shard_name, path_or_fileobj=shard_path)
-                )
-                operations.extend(
-                    _collector_upload_operations(
-                        upload_dataset,
-                        local_root=local_root,
-                        hf_repo_id=hf_repo_id,
-                        remote_files=[] if replace else remote_files,
-                        revision=parent_commit,
+                if publish_data:
+                    shard_path = os.path.join(tmpdir, "shard.parquet")
+                    upload_dataset.to_parquet(shard_path)
+                    shard_name = (
+                        "data/train-00000-of-00001.parquet"
+                        if replace
+                        else f"data/train-{next_shard_idx:05d}-of-{next_shard_idx + 1:05d}.parquet"
                     )
-                )
-
-                sidecar_metadata = {
-                    **_environment_metadata_from_dataset(dataset),
-                    **(load_local_metadata(identity) or {}),
-                }
-                if identity.dataset_repo_id:
-                    sidecar_metadata["dataset_repo_id"] = identity.dataset_repo_id
-                if sidecar_metadata:
-                    sidecar_path = os.path.join(tmpdir, ENVIRONMENT_METADATA_FILENAME)
-                    with open(sidecar_path, "w") as file_obj:
-                        json.dump(sidecar_metadata, file_obj, indent=2, default=_json_default)
                     operations.append(
-                        CommitOperationAdd(
-                            path_in_repo=ENVIRONMENT_METADATA_FILENAME,
-                            path_or_fileobj=sidecar_path,
+                        CommitOperationAdd(path_in_repo=shard_name, path_or_fileobj=shard_path)
+                    )
+                    operations.extend(
+                        _environment_upload_operations(
+                            upload_dataset,
+                            local_root=local_root,
+                            hf_repo_id=hf_repo_id,
+                            remote_files=[] if replace else remote_files,
+                            revision=parent_commit,
+                        )
+                    )
+                    operations.extend(
+                        _collector_upload_operations(
+                            upload_dataset,
+                            local_root=local_root,
+                            hf_repo_id=hf_repo_id,
+                            remote_files=[] if replace else remote_files,
+                            revision=parent_commit,
                         )
                     )
 
-                if storage_format == STORAGE_FORMAT_LOSSLESS_VIDEO:
-                    video_paths = sorted(
-                        {
-                            row["video_path"]
-                            for row in upload_dataset
-                            if "video_path" in row and row["video_path"]
-                        }
-                    )
-                    for video_relpath in video_paths:
-                        video_path = os.path.join(local_root, video_relpath)
-                        if not os.path.exists(video_path):
-                            raise FileNotFoundError(
-                                f"Missing video artifact for upload: {video_path}"
-                            )
+                    sidecar_metadata = _playback_metadata(dataset, local_metadata)
+                    if identity.dataset_repo_id:
+                        sidecar_metadata["dataset_repo_id"] = identity.dataset_repo_id
+                    if sidecar_metadata:
+                        sidecar_path = os.path.join(tmpdir, ENVIRONMENT_METADATA_FILENAME)
+                        with open(sidecar_path, "w") as file_obj:
+                            json.dump(sidecar_metadata, file_obj, indent=2, default=_json_default)
                         operations.append(
                             CommitOperationAdd(
-                                path_in_repo=video_relpath,
-                                path_or_fileobj=video_path,
+                                path_in_repo=ENVIRONMENT_METADATA_FILENAME,
+                                path_or_fileobj=sidecar_path,
                             )
                         )
-                        if include_previews:
-                            video_name = os.path.basename(video_relpath)
-                            if video_name.endswith(CANONICAL_VIDEO_SUFFIX):
-                                episode_stem = video_name[: -len(CANONICAL_VIDEO_SUFFIX)]
-                                preview_relpath = _preview_video_relpath(episode_stem)
-                                preview_path = os.path.join(local_root, preview_relpath)
-                                if os.path.exists(preview_path):
-                                    operations.append(
-                                        CommitOperationAdd(
-                                            path_in_repo=preview_relpath,
-                                            path_or_fileobj=preview_path,
+
+                    if storage_format == STORAGE_FORMAT_LOSSLESS_VIDEO:
+                        video_paths = sorted(
+                            {
+                                row["video_path"]
+                                for row in upload_dataset
+                                if "video_path" in row and row["video_path"]
+                            }
+                        )
+                        for video_relpath in video_paths:
+                            video_path = os.path.join(local_root, video_relpath)
+                            if not os.path.exists(video_path):
+                                raise FileNotFoundError(
+                                    f"Missing video artifact for upload: {video_path}"
+                                )
+                            operations.append(
+                                CommitOperationAdd(
+                                    path_in_repo=video_relpath,
+                                    path_or_fileobj=video_path,
+                                )
+                            )
+                            if include_previews:
+                                video_name = os.path.basename(video_relpath)
+                                if video_name.endswith(CANONICAL_VIDEO_SUFFIX):
+                                    episode_stem = video_name[: -len(CANONICAL_VIDEO_SUFFIX)]
+                                    preview_relpath = _preview_video_relpath(episode_stem)
+                                    preview_path = os.path.join(local_root, preview_relpath)
+                                    if os.path.exists(preview_path):
+                                        operations.append(
+                                            CommitOperationAdd(
+                                                path_in_repo=preview_relpath,
+                                                path_or_fileobj=preview_path,
+                                            )
                                         )
-                                    )
+
+                if replace or DATASET_REPLAY_FILENAME not in remote_files:
+                    replay_path = os.path.join(tmpdir, DATASET_REPLAY_FILENAME)
+                    _materialize_dataset_replay(
+                        upload_dataset,
+                        local_root,
+                        replay_path,
+                        preview_fps,
+                    )
+                    operations.append(
+                        CommitOperationAdd(
+                            path_in_repo=DATASET_REPLAY_FILENAME,
+                            path_or_fileobj=replay_path,
+                        )
+                    )
 
                 card_content = _build_dataset_card_content(
                     identity,
                     env_id,
                     hf_repo_id,
-                    new_frames=len(upload_dataset),
-                    new_episodes=len(episode_ids),
-                    repo_exists=repo_exists,
+                    new_frames=len(upload_dataset) if publish_data else 0,
+                    new_episodes=len(episode_ids) if publish_data else 0,
+                    existing_frames=current_remote_state.frames,
+                    existing_episodes=current_remote_state.episodes,
                     local_root=local_root,
                     remote_files=[] if replace else remote_files,
+                    dataset=upload_dataset,
+                    fps=preview_fps,
                 )
                 if card_content:
                     card_path = os.path.join(tmpdir, "README.md")
@@ -5038,6 +4595,18 @@ def _upload_dataset_shard_to_hub(
                     operations.append(
                         CommitOperationAdd(path_in_repo="README.md", path_or_fileobj=card_path)
                     )
+
+                if not repo_exists:
+                    created, created_parent, created_files = _hf_repo_state(
+                        api, hf_repo_id, create=True
+                    )
+                    if not created:
+                        raise RuntimeError(f"Could not create dataset repository {hf_repo_id}")
+                    if any(path != ".gitattributes" for path in created_files):
+                        raise RuntimeError(
+                            "Conflict detected: dataset repository was populated during upload"
+                        )
+                    parent_commit = created_parent
 
                 api.preupload_lfs_files(
                     repo_id=hf_repo_id,
@@ -5051,17 +4620,23 @@ def _upload_dataset_shard_to_hub(
                     commit_message=(
                         f"Replace recordings from {env_id}"
                         if replace
-                        else f"Add recordings from {env_id}"
+                        else (
+                            f"Add recordings from {env_id}"
+                            if publish_data
+                            else f"Repair dataset preview for {env_id}"
+                        )
                     ),
                     parent_commit=parent_commit,
                 )
 
-            uploaded_episode_ids = (
-                episode_ids if replace else _load_uploaded_episode_ids(identity) | episode_ids
-            )
-            _save_uploaded_episode_ids(identity, uploaded_episode_ids)
+            if publish_data:
+                uploaded_episode_ids = (
+                    episode_ids if replace else _load_uploaded_episode_ids(identity) | episode_ids
+                )
+                _save_uploaded_episode_ids(identity, uploaded_episode_ids)
+            action = "Dataset uploaded" if publish_data else "Dataset preview repaired"
             console.print(
-                f"[{STYLE_SUCCESS}]Dataset uploaded: https://huggingface.co/datasets/{hf_repo_id}[/]"
+                f"[{STYLE_SUCCESS}]{action}: https://huggingface.co/datasets/{hf_repo_id}[/]"
             )
             return True
 
@@ -5122,17 +4697,20 @@ def _package_path(package_dir, relpath):
 
 
 def _recover_live_video_artifact(package_dir, records):
-    first = records[0]
+    rows = [_row_from_live_journal_record(record) for record in records]
+    first = rows[0]
     last = records[-1]
     video_relpath = first["video_path"]
     video_path = _package_path(package_dir, video_relpath)
     width = int(first["frame_width"])
     height = int(first["frame_height"])
-    step_hashes = [record["frame_sha256"] for record in records]
+    step_hashes = [row["frame_sha256"] for row in rows]
     terminal_path = _package_path(package_dir, last["terminal_candidate_path"])
     terminal_frame = _observation_to_rgb_array(PILImage.open(terminal_path))
     terminal_hash = _sha256_rgb(terminal_frame)
-    fps = last.get("fps") or CONFIG["fps_defaults"]["atari"]
+    fps = last.get("fps")
+    if fps is None:
+        raise ValueError("Live recording journal is missing provider fps")
 
     try:
         _verify_lossless_rgb_video_stream(
@@ -5169,96 +4747,97 @@ def _recover_live_video_artifact(package_dir, records):
     return video_relpath, terminal_hash, len(step_hashes) + 1
 
 
+def _row_from_live_journal_record(record):
+    """Read current canonical journals and the pre-canonical local journal format."""
+    if isinstance(record.get("row"), dict):
+        return dict(record["row"])
+
+    row = _canonical_dataset_row(
+        episode_id=record.get("episode_id"),
+        step_index=record.get("step_index"),
+        seed=record.get("seed"),
+        actions=record.get("action"),
+        policy_actions=record.get("policy_action"),
+        rewards=record.get("reward"),
+        terminations=record.get("termination"),
+        truncations=record.get("truncation"),
+        infos=record.get("info"),
+        session_id=record.get("session_id"),
+        **{
+            name: record.get(name)
+            for name in ROW_CONTEXT_FIELD_NAMES
+            if name
+            not in {
+                "episode_id",
+                "step_index",
+                "seed",
+                "session_id",
+            }
+        },
+    )
+    storage_format = _normalize_storage_format(row["storage_format"])
+    if storage_format == STORAGE_FORMAT_IMAGES:
+        row["observations"] = record.get("observation_path")
+    else:
+        row.update({field.name: record.get(field.name) for field in VIDEO_DATASET_FIELDS})
+    return row
+
+
 def _dataset_from_recovered_live_records(package_dir, episode_id, records):
     if not records:
         raise RuntimeError(f"No recoverable completed steps found for {episode_id}")
     records = sorted(records, key=lambda record: int(record.get("row_index", 0)))
-    storage_format = _normalize_storage_format(records[0]["storage_format"])
-    last = records[-1]
-    last["truncation"] = bool(last.get("truncation") or not last.get("termination"))
+    rows = [_row_from_live_journal_record(record) for record in records]
+    storage_format = _normalize_storage_format(rows[0]["storage_format"])
+    last_record = records[-1]
+    last_row = rows[-1]
+    last_row["truncations"] = bool(last_row.get("truncations") or not last_row.get("terminations"))
 
-    episode_bytes = uuid.UUID(hex=episode_id).bytes
-    session_bytes = uuid.UUID(hex=records[0]["session_id"]).bytes
-    data = {
-        "episode_id": [episode_bytes for _ in records],
-        "seed": [record["seed"] for record in records],
-        "actions": [record["action"] for record in records],
-        "rewards": [record["reward"] for record in records],
-        "terminations": [bool(record["termination"]) for record in records],
-        "truncations": [bool(record["truncation"]) for record in records],
-        "infos": [record["info"] for record in records],
-        "session_id": [session_bytes for _ in records],
-        "collector": [records[0]["collector"] for _ in records],
-        "gymrec_version": [records[0]["gymrec_version"] for _ in records],
-        "storage_format": [storage_format for _ in records],
-    }
-    environment_columns = (
-        "logical_env_id",
-        "capture_backend",
-        "state_name",
-        "rom_sha256",
-        "nes_button_order",
-        "action_encoding",
-        "frame_skip",
-        "sticky_action_prob",
-        "collector_contract_id",
-        "policy_mode",
-        "policy_seed",
+    episode_uuid = str(uuid.UUID(str(episode_id)))
+    session_uuid = str(uuid.UUID(str(rows[0]["session_id"])))
+    for row in rows:
+        row["episode_id"] = episode_uuid
+        row["step_index"] = int(row["step_index"])
+        row["session_id"] = session_uuid
+        row["storage_format"] = storage_format
+
+    terminal_row = _canonical_dataset_row(
+        **{name: rows[0].get(name) for name in ROW_CONTEXT_FIELD_NAMES},
     )
-    for column in environment_columns:
-        data[column] = [record.get(column) for record in records]
-
-    terminal_record = {
-        "episode_id": episode_bytes,
-        "seed": records[0]["seed"],
-        "actions": [],
-        "rewards": None,
-        "terminations": None,
-        "truncations": None,
-        "infos": None,
-        "session_id": session_bytes,
-        "collector": records[0]["collector"],
-        "gymrec_version": records[0]["gymrec_version"],
-        "storage_format": storage_format,
-    }
-    for column in environment_columns:
-        terminal_record[column] = records[0].get(column)
+    terminal_row.update(
+        {
+            "episode_id": episode_uuid,
+            "step_index": len(rows),
+            "session_id": session_uuid,
+            "storage_format": storage_format,
+        }
+    )
 
     if storage_format == STORAGE_FORMAT_IMAGES:
-        data["observations"] = [
-            _package_path(package_dir, record["observation_path"]) for record in records
-        ]
-        terminal_record["observations"] = _package_path(
-            package_dir, last["terminal_candidate_path"]
+        for row in rows:
+            row["observations"] = _package_path(package_dir, row["observations"])
+        terminal_row["observations"] = _package_path(
+            package_dir, last_record["terminal_candidate_path"]
         )
     else:
-        video_relpath, terminal_hash, total_observations = _recover_live_video_artifact(
-            package_dir, records
-        )
-        data.update(
-            {
-                "video_path": [record["video_path"] for record in records],
-                "frame_index": [int(record["frame_index"]) for record in records],
-                "frame_sha256": [record["frame_sha256"] for record in records],
-                "frame_width": [int(record["frame_width"]) for record in records],
-                "frame_height": [int(record["frame_height"]) for record in records],
-                "episode_num_observations": [total_observations for _ in records],
-            }
-        )
-        terminal_record.update(
+        video_relpath, terminal_hash, _ = _recover_live_video_artifact(package_dir, records)
+        for row in rows:
+            row["frame_width"] = int(row["frame_width"])
+            row["frame_height"] = int(row["frame_height"])
+        terminal_row.update(
             {
                 "video_path": video_relpath,
-                "frame_index": len(records),
                 "frame_sha256": terminal_hash,
-                "frame_width": int(last["terminal_candidate_width"]),
-                "frame_height": int(last["terminal_candidate_height"]),
-                "episode_num_observations": total_observations,
+                "frame_width": int(last_record["terminal_candidate_width"]),
+                "frame_height": int(last_record["terminal_candidate_height"]),
             }
         )
 
-    for key, value in terminal_record.items():
-        data[key].append(value)
-
+    rows.append(terminal_row)
+    data = {
+        field.name: [row.get(field.name) for row in rows]
+        for field in _dataset_fields(storage_format)
+    }
     return _recording_dataset_from_dict(data, storage_format)
 
 
@@ -5277,9 +4856,11 @@ def drain_live_upload_queue(recording_identity, max_retries=5, base_wait=1.0):
 
     console.print(f"[{STYLE_INFO}]Draining {len(entries)} pending live-upload episode(s)...[/]")
     ok = True
-    already_uploaded = _remote_dataset_episode_ids(identity)
-    if already_uploaded is None:
+    remote_state = _remote_dataset_state(identity)
+    if remote_state is None:
         already_uploaded = _load_uploaded_episode_ids(identity)
+    else:
+        already_uploaded = set(remote_state.episode_ids)
     for episode_id, entry in entries:
         package_dir = entry["package_dir"]
         if episode_id in already_uploaded:
@@ -5288,8 +4869,9 @@ def drain_live_upload_queue(recording_identity, max_retries=5, base_wait=1.0):
                 episode_id,
                 state="uploaded",
                 package_dir=package_dir,
-                storage_format=entry.get("storage_format", STORAGE_FORMAT_IMAGES),
+                storage_format=_normalize_storage_format(entry.get("storage_format")),
                 frames=entry.get("frames", 0),
+                fps=entry.get("fps"),
             )
             shutil.rmtree(package_dir, ignore_errors=True)
             continue
@@ -5310,6 +4892,7 @@ def drain_live_upload_queue(recording_identity, max_retries=5, base_wait=1.0):
                 package_dir,
                 dataset,
                 storage_format=storage_format,
+                fps=entry.get("fps"),
                 max_retries=max_retries,
                 base_wait=base_wait,
                 persist_dataset=persist_dataset,
@@ -5323,8 +4906,9 @@ def drain_live_upload_queue(recording_identity, max_retries=5, base_wait=1.0):
                 episode_id,
                 state="failed",
                 package_dir=package_dir,
-                storage_format=entry.get("storage_format", STORAGE_FORMAT_IMAGES),
+                storage_format=_normalize_storage_format(entry.get("storage_format")),
                 frames=entry.get("frames", 0),
+                fps=entry.get("fps"),
                 error=e,
             )
             console.print(f"[{STYLE_FAIL}]Pending live upload failed for {episode_id}: {e}[/]")
@@ -5336,12 +4920,11 @@ def preflight_live_upload(recording_identity, storage_format):
     identity = _coerce_recording_identity(recording_identity)
     if not ensure_hf_login():
         return False
-    if storage_format == STORAGE_FORMAT_LOSSLESS_VIDEO:
-        try:
-            _require_lossless_video_tools()
-        except Exception as e:
-            console.print(f"[{STYLE_FAIL}]Live upload preflight failed: {e}[/]")
-            return False
+    try:
+        _require_dataset_replay_tools()
+    except Exception as e:
+        console.print(f"[{STYLE_FAIL}]Live upload preflight failed: {e}[/]")
+        return False
 
     hf_repo_id = _identity_hf_repo_id(identity)
     api = HfApi()
@@ -5405,9 +4988,11 @@ def upload_local_dataset(recording_identity, max_retries=5, base_wait=1.0, repla
         return pending_ok
     storage_format = _dataset_storage_format(local_dataset)
 
-    already_uploaded = _remote_dataset_episode_ids(identity)
-    if already_uploaded is None:
+    remote_state = _remote_dataset_state(identity)
+    if remote_state is None:
         already_uploaded = _load_uploaded_episode_ids(identity)
+    else:
+        already_uploaded = set(remote_state.episode_ids)
     new_indices = []
     new_episode_ids = set()
     for i, row in enumerate(local_dataset):
@@ -5417,20 +5002,39 @@ def upload_local_dataset(recording_identity, max_retries=5, base_wait=1.0, repla
             new_episode_ids.add(eid)
 
     if not new_indices:
-        if not replace:
-            try:
-                api = HfApi()
-                hf_repo_id = _identity_hf_repo_id(identity)
-                _, _, remote_files = _hf_repo_state(api, hf_repo_id, create=False)
-                remote_format = _remote_storage_format_from_files(remote_files)
-                conflict_message = _remote_storage_conflict_message(
-                    identity.display_ref, hf_repo_id, storage_format, remote_format
-                )
-                if conflict_message:
-                    console.print(f"[{STYLE_FAIL}]{conflict_message}[/]")
-                    return False
-            except Exception:
-                pass
+        try:
+            hf_repo_id = _identity_hf_repo_id(identity)
+            repo_exists, revision, remote_files = _hf_repo_state(HfApi(), hf_repo_id, create=False)
+            remote_format = _remote_storage_format_from_files(remote_files)
+            conflict_message = _remote_storage_conflict_message(
+                identity.display_ref, hf_repo_id, storage_format, remote_format
+            )
+            if conflict_message:
+                console.print(f"[{STYLE_FAIL}]{conflict_message}[/]")
+                return False
+            needs_repair = repo_exists and _remote_dataset_publication_needs_repair(
+                hf_repo_id,
+                revision,
+                remote_files,
+            )
+        except Exception as exc:
+            console.print(f"[{STYLE_FAIL}]Could not inspect remote dataset publication: {exc}[/]")
+            return False
+        if needs_repair:
+            console.print(f"[{STYLE_INFO}]Repairing missing dataset preview artifacts...[/]")
+            repaired = _upload_dataset_shard_to_hub(
+                identity,
+                local_dataset,
+                storage_format=storage_format,
+                local_root=get_local_dataset_path(identity),
+                episode_ids=set(),
+                include_previews=False,
+                publish_data=False,
+                remote_state=remote_state,
+                max_retries=max_retries,
+                base_wait=base_wait,
+            )
+            return pending_ok and repaired
         console.print(f"[{STYLE_INFO}]All episodes already uploaded, nothing to do[/]")
         return pending_ok
 
@@ -5452,6 +5056,7 @@ def upload_local_dataset(recording_identity, max_retries=5, base_wait=1.0, repla
         episode_ids=new_episode_ids,
         replace=replace,
         include_previews=True,
+        remote_state=remote_state,
         max_retries=max_retries,
         base_wait=base_wait,
     )
@@ -5486,24 +5091,23 @@ def minari_export(recording_identity, dataset_name=None, author=None):
 
     episode_keys, row_indices_by_episode = _ordered_episode_rows(dataset)
 
-    # Try to extract action/observation spaces from the environment
-    action_space = None
-    observation_space = None
-    try:
-        env = create_env(env_id)
-        action_space = env.action_space
-        observation_space = env.observation_space
-        env.close()
-    except Exception:
-        console.print("[yellow]Could not create env for space metadata; inferring from data.[/]")
+    documents = _load_dataset_environment_documents(dataset, label="Local dataset")
+    if len(documents) != 1:
+        raise ValueError("Minari export requires one environment contract")
+    _contract, session = _session_from_environment_document(
+        next(iter(documents.values())), render_mode="rgb_array"
+    )
+    action_space = session.env.action_space
+    observation_space = session.env.observation_space
+    session.env.close()
 
     # Build EpisodeBuffers
     buffers = []
     total_steps = 0
     for ep_idx, episode_key in enumerate(sorted(episode_keys)):
         rows = [dataset[row_index] for row_index in row_indices_by_episode[episode_key]]
-        if "step" in rows[0]:
-            rows.sort(key=lambda row: row["step"])
+        if "step_index" in rows[0]:
+            rows.sort(key=lambda row: row["step_index"])
         observations = []
         actions = []
         rewards = []
@@ -5517,7 +5121,7 @@ def minari_export(recording_identity, dataset_name=None, author=None):
                 img = np.array(img)
             observations.append(img)
 
-            # Detect terminal observation by empty actions
+            # Detect the terminal observation by its null action.
             action = row.get("actions")
             if _is_terminal_action(action):
                 continue
@@ -5571,10 +5175,8 @@ def minari_export(recording_identity, dataset_name=None, author=None):
     )
     if author:
         create_kwargs["author"] = author
-    if action_space is not None:
-        create_kwargs["action_space"] = action_space
-    if observation_space is not None:
-        create_kwargs["observation_space"] = observation_space
+    create_kwargs["action_space"] = action_space
+    create_kwargs["observation_space"] = observation_space
 
     minari.create_dataset_from_buffers(**create_kwargs)
 
@@ -5596,117 +5198,6 @@ def minari_export(recording_identity, dataset_name=None, author=None):
         )
     )
     return True
-
-
-def _capture_env_metadata(env):
-    """Capture environment configuration metadata for dataset card."""
-    env_make_kwargs = dict(getattr(env, "_gymrec_make_kwargs", {}) or {})
-    metadata = {
-        "env_id": getattr(env, "_env_id", "unknown"),
-        "backend": classify_env_id(getattr(env, "_env_id", "")),
-        "capture_backend": getattr(
-            env,
-            "_gymrec_backend",
-            classify_env_id(getattr(env, "_env_id", "")),
-        ),
-        "frameskip": get_frameskip(env),
-        "fps": get_default_fps(env),
-    }
-    if env_make_kwargs:
-        metadata["env_make_kwargs"] = env_make_kwargs
-    # Action space info
-    action_space = env.action_space
-    if isinstance(action_space, gym.spaces.Discrete):
-        metadata["action_space_type"] = "Discrete"
-        metadata["n_actions"] = action_space.n
-    elif isinstance(action_space, gym.spaces.MultiBinary):
-        metadata["action_space_type"] = "MultiBinary"
-        metadata["n_actions"] = action_space.n
-    elif isinstance(action_space, gym.spaces.Dict):
-        metadata["action_space_type"] = "Dict"
-        for key, space in action_space.spaces.items():
-            if isinstance(space, gym.spaces.Discrete):
-                metadata[f"action_space_{key}"] = f"Discrete({space.n})"
-            elif isinstance(space, gym.spaces.MultiBinary):
-                metadata[f"action_space_{key}"] = f"MultiBinary({space.n})"
-            else:
-                metadata[f"action_space_{key}"] = str(space)
-    else:
-        metadata["action_space_type"] = type(action_space).__name__
-
-    # Observation space shape
-    obs_space = env.observation_space
-    metadata["observation_space_type"] = type(obs_space).__name__
-    obs_shape = getattr(obs_space, "shape", None)
-    if obs_shape is not None:
-        metadata["observation_shape"] = list(obs_shape)
-    if getattr(obs_space, "dtype", None) is not None:
-        metadata["observation_dtype"] = str(obs_space.dtype)
-    if isinstance(obs_space, gym.spaces.Dict):
-        for key, space in obs_space.spaces.items():
-            metadata[f"observation_space_{key}"] = str(space)
-
-    # Spec-based metadata
-    spec = getattr(env, "spec", None)
-    if spec is not None:
-        if hasattr(spec, "max_episode_steps") and spec.max_episode_steps is not None:
-            metadata["max_episode_steps"] = spec.max_episode_steps
-        kwargs = getattr(spec, "kwargs", {}) or {}
-        # Sticky actions (ALE)
-        if "repeat_action_probability" in kwargs and "sticky_actions" not in metadata:
-            metadata["sticky_actions"] = kwargs["repeat_action_probability"]
-
-    if "repeat_action_probability" in env_make_kwargs:
-        metadata["sticky_actions"] = env_make_kwargs["repeat_action_probability"]
-    elif "sticky_action_prob" in env_make_kwargs:
-        metadata["sticky_actions"] = env_make_kwargs["sticky_action_prob"]
-
-    state_name = getattr(env, "_gymrec_state_name", None)
-    if state_name:
-        metadata["state_name"] = state_name
-    rom_sha256 = getattr(env, "_gymrec_rom_sha256", None)
-    if rom_sha256:
-        metadata["rom_sha256"] = rom_sha256
-    if _is_nes_controller_env(env):
-        metadata.setdefault("sticky_actions", 0.0)
-        metadata["nes_button_order"] = list(NES_BUTTON_ORDER)
-        metadata["action_encoding"] = NES_ACTION_ENCODING
-        metadata["frame_stack"] = int(env_make_kwargs.get("frame_stack", 1))
-        metadata["noop_reset_max"] = int(env_make_kwargs.get("noop_reset_max", 0))
-
-    # ALE-specific: check unwrapped for sticky actions
-    unwrapped = getattr(env, "unwrapped", None)
-    if unwrapped is not None:
-        sticky = getattr(unwrapped, "_repeat_action_probability", None)
-        if sticky is not None and "sticky_actions" not in metadata:
-            metadata["sticky_actions"] = sticky
-
-    # Reward range
-    if hasattr(env, "reward_range"):
-        metadata["reward_range"] = list(env.reward_range)
-
-    # Stable-Retro specific
-    if hasattr(env, "_stable_retro") and env._stable_retro:
-        stable_retro_state = getattr(env, "_gymrec_stable_retro_state", None)
-        if stable_retro_state:
-            metadata["stable_retro_state"] = stable_retro_state
-        unwrapped = getattr(env, "unwrapped", None)
-        if unwrapped is not None:
-            metadata["retro_platform"] = getattr(unwrapped, "system", None)
-            metadata["retro_game"] = getattr(unwrapped, "gamerom", None)
-            buttons = getattr(unwrapped, "buttons", None)
-            if buttons:
-                metadata["retro_buttons"] = list(buttons)
-
-    # VizDoom specific
-    if hasattr(env, "_vizdoom") and env._vizdoom:
-        unwrapped = getattr(env, "unwrapped", None)
-        if unwrapped is not None:
-            metadata["vizdoom_scenario"] = getattr(unwrapped, "scenario", None)
-            metadata["vizdoom_num_binary_buttons"] = getattr(unwrapped, "num_binary_buttons", None)
-            metadata["vizdoom_num_delta_buttons"] = getattr(unwrapped, "num_delta_buttons", None)
-
-    return metadata
 
 
 def _size_category(n):
@@ -5747,71 +5238,39 @@ def _dataset_card_intro(env_id, collectors):
     return f"Human gameplay recordings from the Gymnasium environment `{env_id}`,"
 
 
-def _dataset_card_environment_lines(metadata, backend):
+def _dataset_card_environment_lines(metadata):
     if not metadata:
         return []
-
     lines = [
-        "## Environment Configuration",
+        "## Environment Contract",
         "",
         "| Setting | Value |",
         "|---------|-------|",
     ]
-
-    if metadata.get("capture_backend"):
-        lines.append(f"| Capture Backend | {metadata['capture_backend']} |")
-    if metadata.get("state_name"):
-        lines.append(f"| State | {metadata['state_name']} |")
-    if metadata.get("rom_sha256"):
-        lines.append(f"| ROM SHA-256 | `{metadata['rom_sha256']}` |")
-    if metadata.get("action_encoding"):
-        lines.append(f"| Action Encoding | {metadata['action_encoding']} |")
-    if metadata.get("nes_button_order"):
-        lines.append(f"| NES Button Order | `{json.dumps(metadata['nes_button_order'])}` |")
     for key, label in (
-        ("frameskip", "Frameskip"),
+        ("provider_id", "Provider"),
+        ("environment_contract_id", "Contract ID"),
         ("fps", "Target FPS"),
-        ("sticky_actions", "Sticky Actions"),
-        ("max_episode_steps", "Max Episode Steps"),
     ):
         if key in metadata:
-            lines.append(f"| {label} | {metadata[key]} |")
-
-    if "observation_shape" in metadata:
-        shape = metadata["observation_shape"]
-        lines.append(f"| Observation Shape | {' x '.join(str(s) for s in shape)} |")
-    if "observation_dtype" in metadata:
-        lines.append(f"| Observation Dtype | {metadata['observation_dtype']} |")
-    if "action_space_type" in metadata:
-        lines.append(f"| Action Space | {metadata['action_space_type']} |")
-    if "n_actions" in metadata:
-        lines.append(f"| Number of Actions | {metadata['n_actions']} |")
-    if "reward_range" in metadata:
-        rmin, rmax = metadata["reward_range"]
-        lines.append(f"| Reward Range | [{rmin}, {rmax}] |")
-
-    if backend in {"stable-retro", "stable-retro-turbo", "supermariobrosnes-turbo"}:
-        if metadata.get("retro_platform"):
-            lines.append(f"| Platform | {metadata['retro_platform']} |")
-        if metadata.get("retro_game"):
-            lines.append(f"| Game | {metadata['retro_game']} |")
-        if metadata.get("retro_buttons"):
-            named = [b for b in metadata["retro_buttons"][:8] if b is not None]
-            buttons = ", ".join(named)
-            total_named = sum(1 for b in metadata["retro_buttons"] if b is not None)
-            if total_named > 8:
-                buttons += f" (+{total_named - 8} more)"
-            lines.append(f"| Buttons | {buttons} |")
-    elif backend == "vizdoom":
-        if metadata.get("vizdoom_scenario"):
-            lines.append(f"| Scenario | {metadata['vizdoom_scenario']} |")
-        if "vizdoom_num_binary_buttons" in metadata:
-            lines.append(f"| Binary Buttons | {metadata['vizdoom_num_binary_buttons']} |")
-        if "vizdoom_num_delta_buttons" in metadata:
-            lines.append(f"| Delta Buttons | {metadata['vizdoom_num_delta_buttons']} |")
-
+            value = f"`{metadata[key]}`" if key == "environment_contract_id" else metadata[key]
+            lines.append(f"| {label} | {value} |")
     lines.append("")
     return lines
+
+
+_DATASET_CARD_TEMPLATE_ENV = Environment(
+    loader=FileSystemLoader(
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "gymrec_templates")
+    ),
+    undefined=StrictUndefined,
+    autoescape=False,
+    keep_trailing_newline=True,
+)
+
+
+def _render_dataset_card_template(context):
+    return _DATASET_CARD_TEMPLATE_ENV.get_template("dataset_card.md.j2").render(**context)
 
 
 def render_dataset_card_content(
@@ -5826,59 +5285,40 @@ def render_dataset_card_content(
     curator=None,
 ):
     """Render the shared Hugging Face dataset card Markdown."""
-    backend = (metadata or {}).get("capture_backend") or classify_env_id(env_id)
+    metadata = _canonicalize_environment_metadata(metadata)
+    provider_id = (metadata or {}).get("provider_id")
+    if provider_id not in SUPPORTED_PROVIDER_IDS:
+        raise ValueError("Dataset card requires a supported provider_id")
     collectors = collectors or []
     gymrec_versions = gymrec_versions or []
     collector_contracts = collector_contracts or []
     curator = curator or _current_hf_username()
-    storage_format = (
-        _normalize_storage_format(metadata.get("storage_format"))
-        if metadata and metadata.get("storage_format")
-        else STORAGE_FORMAT_IMAGES
-    )
+    storage_format = _configured_storage_format(metadata.get("storage_format"))
     card_data = DatasetCardData(
         language="en",
         license=CONFIG["dataset"]["license"],
         task_categories=CONFIG["dataset"]["task_categories"],
-        tags=["gymnasium", backend, env_id],
+        tags=["gymnasium", provider_id, env_id],
         size_categories=[_size_category(frames)],
         pretty_name=f"{env_id} Gameplay Dataset",
     )
 
-    content_lines = [
-        "---",
-        card_data.to_yaml(),
-        "---",
-        "",
-        f"# {env_id} Gameplay Dataset",
-        "",
-        _dataset_card_intro(env_id, collectors),
-        "captured using [gymrec](https://github.com/tsilva/gymrec).",
-        "",
-        "## Dataset Summary",
-        "",
-        "| Stat | Value |",
-        "|------|-------|",
-        f"| Total frames | {frames:,} |",
-        f"| Episodes | {episodes:,} |",
-        f"| Environment | `{env_id}` |",
-        f"| Backend | {BACKEND_LABELS.get(backend, backend)} |",
-        f"| Storage format | `{storage_format}` |",
-    ]
+    summary_optional_rows = []
     if collectors:
-        content_lines.append(f"| Collector(s) | {', '.join(collectors)} |")
+        summary_optional_rows.append(f"| Collector(s) | {', '.join(collectors)} |")
     if gymrec_versions:
-        content_lines.append(f"| gymrec version(s) | {', '.join(gymrec_versions)} |")
-    content_lines.append("")
+        summary_optional_rows.append(f"| gymrec version(s) | {', '.join(gymrec_versions)} |")
+    summary_optional_rows = "\n" + "\n".join(summary_optional_rows) if summary_optional_rows else ""
 
+    collector_contract_lines = []
     if collector_contracts:
-        content_lines.extend(
-            [
+        collector_contract_lines.extend(
+            (
                 "## Collector Contracts",
                 "",
                 "| Contract ID | Immutable model source | Mode | Files |",
                 "|-------------|------------------------|------|-------|",
-            ]
+            )
         )
         for contract in collector_contracts:
             contract_id = contract["contract_id"]
@@ -5890,87 +5330,43 @@ def render_dataset_card_content(
             files = ", ".join(
                 f"[`{filename}`](collectors/{contract_id}/{filename})" for filename in file_names
             )
-            content_lines.append(
+            collector_contract_lines.append(
                 f"| `{contract_id}` | `{source}` | `{contract.get('policy_mode')}` | {files} |"
             )
-        content_lines.append("")
-
-    if storage_format == STORAGE_FORMAT_LOSSLESS_VIDEO:
-        observation_lines = [
-            f"- **video_path** (`string`): Relative path to the canonical lossless RGB observation stream under `{VIDEO_ARTIFACT_DIR}/`, named `*{CANONICAL_VIDEO_SUFFIX}`",
-            "- **frame_index** (`int`): Observation frame index within `video_path`",
-            "- **frame_sha256** (`string`): SHA-256 of the raw RGB frame bytes, verified after video encode/decode",
-            "- **frame_width** / **frame_height** (`int`): Decoded RGB frame dimensions",
-            "- **episode_num_observations** (`int`): Number of observations in the episode video",
-            f"- Browser-friendly `*{PREVIEW_VIDEO_SUFFIX}` files under `{PREVIEW_VIDEO_ARTIFACT_DIR}/` are lossy previews only and are not used for trajectory replay/training",
-        ]
-    else:
-        observation_lines = [
-            "- **observations** (`Image`): RGB frame from the environment",
-        ]
-
-    content_lines.extend(_dataset_card_environment_lines(metadata, backend))
-    content_lines.extend(
-        [
-            "## Dataset Structure",
-            "",
-            "Minari-compatible flat table format. Use `minari-export` for native [Minari](https://minari.farama.org/) HDF5 format.",
-            "",
-            "Each episode has N step rows plus one terminal observation row (N+1 pattern).",
-            "The terminal observation is the final state after the last step - it has an empty action",
-            "and null values for rewards/terminations/truncations/infos.",
-            "",
-            "- **episode_id** (`binary(16)`): Unique UUID identifier for each episode (16 bytes, universally unique across all recordings)",
-            "- **seed** (`int` or `null`): RNG seed used for `env.reset()` (set on first row of each episode, `null` on other rows)",
-            *observation_lines,
-            "- **actions** (`list`): Action taken at this step (`[]` for terminal observations)",
-            "- **rewards** (`float` or `null`): Reward received (`null` on terminal observation rows)",
-            "- **terminations** (`bool` or `null`): Whether the episode terminated naturally (`null` on terminal observation rows)",
-            "- **truncations** (`bool` or `null`): Whether the episode was truncated (`null` on terminal observation rows)",
-            "- **infos** (`str` or `null`): Additional environment info as JSON (`null` on terminal observation rows)",
-            "- **session_id** (`binary(16)`): UUID grouping all episodes from one `gymrec record` run",
-            '- **collector** (`string`): Who collected the data (`"human"`, `"random"`, or future agent names)',
-            '- **gymrec_version** (`string`): Version of gymrec used to record (e.g. `"0.1.0+abc1234"`)',
-            "- **storage_format** (`string`): Observation storage backend (`images` or `lossless-video`)",
-            "- **collector_contract_id** (`string` or `null`): SHA-256 key for the collector documents under `collectors/<id>/`",
-            "- **policy_mode** (`string` or `null`): Effective `deterministic` or `stochastic` action sampling mode",
-            "- **policy_seed** (`int` or `null`): Episode policy RNG seed; null for human and built-in collectors",
-            "",
-            "## Usage",
-            "",
-            "```python",
-            "from datasets import load_dataset",
-            f'ds = load_dataset("{repo_id}")',
-            "```",
-            "",
-            "## About",
-            "",
-            "Recorded with [gymrec](https://github.com/tsilva/gymrec).",
-            f"Curated by: {curator}",
-        ]
+        collector_contract_lines.append("")
+    collector_contracts_block = (
+        "\n".join(collector_contract_lines) + "\n" if collector_contract_lines else ""
     )
-    return "\n".join(content_lines)
 
-
-def _read_existing_dataset_card_counts(repo_id):
-    """Return frame and episode counts parsed from an existing Hub README."""
-    import re
-
-    try:
-        readme_path = hf_hub_download(
-            repo_id=repo_id,
-            repo_type="dataset",
-            filename="README.md",
+    field_lines = [field.card_line() for field in _dataset_fields(storage_format)]
+    if storage_format == STORAGE_FORMAT_LOSSLESS_VIDEO:
+        field_lines.append(
+            f"- Browser-friendly `*{PREVIEW_VIDEO_SUFFIX}` files under "
+            f"`{PREVIEW_VIDEO_ARTIFACT_DIR}/` are lossy previews only and are not used "
+            "for trajectory replay/training"
         )
-        with open(readme_path) as f:
-            readme_content = f.read()
-        frames_match = re.search(r"\|\s*Total frames\s*\|\s*([\d,]+)\s*\|", readme_content)
-        episodes_match = re.search(r"\|\s*Episodes\s*\|\s*([\d,]+)\s*\|", readme_content)
-        frames = int(frames_match.group(1).replace(",", "")) if frames_match else 0
-        episodes = int(episodes_match.group(1).replace(",", "")) if episodes_match else 0
-        return frames, episodes
-    except Exception:
-        return 0, 0
+
+    environment_lines = _dataset_card_environment_lines(metadata)
+    environment_block = "\n".join(environment_lines) + "\n" if environment_lines else ""
+    return _render_dataset_card_template(
+        {
+            "card_yaml": card_data.to_yaml(),
+            "env_id": env_id,
+            "intro": _dataset_card_intro(env_id, collectors),
+            "replay_url": _dataset_replay_url(repo_id),
+            "replay_filename": DATASET_REPLAY_FILENAME,
+            "frames": f"{frames:,}",
+            "episodes": f"{episodes:,}",
+            "provider_label": PROVIDER_LABELS.get(provider_id, provider_id),
+            "storage_format": storage_format,
+            "summary_optional_rows": summary_optional_rows,
+            "collector_contracts_block": collector_contracts_block,
+            "environment_block": environment_block,
+            "field_lines": "\n".join(field_lines),
+            "repo_id": repo_id,
+            "curator": curator,
+        }
+    ).rstrip("\n")
 
 
 def _collector_contract_summaries(local_root, *, repo_id=None, remote_files=()):
@@ -6022,26 +5418,35 @@ def _build_dataset_card_content(
     repo_id,
     new_frames,
     new_episodes,
-    repo_exists,
+    existing_frames=0,
+    existing_episodes=0,
     local_root=None,
     remote_files=None,
+    dataset=None,
+    fps=None,
 ):
-    """Build dataset card content string for an append-only upload.
+    """Build a dataset card using row-derived existing and new statistics."""
+    total_frames = existing_frames + new_frames
+    total_episodes = existing_episodes + new_episodes
 
-    If the repo exists, downloads the current README and parses existing frame/episode
-    counts to compute running totals. Otherwise starts from new_frames/new_episodes.
-    Returns the full card content string (does not push to Hub).
-    """
-    total_frames = new_frames
-    total_episodes = new_episodes
-
-    if repo_exists:
-        existing_frames, existing_episodes = _read_existing_dataset_card_counts(repo_id)
-        total_frames += existing_frames
-        total_episodes += existing_episodes
-
-    metadata = load_local_metadata(recording_identity)
-    collectors, gymrec_versions = _provenance_from_metadata(metadata)
+    local_metadata = load_local_metadata(recording_identity)
+    metadata = _playback_metadata(dataset, local_metadata)
+    if fps is not None:
+        metadata["fps"] = fps
+    if dataset is not None:
+        columns = set(getattr(dataset, "column_names", None) or [])
+        collectors = (
+            sorted({value for value in dataset["collector"] if value})
+            if "collector" in columns
+            else []
+        )
+        gymrec_versions = (
+            sorted({value for value in dataset["gymrec_version"] if value})
+            if "gymrec_version" in columns
+            else []
+        )
+    else:
+        collectors, gymrec_versions = _provenance_from_metadata(local_metadata)
     collector_contracts = _collector_contract_summaries(
         local_root,
         repo_id=repo_id,
@@ -6059,1171 +5464,108 @@ def _build_dataset_card_content(
     )
 
 
-def _is_unexpected_env_kwarg_error(exc):
-    text = str(exc).lower()
-    return "unexpected keyword" in text or "got an unexpected" in text
-
-
-def _warn_unsupported_env_kwargs(env_id, kwargs):
-    if not kwargs:
-        return
-    keys = ", ".join(sorted(kwargs))
-    console.print(
-        f"[yellow]Warning:[/] {env_id} does not accept env kwargs ({keys}); using backend defaults."
+def create_environment_session(contract, *, render_mode):
+    """Create one provider-owned environment and its immutable recording artifact."""
+    contract = (
+        contract
+        if isinstance(contract, EnvironmentContract)
+        else EnvironmentContract.parse(contract)
     )
+    session = create_session(contract, render_mode=render_mode)
+    artifact = _environment_artifact(contract, session)
+    return session, artifact
 
 
-def _sha256_file(path):
-    digest = hashlib.sha256()
-    with open(path, "rb") as file_obj:
-        for chunk in iter(lambda: file_obj.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _lane_zero_value(value):
-    if isinstance(value, dict):
-        return _vector_info_to_lane_info(value)
-    if isinstance(value, np.ndarray):
-        if value.ndim == 0:
-            return value.item()
-        value = value[0]
-    elif isinstance(value, (list, tuple)):
-        value = value[0]
-    if isinstance(value, np.generic):
-        return value.item()
-    return value
-
-
-def _vector_info_to_lane_info(vector_info):
-    """Convert Gymnasium vector-info dictionaries into an ordinary lane-zero dict."""
-    if not vector_info:
-        return {}
-    lane_info = {}
-    for key, value in vector_info.items():
-        if key.startswith("_"):
+def _provider_catalog():
+    providers = discover_providers()
+    rows = []
+    for provider_id in sorted(SUPPORTED_PROVIDER_IDS):
+        provider = providers.get(provider_id)
+        if provider is None:
             continue
-        mask = vector_info.get(f"_{key}")
-        if mask is not None and not bool(_lane_zero_value(mask)):
-            continue
-        lane_info[key] = _lane_zero_value(value)
-    return lane_info
+        for environment_id in provider.catalog():
+            rows.append((provider_id, str(environment_id)))
+    return rows
 
 
-class SuperMarioBrosNesTurboEnvAdapter(gym.Env):
-    """Expose a one-lane native Retro VectorEnv as an ordinary Gymnasium Env."""
-
-    def __init__(self, vector_env):
-        _lazy_init()
-        if getattr(vector_env, "num_envs", None) != 1:
-            raise ValueError("The gymrec turbo adapter requires num_envs=1")
-        self.vector_env = vector_env
-        self.action_space = vector_env.single_action_space
-        self.observation_space = vector_env.single_observation_space
-        self.metadata = dict(getattr(vector_env, "metadata", {}) or {})
-        self.render_mode = getattr(vector_env, "render_mode", "rgb_array")
-        self.autoreset_mode = getattr(vector_env, "autoreset_mode", None)
-        self.system = getattr(vector_env, "system", "Nes")
-        self.buttons = list(getattr(vector_env, "buttons", NES_BUTTON_ORDER))
-        self._needs_reset = True
-
-    def reset(self, *, seed=None, options=None):
-        super().reset(seed=seed)
-        observations, infos = self.vector_env.reset(seed=seed, options=options)
-        self._needs_reset = False
-        return observations[0], _vector_info_to_lane_info(infos)
-
-    def step(self, action):
-        if self._needs_reset:
-            raise RuntimeError("reset() must be called before step() or after a terminal step")
-        if isinstance(self.action_space, gym.spaces.Discrete):
-            action = int(np.asarray(action).reshape(-1)[0])
-            if not self.action_space.contains(action):
-                raise ValueError(f"Expected action in {self.action_space}; got {action}")
-            batched_action = np.asarray([action], dtype=self.action_space.dtype)
-        else:
-            action = np.asarray(action, dtype=self.action_space.dtype)
-            if action.shape != self.action_space.shape or not self.action_space.contains(action):
-                raise ValueError(
-                    f"Expected a Stable-Retro-compatible action with shape "
-                    f"{self.action_space.shape}; got {action.shape}"
-                )
-            batched_action = action[np.newaxis, ...]
-        observations, rewards, terminations, truncations, infos = self.vector_env.step(
-            batched_action
-        )
-        terminated = bool(terminations[0])
-        truncated = bool(truncations[0])
-        if terminated or truncated:
-            self._needs_reset = True
-        return (
-            observations[0],
-            float(rewards[0]),
-            terminated,
-            truncated,
-            _vector_info_to_lane_info(infos),
-        )
-
-    def render(self):
-        return self.vector_env.render()
-
-    def close(self):
-        self.vector_env.close()
-
-
-class MarioRecipeTaskEnv(gym.Wrapper):
-    """Apply the declarative rlab Mario reward and episode contract to one lane."""
-
-    def __init__(self, env, task):
-        super().__init__(env)
-        self.task = task
-        self.signals = task.get("signals") or {}
-        self.events = task.get("events") or {}
-        self.termination = task.get("termination") or {}
-        self.reward_config = task.get("reward") or {}
-        self._validate_contract()
-        self._gymrec_policy_observations = bool(getattr(env, "_gymrec_policy_observations", False))
-        self._episode_steps = 0
-        self._last_progress_step = 0
-
-    def _validate_contract(self):
-        expected_events = {
-            "life_loss": ("lives", "decrease"),
-            "level_change": ("level", "change"),
-            "stalled": ("x", "unchanged_for"),
+def _manual_environment_contract(provider_id, environment_id, config=None):
+    if provider_id is None:
+        matches = {
+            candidate
+            for candidate, candidate_env_id in _provider_catalog()
+            if candidate_env_id == environment_id
         }
-        unknown = sorted(set(self.events) - set(expected_events))
-        if unknown:
-            raise ValueError(f"Unsupported Mario recipe event(s): {', '.join(unknown)}")
-        for name, expected in expected_events.items():
-            if name not in self.events:
-                continue
-            rule = self.events[name]
-            actual = (rule.get("signal"), rule.get("operation"))
-            if actual != expected:
-                raise ValueError(
-                    f"Mario recipe event {name!r} requires signal={expected[0]!r}, "
-                    f"operation={expected[1]!r}"
-                )
-        reward_mode = self.reward_config.get("reward_mode", "native")
-        if reward_mode not in {"native", "bounded", "baseline", "score", "additive"}:
-            raise ValueError(f"Unsupported Mario recipe reward mode {reward_mode!r}")
-
-    @staticmethod
-    def _signal(info, source, *, pair=False):
-        names = (source,) if isinstance(source, str) else tuple(source)
-        try:
-            values = tuple(int(info[name]) for name in names)
-        except (KeyError, TypeError, ValueError) as exc:
+        if len(matches) != 1:
+            supported = ", ".join(sorted(SUPPORTED_PROVIDER_IDS))
             raise ValueError(
-                f"Mario recipe signal {source!r} is absent from provider info"
-            ) from exc
-        if pair:
-            if len(values) != 2:
-                raise ValueError(f"Mario recipe pair signal {source!r} must contain two fields")
-            return values
-        if len(values) == 1:
-            return values[0]
-        if len(values) == 2:
-            return values[0] * 256 + values[1]
-        raise ValueError(f"Mario recipe signal {source!r} has unsupported width {len(values)}")
-
-    def _read_state(self, info):
-        return {
-            "x": self._signal(info, self.signals.get("x", ("xscrollHi", "xscrollLo"))),
-            "score": self._signal(info, self.signals.get("score", "score")),
-            "lives": self._signal(info, self.signals.get("lives", "lives")),
-            "level": self._signal(
-                info, self.signals.get("level", ("levelHi", "levelLo")), pair=True
-            ),
-        }
-
-    def reset(self, *, seed=None, options=None):
-        observation, info = self.env.reset(seed=seed, options=options)
-        state = self._read_state(info)
-        self._x = state["x"]
-        self._level_max_x = state["x"]
-        self._completed_level_base = 0
-        self._max_global_x = state["x"]
-        self._score = state["score"]
-        self._lives = state["lives"]
-        self._level = state["level"]
-        self._episode_steps = 0
-        self._last_progress_step = 0
-        return observation, info
-
-    def step(self, action):
-        observation, native_reward, provider_terminated, provider_truncated, info = self.env.step(
-            action
-        )
-        info = dict(info)
-        state = self._read_state(info)
-        lost_life = state["lives"] < self._lives
-        changed_level = state["level"] != self._level
-        completed = changed_level and not lost_life
-
-        if completed:
-            self._completed_level_base += self._level_max_x
-            self._level_max_x = 0
-        effective_x = 0 if changed_level else state["x"]
-        self._level_max_x = max(self._level_max_x, effective_x)
-        global_x = self._completed_level_base + effective_x
-        global_max_x = self._completed_level_base + self._level_max_x
-        progress_delta = max(global_max_x - self._max_global_x, 0)
-        self._max_global_x = max(self._max_global_x, global_max_x)
-        score_delta = max(state["score"] - self._score, 0)
-
-        no_progress_min_delta = int(self.termination.get("no_progress_min_delta", 0))
-        if progress_delta > no_progress_min_delta:
-            self._last_progress_step = self._episode_steps
-        self._episode_steps += 1
-        stalled_rule = self.events.get("stalled") or {}
-        stalled_steps = int(stalled_rule.get("steps", 0))
-        stalled = bool(
-            stalled_steps > 0 and self._episode_steps - self._last_progress_step >= stalled_steps
-        )
-
-        failure_events = set(self.termination.get("failure") or ())
-        success_events = set(self.termination.get("success") or ())
-        task_terminated = (
-            (lost_life and "life_loss" in failure_events)
-            or (completed and "level_change" in success_events)
-            or (stalled and "stalled" in failure_events)
-        )
-        max_episode_steps = int(self.termination.get("max_episode_steps", 0))
-        task_truncated = (stalled and "stalled" not in failure_events) or (
-            max_episode_steps > 0 and self._episode_steps >= max_episode_steps
-        )
-        if task_terminated:
-            task_truncated = False
-
-        terminated = bool(provider_terminated or task_terminated)
-        truncated = bool((provider_truncated or task_truncated) and not terminated)
-        reward = self._shape_reward(
-            float(native_reward),
-            progress_delta=progress_delta,
-            score_delta=score_delta,
-            completed=completed,
-            lost_life=lost_life,
-            done=terminated or truncated,
-        )
-
-        emitted_events = []
-        if lost_life and "life_loss" in self.events:
-            emitted_events.append("life_loss")
-        if changed_level and "level_change" in self.events:
-            emitted_events.append("level_change")
-        if stalled and "stalled" in self.events:
-            emitted_events.append("stalled")
-        outcome = "neutral"
-        if truncated:
-            outcome = "timeout"
-        if completed and not lost_life:
-            outcome = "success"
-        if (
-            lost_life
-            or (stalled and "stalled" in failure_events)
-            or (provider_terminated and not completed)
-        ):
-            outcome = "failure"
-        info.update(
-            {
-                "task_events": emitted_events,
-                "task_outcome": outcome,
-                "level_complete": completed,
-                "life_loss": lost_life,
-                "progress_delta": progress_delta,
-                "score_delta": score_delta,
-                "global_x_pos": global_x,
-                "global_max_x_pos": self._max_global_x,
-                "native_reward": float(native_reward),
-                "shaped_reward": reward,
-            }
-        )
-
-        self._x = effective_x
-        self._score = state["score"]
-        self._lives = state["lives"]
-        self._level = state["level"]
-        return observation, reward, terminated, truncated, info
-
-    def _shape_reward(
-        self,
-        native_reward,
-        *,
-        progress_delta,
-        score_delta,
-        completed,
-        lost_life,
-        done,
-    ):
-        config = self.reward_config
-        mode = str(config.get("reward_mode", "native"))
-        reward_scale = float(config.get("reward_scale", 10.0)) or 1.0
-        terminal_reward = float(config.get("terminal_reward", 50.0))
-        progress_cap = float(config.get("progress_reward_cap", 30.0))
-        capped_progress = min(float(progress_delta), progress_cap)
-        if mode == "native":
-            shaped = native_reward
-        elif mode == "bounded":
-            raw = (
-                terminal_reward if completed else -terminal_reward if lost_life else capped_progress
+                f"--provider is required for {environment_id!r}; choose one of: {supported}"
             )
-            shaped = raw / reward_scale
-        elif mode == "baseline":
-            raw = native_reward + float(score_delta) / 40.0
-            if completed:
-                raw += terminal_reward
-            elif done:
-                raw -= terminal_reward
-            shaped = raw / reward_scale
-        else:
-            native_component = native_reward if config.get("use_native_reward", False) else 0.0
-            if mode == "score":
-                progress = (
-                    capped_progress
-                    if config.get("score_progress_clipped", False)
-                    else float(progress_delta)
-                )
-                score_component = 0.01 * float(score_delta)
-            else:
-                progress = float(progress_delta)
-                score_component = 0.0
-            shaped = (
-                native_component
-                + float(config.get("progress_reward_scale", 1.0)) * progress
-                + score_component
-                + (float(config.get("completion_reward", 0.0)) if completed else 0.0)
-                - (float(config.get("death_penalty", 25.0)) if lost_life else 0.0)
-            )
-        shaped -= float(config.get("time_penalty", 0.0))
-        if config.get("clip_rewards", False):
-            shaped = 1.0 if shaped > 0 else -1.0 if shaped < 0 else 0.0
-        return float(shaped)
-
-
-def _create_env__stableretro(env_id, state=None, env_make_kwargs=None):
-    _ensure_stableretro_roms_path_imported()
-
-    import stable_retro as retro
-
-    make_kwargs = {"render_mode": "rgb_array"}
-    if state:
-        make_kwargs["state"] = state
-    optional_kwargs = dict(env_make_kwargs or {})
-    try:
-        env = retro.make(env_id, **make_kwargs, **optional_kwargs)
-        env._gymrec_make_kwargs = optional_kwargs
-    except FileNotFoundError:
-        console.print(f"\n[{STYLE_FAIL}]Error: ROM not found for '{env_id}'.[/]")
-        console.print("\nStable-retro requires ROM files to be imported separately.")
-        console.print(
-            f"Import ROMs with:  [{STYLE_CMD}]{_gymrec_cmd('import_roms', '/path/to/roms')}[/]"
-        )
-        console.print(
-            f"\nUse [{STYLE_CMD}]{_gymrec_cmd('list_environments')}[/] to see which games have ROMs imported."
-        )
-        sys.exit(1)
-    except TypeError as exc:
-        if not optional_kwargs or not _is_unexpected_env_kwarg_error(exc):
-            raise
-        _warn_unsupported_env_kwargs(env_id, optional_kwargs)
-        env = retro.make(env_id, **make_kwargs)
-        env._gymrec_make_kwargs = {}
-    env._stable_retro = True
-    env._gymrec_backend = "stable-retro"
-    env._gymrec_stable_retro_state = state
-    env._gymrec_state_name = state
-    env._gymrec_nes_controller = getattr(getattr(env, "unwrapped", None), "system", None) == "Nes"
-    try:
-        rom_path = retro.data.get_romfile_path(env_id, retro.data.Integrations.ALL)
-        env._gymrec_rom_sha256 = _sha256_file(rom_path)
-    except (FileNotFoundError, OSError, AttributeError):
-        pass
-    return env
-
-
-def _create_env__supermariobrosnes_turbo(env_id, state=None, env_make_kwargs=None):
-    if env_id != SUPERMARIOBROS_NES_ENV_ID:
-        raise ValueError(
-            f"The supermariobrosnes-turbo backend only supports {SUPERMARIOBROS_NES_ENV_ID}."
-        )
-
-    from supermariobrosnes_turbo import Actions, SuperMarioBrosNesTurboVecEnv
-
-    state = state or "Level1-1"
-    optional_kwargs = dict(env_make_kwargs or {})
-    optional_kwargs.update(
+        provider_id = matches.pop()
+    return EnvironmentContract.parse(
         {
-            "num_envs": 1,
-            "state": state,
+            "contract_version": 1,
+            "provider_id": provider_id,
+            "environment_id": environment_id,
+            "config": config or {},
         }
     )
-    optional_kwargs.setdefault("num_threads", 1)
-    optional_kwargs.setdefault("render_mode", "rgb_array")
-    optional_kwargs.setdefault("use_restricted_actions", Actions.ALL)
-    optional_kwargs.setdefault("obs_layout", "hwc")
-    optional_kwargs.setdefault("frame_stack", 1)
-    optional_kwargs.setdefault("frame_skip", 1)
-    optional_kwargs.setdefault("sticky_action_prob", 0.0)
-    optional_kwargs.setdefault("noop_reset_max", 0)
-    optional_kwargs.setdefault("info_filter", "all")
-    vector_env = SuperMarioBrosNesTurboVecEnv(
-        SUPERMARIOBROS_NES_ENV_ID,
-        **optional_kwargs,
-    )
-    env = SuperMarioBrosNesTurboEnvAdapter(vector_env)
-    env._gymrec_backend = "supermariobrosnes-turbo"
-    env._gymrec_nes_controller = True
-    env._gymrec_state_name = state
-    env._gymrec_rom_sha256 = SUPERMARIOBROS_NES_ROM_SHA256
-    env._gymrec_policy_observations = bool(
-        optional_kwargs.get("obs_grayscale")
-        or int(optional_kwargs.get("frame_stack", 1)) > 1
-        or optional_kwargs.get("obs_resize") is not None
-        or optional_kwargs.get("obs_crop") is not None
-        or optional_kwargs.get("obs_layout") != "hwc"
-    )
-    env._gymrec_make_kwargs = {
-        key: value
-        for key, value in optional_kwargs.items()
-        if key not in {"num_envs", "rom_path", "state"}
-    }
-    return env
 
 
-def _create_env__stable_retro_turbo(env_id, state=None, env_make_kwargs=None):
-    """Create the one-lane native RetroVecEnv declared by an rlab recipe."""
-    _ensure_stableretro_roms_path_imported()
-    import stable_retro as retro
-
-    optional_kwargs = dict(env_make_kwargs or {})
-    optional_kwargs.update({"num_envs": 1, "state": state or retro.State.DEFAULT})
-    optional_kwargs.setdefault("num_threads", 1)
-    optional_kwargs.setdefault("render_mode", "rgb_array")
-    optional_kwargs.setdefault("use_restricted_actions", retro.Actions.ALL)
-    optional_kwargs.setdefault("obs_layout", "hwc")
-    optional_kwargs.setdefault("frame_stack", 1)
-    optional_kwargs.setdefault("frame_skip", 1)
-    optional_kwargs.setdefault("sticky_action_prob", 0.0)
-    optional_kwargs.setdefault("noop_reset_max", 0)
-    optional_kwargs.setdefault("info_filter", "all")
-    vector_env = retro.RetroVecEnv(env_id, **optional_kwargs)
-    env = SuperMarioBrosNesTurboEnvAdapter(vector_env)
-    env._stable_retro = True
-    env._gymrec_backend = "stable-retro-turbo"
-    env._gymrec_state_name = state
-    env._gymrec_nes_controller = getattr(env, "system", None) == "Nes"
-    env._gymrec_policy_observations = bool(
-        optional_kwargs.get("obs_grayscale")
-        or int(optional_kwargs.get("frame_stack", 1)) > 1
-        or optional_kwargs.get("obs_resize") is not None
-        or optional_kwargs.get("obs_crop") is not None
-        or optional_kwargs.get("obs_layout") != "hwc"
-    )
-    env._gymrec_make_kwargs = {
-        key: value
-        for key, value in optional_kwargs.items()
-        if key not in {"num_envs", "rom_path", "state"}
-    }
-    try:
-        rom_path = retro.data.get_romfile_path(env_id, retro.data.Integrations.ALL)
-        env._gymrec_rom_sha256 = _sha256_file(rom_path)
-    except (FileNotFoundError, OSError, AttributeError):
-        pass
-    return env
-
-
-def _create_env__vizdoom(env_id):
-    import vizdoom.gymnasium_wrapper  # noqa: F401
-
-    env = gym.make(env_id, render_mode="rgb_array", max_buttons_pressed=0)
-    env._vizdoom = True
-    return env
-
-
-def _create_env__alepy(env_id, env_make_kwargs=None):
-    _configure_atari_roms_path()
-
-    import ale_py
-
-    gym.register_envs(ale_py)
-    has_rom, rom_status = _get_atari_rom_status(env_id)
-    if not has_rom:
-        game = _get_atari_game_name(env_id) or env_id
-        console.print(f"\n[{STYLE_FAIL}]Error: Atari ROM not available for '{env_id}'.[/]")
-        console.print(
-            f"\nALE-py registered this environment, but the ROM file for [{STYLE_ENV}]{game}[/] is not usable in this Python environment ([{STYLE_FAIL}]{rom_status}[/])."
-        )
-        console.print(
-            f"Use [{STYLE_CMD}]{_gymrec_cmd('list_environments')}[/] to see which Atari environments have ROMs installed."
-        )
-        sys.exit(1)
-
-    optional_kwargs = dict(env_make_kwargs or {})
-    try:
-        env = gym.make(env_id, render_mode="rgb_array", **optional_kwargs)
-        env._gymrec_make_kwargs = optional_kwargs
-        return env
-    except TypeError as exc:
-        if not optional_kwargs or not _is_unexpected_env_kwarg_error(exc):
-            raise
-        _warn_unsupported_env_kwargs(env_id, optional_kwargs)
-        env = gym.make(env_id, render_mode="rgb_array")
-        env._gymrec_make_kwargs = {}
-        return env
-    except FileNotFoundError:
-        game = _get_atari_game_name(env_id) or env_id
-        console.print(f"\n[{STYLE_FAIL}]Error: Atari ROM not found for '{env_id}'.[/]")
-        console.print(
-            f"\nALE-py registered this environment, but the ROM file for [{STYLE_ENV}]{game}[/] is not installed in this Python environment."
-        )
-        console.print(
-            f"Use [{STYLE_CMD}]{_gymrec_cmd('list_environments')}[/] to see which Atari environments have ROMs installed."
-        )
-        sys.exit(1)
-    except OSError as e:
-        console.print(f"\n[{STYLE_FAIL}]Error: Atari ROM failed validation for '{env_id}'.[/]")
-        console.print(f"[dim]{e}[/]")
-        console.print(
-            f"Use [{STYLE_CMD}]{_gymrec_cmd('list_environments')}[/] to see which Atari environments have valid ROMs installed."
-        )
-        sys.exit(1)
-
-
-def create_env(
-    env_id,
-    *,
-    stable_retro_state=None,
-    backend=None,
-    human_recording=False,
-    metadata=None,
-    env_make_kwargs=None,
-):
-    """Create a Gymnasium environment with the appropriate backend."""
-
-    if backend is None and not (metadata or {}).get("capture_backend"):
-        stable_retro_envs = set(_get_stableretro_envs())
-        backend = classify_env_id(env_id, stable_retro_envs=stable_retro_envs)
-    backend = resolve_runtime_backend(env_id, requested=backend, metadata=metadata)
-    if env_make_kwargs is None:
-        if human_recording:
-            env_make_kwargs = _human_record_env_make_kwargs(backend)
-        else:
-            env_make_kwargs = _env_make_kwargs_from_metadata(env_id, metadata, backend=backend)
-    else:
-        env_make_kwargs = dict(env_make_kwargs)
-    if (
-        backend
-        in {
-            "stable-retro",
-            "stable-retro-turbo",
-            "supermariobrosnes-turbo",
-        }
-        and stable_retro_state is None
-    ):
-        stable_retro_state = _stable_retro_state_from_metadata(metadata)
-    if env_id == SUPERMARIOBROS_NES_ENV_ID and stable_retro_state is None:
-        stable_retro_state = "Level1-1"
-
-    if backend == "stable-retro":
-        env = _create_env__stableretro(
-            env_id,
-            state=stable_retro_state,
-            env_make_kwargs=env_make_kwargs,
-        )
-    elif backend == "stable-retro-turbo":
-        env = _create_env__stable_retro_turbo(
-            env_id,
-            state=stable_retro_state,
-            env_make_kwargs=env_make_kwargs,
-        )
-    elif backend == "supermariobrosnes-turbo":
-        env = _create_env__supermariobrosnes_turbo(
-            env_id,
-            state=stable_retro_state,
-            env_make_kwargs=env_make_kwargs,
-        )
-    elif backend == "vizdoom":
-        env = _create_env__vizdoom(env_id)
-        env._gymrec_make_kwargs = {}
-    else:
-        env = _create_env__alepy(env_id, env_make_kwargs=env_make_kwargs)
-
-    env._env_id = env_id
-    env._gymrec_backend = backend
-    return env
-
-
-def _normalize_frameskip_value(value):
-    """Normalize a scalar or two-value frameskip to a positive integer."""
-    try:
-        if isinstance(value, (tuple, list)) and len(value) == 2:
-            value = (value[0] + value[1]) / 2
-        return max(int(round(value)), 1)
-    except (TypeError, ValueError):
-        return None
-
-
-def get_frameskip(env) -> int:
-    """Detect the frameskip value for an environment.
-
-    Returns the number of internal frames per env.step() call.
-    For stochastic frameskip tuples like (2, 5), returns the average.
-    """
-    env_id = getattr(env, "_env_id", "")
-    make_kwargs = getattr(env, "_gymrec_make_kwargs", {}) or {}
-    for key in ("frameskip", "frame_skip"):
-        frameskip = _normalize_frameskip_value(make_kwargs.get(key))
-        if frameskip is not None:
-            return frameskip
-
-    # VizDoom and Retro have different frameskip semantics; skip detection
-    if hasattr(env, "_vizdoom") and env._vizdoom:
-        return 1
-    if bool(getattr(env, "_stable_retro", False)) or _is_nes_controller_env(env):
-        return 1
-
-    # Check spec kwargs (works for gym.make() environments)
-    spec = getattr(env, "spec", None)
-    if spec is not None:
-        kwargs = getattr(spec, "kwargs", {}) or {}
-        frameskip = _normalize_frameskip_value(kwargs.get("frameskip"))
-        if frameskip is not None:
-            return frameskip
-
-    # ALE-specific attribute fallback
-    unwrapped = getattr(env, "unwrapped", None)
-    if unwrapped is not None:
-        frameskip = _normalize_frameskip_value(getattr(unwrapped, "_frameskip", None))
-        if frameskip is not None:
-            return frameskip
-
-    # Name-based: NoFrameskip means frameskip=1
-    if "NoFrameskip" in env_id:
-        return 1
-
-    return 1
-
-
-def get_default_fps(env):
-    """Determine a sensible default FPS for an environment."""
-
-    env_id = getattr(env, "_env_id", "")
-    backend = classify_env_id(env_id)
-    base_fps = CONFIG["fps_defaults"]["atari"] if backend == "atari" else None
-
-    for key in ("render_fps", "video.frames_per_second"):
-        if base_fps is not None:
-            break
-        fps = env.metadata.get(key)
-        if fps:
-            try:
-                base_fps = int(round(float(fps)))
-                break
-            except (TypeError, ValueError):
-                pass
-
-    if base_fps is None:
-        if backend == "stable-retro":
-            base_fps = CONFIG["fps_defaults"]["retro"]
-        elif backend == "vizdoom":
-            base_fps = CONFIG["fps_defaults"]["vizdoom"]
-        else:
-            base_fps = CONFIG["fps_defaults"]["atari"]
-
-    frameskip = get_frameskip(env)
-    if frameskip > 1:
-        adjusted_fps = max(int(round(base_fps / frameskip)), 1)
-        console.print(
-            f"[{STYLE_INFO}]\\[FPS][/] Base FPS={base_fps}, frameskip={frameskip} → adjusted to [{STYLE_INFO}]{adjusted_fps}[/] FPS for human playability"
-        )
-        return adjusted_fps
-
-    return base_fps
-
-
-def _get_atari_game_name(env_id: str) -> str | None:
-    try:
-        spec = gym.spec(env_id)
-    except Exception:
-        return None
-    kwargs = getattr(spec, "kwargs", {}) or {}
-    game = kwargs.get("game")
-    return str(game) if game else None
-
-
-def _get_atari_rom_status(env_id: str) -> tuple[bool, str]:
-    game = _get_atari_game_name(env_id)
-    if not game:
-        return False, "missing ROM metadata"
-
-    try:
-        import contextlib
-        import io
-
-        from ale_py import roms
-
-        with contextlib.redirect_stdout(io.StringIO()):
-            rom_path = roms.get_rom_path(game)
-        if rom_path and os.path.exists(rom_path):
-            return True, "installed"
-        return False, "missing ROM"
-    except FileNotFoundError:
-        return False, "missing ROM"
-    except OSError:
-        return False, "invalid ROM"
-    except Exception:
-        return False, "ROM unavailable"
-
-
-def _get_atari_envs(imported_only: bool = False) -> list[str]:
-    try:
-        _configure_atari_roms_path()
-
-        import ale_py
-
-        gym.register_envs(ale_py)
-        atari_ids = sorted(
-            env_id
-            for env_id in gym.envs.registry.keys()
-            if str(gym.spec(env_id).entry_point) == "ale_py.env:AtariEnv"
-            and env_id.startswith("ALE/")
-        )
-        if imported_only:
-            return [env_id for env_id in atari_ids if _get_atari_rom_status(env_id)[0]]
-        return atari_ids
-    except Exception:
-        return []
-
-
-def _get_stableretro_envs(imported_only: bool = False) -> list[str]:
-    try:
-        _ensure_stableretro_roms_path_imported()
-
-        import stable_retro as retro
-
-        all_games = sorted(retro.data.list_games(retro.data.Integrations.ALL))
-        if imported_only:
-            result = []
-            for game in all_games:
-                try:
-                    retro.data.get_romfile_path(game, retro.data.Integrations.ALL)
-                    result.append(game)
-                except FileNotFoundError:
-                    pass
-            return result
-        return all_games
-    except Exception:
-        return []
-
-
-def _get_vizdoom_envs() -> list[str]:
-    try:
-        import vizdoom.gymnasium_wrapper  # noqa: F401
-
-        return sorted(env_id for env_id in gym.envs.registry.keys() if env_id.startswith("Vizdoom"))
-    except Exception:
-        return []
-
-
-def _get_env_platform(env_id: str) -> str:
-    """Determine the platform type for an env_id."""
-    return {
-        "atari": "Atari",
-        "vizdoom": "VizDoom",
-        "stable-retro": "Stable-Retro",
-    }[classify_env_id(env_id)]
-
-
-def _build_environment_menu_entries(grouped_envs):
-    """Build menu entries and env lookup, preserving backend display order."""
-    entries = []
-    env_id_map = []
-    groups = [(label, envs) for label, envs in grouped_envs if envs]
-
-    for group_index, (label, envs) in enumerate(groups):
-        if group_index > 0:
-            entries.append("")
-            env_id_map.append(None)
-        for env_id in envs:
-            entries.append(f"[{label}]  {env_id}")
-            env_id_map.append(env_id)
-
-    return entries, env_id_map
-
-
-def _terminal_menu_supported() -> bool:
-    if os.environ.get("GYMREC_TEXT_MENU", "").lower() in ("1", "true", "yes"):
-        return False
-    if os.environ.get("TERM") in (None, "", "dumb"):
-        return False
-    size = shutil.get_terminal_size(fallback=(0, 0))
-    return size.columns > 0 and size.lines > 0 and sys.stdin.isatty() and sys.stdout.isatty()
-
-
-def _select_environment_text_fallback(entries, env_id_map, title: str) -> str:
-    selectable = [
-        (entry, env_id) for entry, env_id in zip(entries, env_id_map, strict=False) if env_id
-    ]
-    if not selectable:
-        console.print(f"[{STYLE_FAIL}]No environments found.[/]")
-        raise SystemExit(1)
-
-    console.print(
-        f"[bold]{title.strip()}[/]: [{STYLE_INFO}]{len(selectable)}[/] environments available"
-    )
-    console.print(
-        "[dim]Terminal menu is unavailable here. Type part of a name to search, or paste an exact env id.[/]"
-    )
-
+def _select_numbered(options, *, title):
+    if not options:
+        raise ValueError(f"No {title.lower()} are available")
+    console.print(f"[{STYLE_INFO}]{title}[/]")
+    for index, (label, _value) in enumerate(options, start=1):
+        console.print(f"  [{STYLE_PATH}]{index:>2}[/]  {label}")
     while True:
-        query = Prompt.ask("Search").strip()
-        if not query:
-            matches = selectable[:25]
-        else:
-            query_lower = query.lower()
-            exact_matches = [
-                (entry, env_id) for entry, env_id in selectable if env_id.lower() == query_lower
-            ]
-            if exact_matches:
-                return exact_matches[0][1]
-            matches = [
-                (entry, env_id)
-                for entry, env_id in selectable
-                if query_lower in env_id.lower() or query_lower in entry.lower()
-            ][:25]
-
-        if not matches:
-            console.print(f"[{STYLE_FAIL}]No matches. Try a shorter search.[/]")
-            continue
-
-        for index, (entry, _env_id) in enumerate(matches, start=1):
-            console.print(f"{index:2d}. {entry}")
-
-        choice = Prompt.ask("Select number, or search again").strip()
-        if not choice:
-            continue
-        if choice.isdigit():
-            selected_index = int(choice)
-            if 1 <= selected_index <= len(matches):
-                return matches[selected_index - 1][1]
-        query_lower = choice.lower()
-        exact_matches = [
-            (entry, env_id) for entry, env_id in selectable if env_id.lower() == query_lower
-        ]
-        if exact_matches:
-            return exact_matches[0][1]
-
-        matches = [
-            (entry, env_id)
-            for entry, env_id in selectable
-            if query_lower in env_id.lower() or query_lower in entry.lower()
-        ][:25]
-        if len(matches) == 1:
-            return matches[0][1]
-        if matches:
-            for index, (entry, _env_id) in enumerate(matches, start=1):
-                console.print(f"{index:2d}. {entry}")
-        else:
-            console.print(f"[{STYLE_FAIL}]No matches. Try a shorter search.[/]")
-
-
-def select_environment_interactive(available_recordings_only: bool = False) -> str:
-    from simple_term_menu import TerminalMenu
-
-    status_bar = "  ↑↓ navigate · / search · Enter select · Esc cancel"
-    if available_recordings_only:
-        local_refs = _get_available_recording_refs_from_local()
-        hf_refs = _get_available_recording_refs_from_hf()
-        all_recording_refs = sorted(set(local_refs + hf_refs))
-
-        if not all_recording_refs:
-            console.print(
-                f"[{STYLE_FAIL}]No recordings found.[/]\n"
-                f"  Local path: [{STYLE_PATH}]{CONFIG['storage']['local_dir']}[/]\n"
-                f"  Record first: [{STYLE_CMD}]{_gymrec_cmd('record', '<env_id>')}[/]"
-            )
-            raise SystemExit(1)
-
-        repo_refs = [ref for ref in all_recording_refs if ref.startswith(HUGGINGFACE_MODEL_SCHEME)]
-        env_refs = [
-            ref for ref in all_recording_refs if not ref.startswith(HUGGINGFACE_MODEL_SCHEME)
-        ]
-        atari_envs = [e for e in env_refs if _get_env_platform(e) == "Atari"]
-        retro_envs = [e for e in env_refs if _get_env_platform(e) == "Stable-Retro"]
-        vizdoom_envs = [e for e in env_refs if _get_env_platform(e) == "VizDoom"]
-        entries, env_id_map = _build_environment_menu_entries(
-            (
-                ("HF Policy Dataset", repo_refs),
-                ("Atari", atari_envs),
-                ("Stable-Retro", retro_envs),
-                ("VizDoom", vizdoom_envs),
-            )
-        )
-        title = "  Select Recording\n"
-    else:
-        # Original behavior: list all available environments
-        atari_envs = _get_atari_envs(imported_only=True)
-        retro_envs = _get_stableretro_envs(imported_only=True)
-        vizdoom_envs = _get_vizdoom_envs()
-        entries, env_id_map = _build_environment_menu_entries(
-            (("Atari", atari_envs), ("Stable-Retro", retro_envs), ("VizDoom", vizdoom_envs))
-        )
-
-        if not entries:
-            console.print(
-                "[dim]No environments found. Install ale-py, stable-retro, or vizdoom.[/]"
-            )
-            raise SystemExit(1)
-
-        title = "  Select Environment\n"
-
-    if not _terminal_menu_supported():
-        return _select_environment_text_fallback(entries, env_id_map, title)
-
-    menu = TerminalMenu(
-        entries,
-        title=title,
-        menu_cursor="  > ",
-        menu_cursor_style=("fg_cyan", "bold"),
-        menu_highlight_style=("bold", "fg_cyan"),
-        search_highlight_style=("fg_black", "bg_cyan", "bold"),
-        show_search_hint=True,
-        show_search_hint_text="  (type / to search)",
-        search_key="/",
-        skip_empty_entries=True,
-        status_bar=status_bar,
-        status_bar_style=("fg_gray",),
-    )
-
-    selected_index = menu.show()
-    if selected_index is None:
-        console.print("[dim]No environment selected.[/]")
-        raise SystemExit(0)
-
-    return env_id_map[selected_index]
-
-
-def _list_environments__alepy():
-    atari_ids = _get_atari_envs()
-    if atari_ids:
-        lines = []
-        for env_id in atari_ids:
-            has_rom, status = _get_atari_rom_status(env_id)
-            style = STYLE_SUCCESS if has_rom else STYLE_FAIL
-            lines.append(f"{env_id} [{style}]({status})[/]")
-        lines = "\n".join(lines)
-    else:
-        lines = "[dim]Could not list Atari environments.[/]"
-    console.print(
-        Panel(
-            lines,
-            title="[bold]Atari Environments[/]",
-            border_style=STYLE_INFO,
-            expand=False,
-        )
-    )
-
-
-def _list_environments__stableretro():
-    all_games = _get_stableretro_envs()
-    if all_games:
-        lines = []
+        value = Prompt.ask("Select", default="1")
         try:
-            import stable_retro as retro
-
-            for game in all_games:
-                try:
-                    retro.data.get_romfile_path(game, retro.data.Integrations.ALL)
-                    lines.append(f"{game} [{STYLE_SUCCESS}](imported)[/]")
-                except FileNotFoundError:
-                    lines.append(f"{game} [{STYLE_FAIL}](missing ROM)[/]")
-        except Exception as e:
-            lines.append(f"[{STYLE_FAIL}]Stable-Retro not installed: {e}[/]")
-        console.print(
-            Panel(
-                "\n".join(lines),
-                title="[bold]Stable-Retro Games[/]",
-                border_style=STYLE_INFO,
-                expand=False,
-            )
-        )
-    else:
-        console.print(
-            Panel(
-                "[dim]Stable-Retro not installed or no games found.[/]",
-                title="[bold]Stable-Retro Games[/]",
-                border_style=STYLE_INFO,
-                expand=False,
-            )
-        )
+            selected = int(value)
+        except ValueError:
+            selected = 0
+        if 1 <= selected <= len(options):
+            return options[selected - 1][1]
+        console.print(f"[{STYLE_FAIL}]Enter a number from 1 to {len(options)}.[/]")
 
 
-def _list_environments__vizdoom():
-    vizdoom_ids = _get_vizdoom_envs()
-    if vizdoom_ids:
-        lines = list(vizdoom_ids)
-        console.print(
-            Panel(
-                "\n".join(lines),
-                title="[bold]VizDoom Environments[/]",
-                border_style=STYLE_INFO,
-                expand=False,
-            )
+def select_environment_interactive(available_recordings_only=False):
+    if available_recordings_only:
+        refs = _get_available_recording_refs_from_local() + _get_available_recording_refs_from_hf()
+        unique = {}
+        for ref in refs:
+            identity = _coerce_recording_identity(ref)
+            unique[identity.display_ref] = identity.display_ref
+        return _select_numbered(
+            [(label, value) for label, value in sorted(unique.items())],
+            title="Available recordings",
         )
-    else:
-        console.print(
-            Panel(
-                "[dim]VizDoom not installed.[/]",
-                title="[bold]VizDoom Environments[/]",
-                border_style=STYLE_INFO,
-                expand=False,
-            )
-        )
+    rows = _provider_catalog()
+    return _select_numbered(
+        [
+            (f"{PROVIDER_LABELS.get(provider_id, provider_id)}: {environment_id}", (provider_id, environment_id))
+            for provider_id, environment_id in rows
+        ],
+        title="Available environments",
+    )
 
 
 def list_environments():
-    """Print available Atari, stable-retro and VizDoom environments."""
-    _list_environments__alepy()
-    _list_environments__stableretro()
-    _list_environments__vizdoom()
-
-
-def reindex_games():
-    """Force ROMS_PATH re-scan and refresh cached game availability."""
-    roms_path = _get_roms_path()
-    if not roms_path:
-        console.print(f"[{STYLE_FAIL}]ROMS_PATH is not set.[/]")
-        console.print(
-            f"Set it in .env or pass [{STYLE_CMD}]{_gymrec_cmd('reindex_games', '--roms-path', '/path/to/roms')}[/]"
-        )
-        raise SystemExit(1)
-
-    if not os.path.exists(roms_path):
-        console.print(f"[{STYLE_FAIL}]ROMS_PATH does not exist: {roms_path}[/]")
-        raise SystemExit(1)
-
-    console.print(f"[{STYLE_INFO}]Reindexing ROMS_PATH: [{STYLE_PATH}]{roms_path}[/]")
-    stable_retro_imported = _ensure_stableretro_roms_path_imported(quiet=True, force=True)
-
-    atari_envs = _get_atari_envs(imported_only=True)
-    stable_retro_envs = _get_stableretro_envs(imported_only=True)
-    vizdoom_envs = _get_vizdoom_envs()
-
-    console.print(
-        f"[{STYLE_SUCCESS}]Reindex complete[/]: "
-        f"Atari [{STYLE_INFO}]{len(atari_envs)}[/], "
-        f"Stable-Retro [{STYLE_INFO}]{len(stable_retro_envs)}[/], "
-        f"VizDoom [{STYLE_INFO}]{len(vizdoom_envs)}[/]"
-    )
-    if stable_retro_imported:
-        console.print(
-            f"Stable-Retro ROMs matched during reindex: [{STYLE_INFO}]{stable_retro_imported}[/]"
-        )
-    console.print(f"Cache: [{STYLE_PATH}]{_roms_path_cache_file()}[/]")
-
-
-def _import_roms(
-    path: str,
-    quiet: bool = False,
-    source_label: str | None = None,
-    return_games: bool = False,
-) -> int | tuple[int, list[str]]:
-    """Import ROMs into stable-retro from a directory or file."""
-    import zipfile
-
-    import stable_retro.data
-
-    if not os.path.exists(path):
-        if not quiet:
-            console.print(f"[{STYLE_FAIL}]Error: Path not found: {path}[/]")
-        return (0, []) if return_games else 0
-
-    known_hashes = stable_retro.data.get_known_hashes()
-    imported_games = 0
-    matched_games = set()
-
-    def save_if_matches(filename, f):
-        nonlocal imported_games
-        try:
-            data, hash = stable_retro.data.groom_rom(filename, f)
-        except (OSError, ValueError):
-            return
-        if hash in known_hashes:
-            game, ext, curpath = known_hashes[hash]
-            matched_games.add(game)
-            game_path = os.path.join(curpath, game)
-            rom_path = os.path.join(game_path, "rom%s" % ext)
-            if os.path.exists(rom_path):
-                try:
-                    with open(rom_path, "rb") as existing:
-                        if existing.read() == data:
-                            return
-                except OSError:
-                    pass
-            with open(rom_path, "wb") as f:
-                f.write(data)
-
-            metadata_path = os.path.join(game_path, "metadata.json")
-            if os.path.exists(metadata_path):
-                try:
-                    with open(metadata_path) as mf:
-                        metadata = json.load(mf)
-                    original_name = metadata.get("original_rom_name")
-                    if original_name:
-                        with open(os.path.join(game_path, original_name), "wb") as of:
-                            of.write(data)
-                except (json.JSONDecodeError, OSError):
-                    pass
-            imported_games += 1
-
-    def check_zipfile(f, process_f):
-        with zipfile.ZipFile(f) as zf:
-            for entry in zf.infolist():
-                _root, ext = os.path.splitext(entry.filename)
-                with zf.open(entry) as innerf:
-                    if ext == ".zip":
-                        check_zipfile(innerf, process_f)
-                    else:
-                        process_f(entry.filename, innerf)
-
-    if os.path.isfile(path):
-        # Single file
-        with open(path, "rb") as f:
-            _root, ext = os.path.splitext(path)
-            if ext == ".zip":
-                save_if_matches(os.path.basename(path), f)
-                f.seek(0)
-                try:
-                    check_zipfile(f, save_if_matches)
-                except zipfile.BadZipFile:
-                    pass
-            else:
-                save_if_matches(os.path.basename(path), f)
-    else:
-        # Directory - walk recursively
-        for root, dirs, files in os.walk(path):
-            for filename in files:
-                filepath = os.path.join(root, filename)
-                with open(filepath, "rb") as f:
-                    _root, ext = os.path.splitext(filename)
-                    if ext == ".zip":
-                        save_if_matches(filename, f)
-                        f.seek(0)
-                        try:
-                            check_zipfile(f, save_if_matches)
-                        except zipfile.BadZipFile:
-                            pass
-                    else:
-                        save_if_matches(filename, f)
-
-    if not quiet:
-        label = f" from {source_label}" if source_label else ""
-        console.print(f"[{STYLE_SUCCESS}]Imported {imported_games} ROM(s){label}[/]")
-    if return_games:
-        return imported_games, sorted(matched_games)
-    return imported_games
+    _lazy_init()
+    providers = discover_providers()
+    table = Table(title="Supported Environment Providers")
+    table.add_column("Provider", style=STYLE_ENV)
+    table.add_column("Environment", style=STYLE_PATH)
+    for provider_id in sorted(SUPPORTED_PROVIDER_IDS):
+        provider = providers.get(provider_id)
+        if provider is None:
+            table.add_row(provider_id, "[red]provider contract not installed[/]")
+            continue
+        environments = tuple(provider.catalog())
+        if not environments:
+            table.add_row(provider_id, "[dim]no environments available[/]")
+        for environment_id in environments:
+            table.add_row(provider_id, str(environment_id))
+    console.print(table)
 
 
 def _add_env_id_arg(parser):
@@ -7252,24 +5594,12 @@ def _add_scale_arg(parser):
     )
 
 
-def _add_roms_path_arg(parser, default=None):
+def _add_provider_arg(parser, *, default=None):
     parser.add_argument(
-        "--roms-path",
-        type=str,
+        "--provider",
+        choices=sorted(SUPPORTED_PROVIDER_IDS),
         default=default,
-        help="Path to ROM files. Also configurable with ROMS_PATH in .env or the shell.",
-    )
-
-
-def _add_backend_arg(parser):
-    parser.add_argument(
-        "--backend",
-        choices=SELECTABLE_RUNTIME_BACKENDS,
-        default=None,
-        help=(
-            "Runtime backend for Stable-Retro-compatible environments. Playback overrides "
-            "the recorded capture backend when supplied."
-        ),
+        help="Environment provider for manual recording; policy bundles select their provider",
     )
 
 
@@ -7278,10 +5608,8 @@ class RecordPlan:
     agent: str
     headless: bool
     max_episodes: int | None
-    max_steps: int | None
     upload_live: bool
     seed: int
-    policy_seed: int
 
     @property
     def human(self) -> bool:
@@ -7293,11 +5621,9 @@ def _make_record_plan(args):
     agent = getattr(args, "agent", "human")
     headless = bool(getattr(args, "headless", False))
     episodes = getattr(args, "episodes", None)
-    max_steps = getattr(args, "max_steps", None)
     upload_live = bool(getattr(args, "upload_live", False))
     dry_run = bool(getattr(args, "dry_run", False))
     seed = getattr(args, "seed", None)
-    policy_seed = getattr(args, "policy_seed", None)
 
     if episodes is not None and episodes < 1:
         return None, "--episodes must be >= 1"
@@ -7305,8 +5631,6 @@ def _make_record_plan(args):
         return None, "--upload-live cannot be combined with --dry-run"
     if seed is not None and seed < 0:
         return None, "--seed must be >= 0"
-    if policy_seed is not None and policy_seed < 0:
-        return None, "--policy-seed must be >= 0"
 
     effective_episodes = episodes if episodes is not None else 1
     episode_seed_increments = effective_episodes - 1
@@ -7318,15 +5642,8 @@ def _make_record_plan(args):
             f"--seed must be <= {max_base_seed} for {effective_episodes} episode(s) "
             f"so every episode seed fits the supported 32-bit range"
         )
-    if policy_seed is not None and policy_seed > max_base_seed:
-        return None, (
-            f"--policy-seed must be <= {max_base_seed} for {effective_episodes} episode(s) "
-            f"so every episode seed fits the NumPy/SB3 32-bit range"
-        )
     if seed is None:
-        seed = secrets.randbelow(max_base_seed + 1)
-    if policy_seed is None:
-        policy_seed = seed
+        seed = DEFAULT_RECORD_SEED
 
     if agent == "human":
         if headless:
@@ -7336,10 +5653,8 @@ def _make_record_plan(args):
                 agent=agent,
                 headless=False,
                 max_episodes=episodes,
-                max_steps=max_steps,
                 upload_live=upload_live,
                 seed=seed,
-                policy_seed=policy_seed,
             ),
             None,
         )
@@ -7352,31 +5667,76 @@ def _make_record_plan(args):
             agent=agent,
             headless=headless,
             max_episodes=episodes if episodes is not None else 1,
-            max_steps=max_steps,
             upload_live=upload_live,
             seed=seed,
-            policy_seed=policy_seed,
         ),
         None,
     )
 
 
+def _finish_recording_publication(recording_identity, *, dry_run):
+    """Offer upload first, then print the playback command as the final recording hint."""
+    if not dry_run:
+        try:
+            do_upload = Confirm.ask("Upload to Hugging Face Hub?", default=True, console=console)
+        except EOFError:
+            do_upload = False
+        if do_upload:
+            if not upload_local_dataset(recording_identity):
+                console.print(
+                    f"To retry: "
+                    f"[{STYLE_CMD}]{_gymrec_cmd('upload', recording_identity.display_ref)}[/]"
+                )
+        else:
+            console.print(
+                f"To upload later: "
+                f"[{STYLE_CMD}]{_gymrec_cmd('upload', recording_identity.display_ref)}[/]"
+            )
+
+    console.print(
+        f"To play back: [{STYLE_CMD}]{_gymrec_cmd('playback', recording_identity.display_ref)}[/]"
+    )
+
+
+def _parse_cli_args(parser, argv=None):
+    """Parse CLI args, routing a missing subcommand through the record parser."""
+    argv = list(sys.argv[1:] if argv is None else argv)
+    args = parser.parse_args(argv)
+    if args.command is None:
+        args = parser.parse_args([*argv, "record"])
+    return args
+
+
+def _parse_provider_config(value):
+    try:
+        config = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise argparse.ArgumentTypeError(f"invalid JSON: {exc}") from exc
+    if not isinstance(config, dict):
+        raise argparse.ArgumentTypeError("provider config must be a JSON object")
+    return config
+
+
 async def main():
-    parser = argparse.ArgumentParser(description="Gymnasium Recorder/Playback")
-    _add_roms_path_arg(parser)
+    parser = argparse.ArgumentParser(description="Record and replay provider-owned environments")
     subparsers = parser.add_subparsers(dest="command")
 
     parser_record = subparsers.add_parser("record", help="Record gameplay")
-    _add_roms_path_arg(parser_record, default=argparse.SUPPRESS)
     _add_env_id_arg(parser_record)
-    _add_backend_arg(parser_record)
-    _add_fps_arg(parser_record, "Frames per second for playback/recording")
+    _add_provider_arg(parser_record)
+    parser_record.add_argument(
+        "--env-config",
+        type=_parse_provider_config,
+        default=None,
+        help="Opaque provider configuration as a JSON object (manual recording only)",
+    )
+    _add_fps_arg(parser_record, "Display/capture frames per second (default: provider value)")
     _add_scale_arg(parser_record)
     parser_record.add_argument(
         "--dry-run",
         action="store_true",
         default=False,
-        help="Record without uploading to Hugging Face (no HF account required)",
+        help="Record without uploading to Hugging Face",
     )
     parser_record.add_argument(
         "--upload-live",
@@ -7386,566 +5746,165 @@ async def main():
     )
     parser_record.add_argument(
         "--agent",
-        type=str,
         default="human",
-        choices=["human", *AGENT_POLICY_FACTORIES.keys()],
-        help=(
-            "Input source: human, random, mario, or deterministic breakout policy (default: human)"
-        ),
+        choices=["human", "random"],
+        help="Input source: human or seeded random policy (default: human)",
     )
     parser_record.add_argument(
         "--headless",
         action="store_true",
         default=False,
-        help="Run without display (agent mode only, runs at max speed)",
+        help="Run without display (agent mode only)",
     )
     parser_record.add_argument(
         "--episodes",
         type=int,
         default=None,
-        help="Number of episodes to record (default: unlimited for human, 1 for agent)",
-    )
-    parser_record.add_argument(
-        "--max-steps",
-        type=int,
-        default=None,
-        dest="max_steps",
-        help="Maximum steps per episode (truncates episode after N steps)",
+        help="Episodes to collect (default: unlimited for human, 1 for an agent)",
     )
     parser_record.add_argument(
         "--storage",
-        type=str,
-        default=None,
         choices=STORAGE_FORMATS,
-        help="Observation storage backend: images or lossless-video (default: config.toml)",
+        default=None,
+        help="Observation storage: images or lossless-video (default: config.toml)",
     )
     parser_record.add_argument(
         "--dataset-repo",
-        type=str,
         default=None,
-        help=(
-            "Hugging Face dataset target for policy recordings (owner/repo or "
-            "hf://owner/repo; default: the source policy repo name)"
-        ),
+        help="Dataset target for policy recording (default: source policy repository name)",
     )
     parser_record.add_argument(
         "--seed",
         type=int,
         default=None,
-        help="Base environment reset seed (randomly generated when omitted)",
+        help=f"Base environment and policy seed (default: {DEFAULT_RECORD_SEED})",
     )
-    parser_record.add_argument(
-        "--policy-seed",
-        type=int,
-        default=None,
-        help="Base stochastic policy seed (default: --seed)",
-    )
-    parser_record.add_argument(
-        "--hf-revision",
-        type=str,
-        default=None,
-        help="Hugging Face model revision for policy refs (default: main)",
-    )
-    parser_record.add_argument(
-        "--device",
-        type=str,
-        default="auto",
-        help="SB3 policy device for Hugging Face model refs: auto, cpu, cuda, or mps",
-    )
-    hf_policy_mode = parser_record.add_mutually_exclusive_group()
-    hf_policy_mode.add_argument(
-        "--deterministic",
-        action="store_true",
-        default=None,
-        help="Override recipe.json and use deterministic argmax SB3 actions",
-    )
-    hf_policy_mode.add_argument(
-        "--stochastic",
-        action="store_false",
-        dest="deterministic",
-        help="Override recipe.json and sample stochastic SB3 actions",
-    )
-    parser_record.set_defaults(deterministic=None)
+    parser_record.add_argument("--hf-revision", default=None)
+    parser_record.add_argument("--device", default="auto")
+    policy_mode = parser_record.add_mutually_exclusive_group()
+    policy_mode.add_argument("--deterministic", action="store_true", default=None)
+    policy_mode.add_argument("--stochastic", action="store_false", dest="deterministic")
 
     parser_playback = subparsers.add_parser("playback", help="Replay a dataset")
-    _add_roms_path_arg(parser_playback, default=argparse.SUPPRESS)
     _add_env_id_arg(parser_playback)
-    _add_backend_arg(parser_playback)
-    _add_fps_arg(parser_playback, "Frames per second for playback/recording")
+    _add_fps_arg(parser_playback, "Playback frames per second (default: recorded provider value)")
     _add_scale_arg(parser_playback)
-    parser_playback.add_argument(
-        "--verify",
-        action="store_true",
-        default=False,
-        help="Verify determinism by comparing replayed frames against recorded frames (pixel MSE)",
-    )
+    parser_playback.add_argument("--verify", action="store_true", default=False)
 
-    parser_video = subparsers.add_parser(
-        "video", help="Render recorded dataset episodes to a video file"
-    )
-    _add_roms_path_arg(parser_video, default=argparse.SUPPRESS)
+    parser_video = subparsers.add_parser("video", help="Render dataset episodes to video")
     _add_env_id_arg(parser_video)
-    _add_fps_arg(parser_video, "Frames per second for exported video")
-    parser_video.add_argument(
-        "--output",
-        type=str,
-        default=None,
-        help="Output video path (default: ./<env_id>_episodes_...mp4)",
-    )
-    parser_video.add_argument(
-        "--range",
-        dest="episode_range",
-        type=str,
-        default=None,
-        help="1-based inclusive episode range, e.g. 3-7 or 3:7",
-    )
-    parser_video.add_argument(
-        "--first",
-        type=int,
-        default=None,
-        help="Export the first N episodes",
-    )
-    parser_video.add_argument(
-        "--last",
-        type=int,
-        default=None,
-        help="Export the last N episodes",
-    )
+    _add_fps_arg(parser_video, "Export frames per second (default: recorded provider value)")
+    parser_video.add_argument("--output", default=None)
+    parser_video.add_argument("--range", dest="episode_range", default=None)
+    parser_video.add_argument("--first", type=int, default=None)
+    parser_video.add_argument("--last", type=int, default=None)
 
-    parser_upload = subparsers.add_parser("upload", help="Upload local dataset to Hugging Face Hub")
-    _add_roms_path_arg(parser_upload, default=argparse.SUPPRESS)
+    parser_upload = subparsers.add_parser("upload", help="Upload a local dataset")
     _add_env_id_arg(parser_upload)
-    parser_upload.add_argument(
-        "--replace",
-        action="store_true",
-        help="Replace all remote dataset files with the current local dataset",
-    )
+    parser_upload.add_argument("--replace", action="store_true")
 
     subparsers.add_parser("login", help="Log in to Hugging Face Hub")
-    parser_list = subparsers.add_parser("list_environments", help="List available environments")
-    _add_roms_path_arg(parser_list, default=argparse.SUPPRESS)
-    parser_reindex = subparsers.add_parser(
-        "reindex_games", help="Re-scan ROMS_PATH and refresh game availability cache"
-    )
-    _add_roms_path_arg(parser_reindex, default=argparse.SUPPRESS)
+    subparsers.add_parser("list_environments", help="List provider-owned environments")
 
-    parser_import = subparsers.add_parser(
-        "import_roms", help="Import ROMs into stable-retro from a directory or file"
-    )
-    _add_roms_path_arg(parser_import, default=argparse.SUPPRESS)
-    parser_import.add_argument(
-        "path",
-        type=str,
-        help="Path to directory or file containing ROMs",
-    )
-
-    parser_minari = subparsers.add_parser(
-        "minari-export", help="Export local dataset to Minari format"
-    )
-    _add_roms_path_arg(parser_minari, default=argparse.SUPPRESS)
+    parser_minari = subparsers.add_parser("minari-export", help="Export to Minari")
     _add_env_id_arg(parser_minari)
-    parser_minari.add_argument(
-        "--name",
-        type=str,
-        default=None,
-        help="Minari dataset name (default: gymrec/<env_id>/human-v0)",
-    )
-    parser_minari.add_argument(
-        "--author", type=str, default=None, help="Author name for dataset metadata"
-    )
+    parser_minari.add_argument("--name", default=None)
+    parser_minari.add_argument("--author", default=None)
 
-    args = parser.parse_args()
-    roms_path = getattr(args, "roms_path", None)
-    if roms_path:
-        os.environ["ROMS_PATH"] = os.path.abspath(os.path.expanduser(roms_path))
-
-    if args.command is None:
-        args.command = "record"
-        for attr, default in [
-            ("env_id", None),
-            ("fps", None),
-            ("scale", None),
-            ("dry_run", False),
-            ("upload_live", False),
-            ("agent", "human"),
-            ("headless", False),
-            ("episodes", None),
-            ("max_steps", None),
-            ("storage", None),
-            ("dataset_repo", None),
-            ("seed", None),
-            ("policy_seed", None),
-            ("hf_revision", None),
-            ("device", "auto"),
-            ("deterministic", None),
-            ("backend", None),
-        ]:
-            if not hasattr(args, attr):
-                setattr(args, attr, default)
-
+    args = _parse_cli_args(parser)
     if args.command == "login":
         _lazy_init()
         ensure_hf_login(force=True)
         return
-
     if args.command == "list_environments":
+        _lazy_init()
         list_environments()
         return
 
-    if args.command == "reindex_games":
-        reindex_games()
-        return
-
-    if args.command == "import_roms":
-        _import_roms(args.path)
-        return
-
-    env_id = args.env_id
-    hf_policy_source = None
-    recording_identity = None
-
-    if env_id is None:
-        if args.command in ("playback", "video"):
-            _lazy_init()
-        # For playback, only show environments with available recordings
-        is_recording_command = args.command in ("playback", "video")
-        env_id = select_environment_interactive(available_recordings_only=is_recording_command)
+    selected_provider = None
+    selected = getattr(args, "env_id", None)
+    if selected is None:
+        _lazy_init()
+        selected = select_environment_interactive(
+            available_recordings_only=args.command in {"playback", "video"}
+        )
+        if isinstance(selected, tuple):
+            selected_provider, selected = selected
 
     _lazy_init()
+    hf_policy_source = None
+    environment_contract = None
+    recording_identity = None
 
-    if args.command == "record" and is_huggingface_model_ref(env_id):
-        if getattr(args, "agent", "human") != "human":
-            console.print(
-                f"[{STYLE_FAIL}]Error: Hugging Face model refs already select the policy; "
-                "do not combine them with --agent.[/]"
-            )
-            return
+    if args.command == "record" and is_huggingface_model_ref(selected):
+        if args.agent != "human":
+            raise ValueError("Hugging Face policy refs cannot be combined with --agent")
+        if args.provider is not None or args.env_config is not None:
+            raise ValueError("Policy bundles own their provider and environment config")
         hf_policy_source = resolve_huggingface_policy_source(
-            env_id,
-            revision=getattr(args, "hf_revision", None),
-            device=getattr(args, "device", "auto"),
-            deterministic=getattr(args, "deterministic", None),
+            selected,
+            revision=args.hf_revision,
+            device=args.device,
+            deterministic=args.deterministic,
         )
-        env_id = hf_policy_source.env_id
-        try:
-            dataset_repo_id = normalize_dataset_repo_id(
-                getattr(args, "dataset_repo", None) or hf_policy_source.repo_id
-            )
-        except ValueError as exc:
-            console.print(f"[{STYLE_FAIL}]Error: {exc}[/]")
-            return
+        environment_contract = hf_policy_source.environment_contract
+        env_id = environment_contract.environment_id
+        dataset_repo_id = normalize_dataset_repo_id(
+            args.dataset_repo or hf_policy_source.repo_id
+        )
         recording_identity = _policy_recording_identity(
-            hf_policy_source,
-            dataset_repo=dataset_repo_id,
+            hf_policy_source, dataset_repo=dataset_repo_id
         )
-        args.env_id = env_id
         args.agent = "hf"
         console.print(
             f"[{STYLE_INFO}]Resolved policy {hf_policy_source.collector} -> "
-            f"{hf_policy_source.provider}:{env_id}"
-            f"{' state=' + hf_policy_source.state if hf_policy_source.state else ''}, "
-            f"action_set={hf_policy_source.action_set}, "
-            f"frame_skip={hf_policy_source.frame_skip}, "
+            f"{environment_contract.provider_id}:{env_id}, "
             f"mode={'deterministic' if hf_policy_source.deterministic else 'stochastic'}, "
             f"dataset={recording_identity.display_ref}[/]"
         )
     else:
-        if args.command == "record" and getattr(args, "dataset_repo", None):
-            console.print(
-                f"[{STYLE_FAIL}]Error: --dataset-repo is only valid when recording "
-                "a Hugging Face policy ref.[/]"
+        env_id = selected
+        recording_identity = _coerce_recording_identity(env_id)
+        if args.command == "record":
+            if args.dataset_repo:
+                raise ValueError("--dataset-repo is only valid for Hugging Face policy refs")
+            environment_contract = _manual_environment_contract(
+                args.provider or selected_provider,
+                env_id,
+                args.env_config,
             )
-            return
-        try:
-            recording_identity = _coerce_recording_identity(env_id)
-        except ValueError as exc:
-            console.print(f"[{STYLE_FAIL}]Error: {exc}[/]")
-            return
 
     if args.command == "upload":
         upload_local_dataset(recording_identity, replace=args.replace)
         return
-
     if args.command == "minari-export":
         minari_export(recording_identity, dataset_name=args.name, author=args.author)
         return
 
-    if hasattr(args, "scale") and args.scale is not None:
+    if getattr(args, "scale", None) is not None:
         CONFIG["display"]["scale_factor"] = args.scale
-    storage_format = _normalize_storage_format(
-        getattr(args, "storage", None) or CONFIG["storage"].get("format", STORAGE_FORMAT_IMAGES)
-    )
 
-    record_plan = None
-    if args.command == "record":
-        seed_was_omitted = getattr(args, "seed", None) is None
-        policy_seed_was_omitted = getattr(args, "policy_seed", None) is None
-        record_plan, plan_error = _make_record_plan(args)
-        if plan_error:
-            console.print(f"[{STYLE_FAIL}]Error: {plan_error}[/]")
-            return
-        if seed_was_omitted:
-            console.print(f"[{STYLE_INFO}]Generated environment base seed: {record_plan.seed}[/]")
-        if policy_seed_was_omitted:
-            console.print(
-                f"[{STYLE_INFO}]Policy base seed: {record_plan.policy_seed} "
-                f"({'derived from --seed' if not seed_was_omitted else 'derived from generated environment seed'})[/]"
-            )
-        if record_plan.upload_live and not preflight_live_upload(
-            recording_identity, storage_format
-        ):
-            return
-
-    playback_metadata = None
     loaded_dataset = None
     playback_source = None
-    recorded_backend = None
-    if args.command in ("playback", "video"):
+    environment_documents = {}
+    if args.command in {"playback", "video"}:
         loaded_dataset, playback_source = load_recorded_dataset(recording_identity)
         if loaded_dataset is None:
             _print_missing_dataset(recording_identity)
             return
-        dataset_metadata = _environment_metadata_from_dataset(loaded_dataset)
-        local_metadata = load_local_metadata(recording_identity) or {}
-        playback_metadata = {**dataset_metadata, **local_metadata}
-        env_id = _recording_env_id(
-            recording_identity,
-            dataset=loaded_dataset,
-            metadata=playback_metadata,
+        environment_documents = _load_dataset_environment_documents(
+            loaded_dataset, label=f"Dataset {recording_identity.display_ref}"
         )
-        if not env_id:
-            console.print(
-                f"[{STYLE_FAIL}]Error: Could not determine the environment for "
-                f"{recording_identity.display_ref}.[/]"
-            )
-            return
+        env_id = _recording_env_id(recording_identity, dataset=loaded_dataset)
         recording_identity = recording_identity.with_env_id(env_id)
-        recorded_backend = _capture_backend_from_dataset(loaded_dataset)
 
-    env = None
-    fps = args.fps
-    if args.command == "playback" or args.command == "record":
-        try:
-            requested_backend = getattr(args, "backend", None)
-            if (
-                hf_policy_source is not None
-                and requested_backend is not None
-                and requested_backend != hf_policy_source.backend
-            ):
-                raise ValueError(
-                    f"The policy recipe requires backend {hf_policy_source.backend!r}; "
-                    f"--backend {requested_backend!r} would change its environment contract."
-                )
-            selected_backend = (
-                hf_policy_source.backend
-                if hf_policy_source is not None
-                else resolve_runtime_backend(
-                    env_id,
-                    requested=requested_backend,
-                    metadata=playback_metadata,
-                    recorded_backend=recorded_backend,
-                )
-            )
-            env = create_env(
-                env_id,
-                stable_retro_state=hf_policy_source.state if hf_policy_source else None,
-                backend=selected_backend,
-                human_recording=bool(record_plan and record_plan.human),
-                metadata=playback_metadata,
-                env_make_kwargs=(
-                    hf_policy_source.env_make_kwargs if hf_policy_source is not None else None
-                ),
-            )
-            if hf_policy_source is not None:
-                provider_env = env
-                env = MarioRecipeTaskEnv(provider_env, hf_policy_source.environment["task"])
-                env._env_id = env_id
-                env._gymrec_backend = hf_policy_source.backend
-                env._gymrec_state_name = hf_policy_source.state
-                env._gymrec_policy_observations = True
-                env._gymrec_make_kwargs = dict(
-                    getattr(provider_env, "_gymrec_make_kwargs", {}) or {}
-                )
-                env._gymrec_rom_sha256 = getattr(provider_env, "_gymrec_rom_sha256", None)
-                env._gymrec_nes_controller = bool(
-                    getattr(provider_env, "_gymrec_nes_controller", False)
-                )
-                env._stable_retro = bool(getattr(provider_env, "_stable_retro", False))
-        except (FileNotFoundError, ValueError) as exc:
-            console.print(f"[{STYLE_FAIL}]Error: {exc}[/]")
-            return
+    if args.command == "video":
+        fps = args.fps
         if fps is None:
-            if args.command == "playback" and playback_metadata:
-                fps = _get_default_fps_for_env_id(env_id, metadata=playback_metadata)
-            else:
-                fps = get_default_fps(env)
-    elif args.command == "video" and fps is None:
-        fps = _get_default_fps_for_env_id(env_id, metadata=playback_metadata)
-
-    if args.command == "record":
-        recorder = None
-        policy = None
-        collector_contract = None
-        if not record_plan.human:
-            if hf_policy_source is not None:
-                policy = StableBaselines3Policy(
-                    env.action_space,
-                    hf_policy_source,
-                    observation_space=env.observation_space,
-                )
-                collector_contract = build_collector_contract(
-                    hf_policy_source,
-                    env,
-                    inference_device=getattr(policy.model, "device", hf_policy_source.device),
-                )
-            else:
-                policy = create_agent_policy(record_plan.agent, env)
-        live_upload_manager = (
-            LiveEpisodeUploadManager(
-                recording_identity,
-                storage_format,
-                collector_contract=collector_contract,
-            )
-            if record_plan.upload_live
-            else None
-        )
-
-        if record_plan.human:
-            input_source = None  # Will default to HumanInputSource in _play
-            recorder = DatasetRecorderWrapper(
-                env,
-                input_source=input_source,
-                headless=False,
-                collector="human",
-                storage_format=storage_format,
-                live_upload_manager=live_upload_manager,
-                initial_seed=record_plan.seed,
-                initial_policy_seed=record_plan.policy_seed,
-            )
-            recorded_dataset = await recorder.record(
-                fps=fps,
-                max_episodes=record_plan.max_episodes,
-                max_steps=record_plan.max_steps,
-            )
-        else:
-            mode_str = "headless" if record_plan.headless else "with display"
-            console.print(
-                f"[{STYLE_INFO}]Recording with {record_plan.agent} agent ({mode_str}), {record_plan.max_episodes} episode(s)[/]"
-            )
-
-            input_source = AgentInputSource(policy)
-
-            recorder = DatasetRecorderWrapper(
-                env,
-                input_source=input_source,
-                headless=record_plan.headless,
-                collector=hf_policy_source.collector if hf_policy_source else record_plan.agent,
-                storage_format=storage_format,
-                live_upload_manager=live_upload_manager,
-                initial_seed=record_plan.seed,
-                initial_policy_seed=record_plan.policy_seed,
-                collector_contract=collector_contract,
-            )
-
-            total_steps_counter = [0]
-
-            def _make_progress_callback(task_id, progress_bar):
-                def callback(episode_number, steps_in_episode):
-                    total_steps_counter[0] += steps_in_episode
-                    progress_bar.update(
-                        task_id,
-                        advance=1,
-                        description=f"[bold]Episodes[/] [dim]({total_steps_counter[0]} steps total)[/]",
-                    )
-
-                return callback
-
-            with _episode_progress(transient=False) as progress:
-                task_id = progress.add_task("[bold]Episodes[/]", total=record_plan.max_episodes)
-                recorded_dataset = await recorder.record(
-                    fps=fps,
-                    max_episodes=record_plan.max_episodes,
-                    max_steps=record_plan.max_steps,
-                    progress_callback=_make_progress_callback(task_id, progress),
-                )
-
-        if recorded_dataset is None:
-            if recorder is not None:
-                recorder.close()
-            if record_plan.upload_live:
-                console.print(
-                    f"[{STYLE_INFO}]Live recording finished. Pending retries, if any: "
-                    f"[{STYLE_CMD}]{_gymrec_cmd('upload', recording_identity.display_ref)}[/]"
-                )
-            return
-
-        if record_plan.upload_live:
-            if recorder is not None:
-                recorder.close()
-            console.print(
-                f"[{STYLE_INFO}]Live recording finished. Pending retries, if any: "
-                f"[{STYLE_CMD}]{_gymrec_cmd('upload', recording_identity.display_ref)}[/]"
-            )
-            return
-
-        if recorder is not None:
-            save_dataset_locally(
-                recorded_dataset,
-                recording_identity,
-                metadata=recorder._env_metadata,
-                video_artifact_dir=recorder.temp_dir,
-            )
-            recorder.close()  # cleanup temp files after dataset is saved
-        console.print(
-            f"To play back: "
-            f"[{STYLE_CMD}]{_gymrec_cmd('playback', recording_identity.display_ref)}[/]"
-        )
-
-        if not args.dry_run:
-            try:
-                do_upload = Confirm.ask(
-                    "Upload to Hugging Face Hub?", default=True, console=console
-                )
-            except EOFError:
-                do_upload = False
-            if do_upload:
-                if not upload_local_dataset(recording_identity):
-                    console.print(
-                        f"To retry: "
-                        f"[{STYLE_CMD}]{_gymrec_cmd('upload', recording_identity.display_ref)}[/]"
-                    )
-            else:
-                console.print(
-                    f"To upload later: "
-                    f"[{STYLE_CMD}]{_gymrec_cmd('upload', recording_identity.display_ref)}[/]"
-                )
-    elif args.command == "playback":
-        if playback_source == "local":
-            console.print(
-                f"[{STYLE_INFO}]Playing back from local dataset ({len(loaded_dataset)} frames)[/]"
-            )
-        else:
-            console.print(f"[{STYLE_INFO}]Playing back from Hugging Face Hub[/]")
-        recorder = DatasetRecorderWrapper(env, storage_format=STORAGE_FORMAT_IMAGES)
-
-        playback_episodes, playback_total = _dataset_playback_episodes(
-            loaded_dataset, verify=args.verify
-        )
-        await recorder.replay(
-            fps=fps,
-            total=playback_total,
-            verify=args.verify,
-            episodes=playback_episodes,
-        )
-    elif args.command == "video":
-        total = len(loaded_dataset)
-        if playback_source == "local":
-            console.print(
-                f"[{STYLE_INFO}]Loading local dataset for video export ({total} frames)[/]"
-            )
-        else:
-            console.print(f"[{STYLE_INFO}]Loaded dataset from Hugging Face Hub ({total} frames)[/]")
-
+            values = {int(round(float(document["fps"]))) for document in environment_documents.values()}
+            if len(values) != 1:
+                raise ValueError("Datasets with different provider FPS values require --fps")
+            fps = values.pop()
         export_dataset_video(
             env_id,
             loaded_dataset,
@@ -7955,6 +5914,137 @@ async def main():
             first=args.first,
             last=args.last,
         )
+        return
+
+    if args.command == "playback":
+        episodes, playback_total = _dataset_playback_episodes(
+            loaded_dataset, verify=args.verify
+        )
+        groups = []
+        for episode in episodes:
+            contract_id = episode["environment_contract_id"]
+            if not groups or groups[-1][0] != contract_id:
+                groups.append((contract_id, []))
+            groups[-1][1].append(episode)
+        for contract_id, grouped_episodes in groups:
+            document = environment_documents[contract_id]
+            _contract, provider_session = _session_from_environment_document(
+                document, render_mode="rgb_array"
+            )
+            artifact = EnvironmentArtifact(contract_id=contract_id, document=document)
+            fps = args.fps or max(int(round(float(document["fps"]))), 1)
+            recorder = DatasetRecorderWrapper(
+                provider_session.env,
+                storage_format=STORAGE_FORMAT_IMAGES,
+                provider_session=provider_session,
+                environment_artifact=artifact,
+            )
+            group_total = sum(len(episode["items"]) for episode in grouped_episodes)
+            await recorder.replay(
+                fps=fps,
+                total=group_total,
+                verify=args.verify,
+                episodes=grouped_episodes,
+            )
+            recorder.close()
+        return
+
+    storage_format = _configured_storage_format(args.storage)
+    record_plan, plan_error = _make_record_plan(args)
+    if plan_error:
+        raise ValueError(plan_error)
+    if args.seed is None:
+        console.print(f"[{STYLE_INFO}]Base seed: {record_plan.seed} (default)[/]")
+    if record_plan.upload_live and not preflight_live_upload(recording_identity, storage_format):
+        return
+
+    provider_session, environment_artifact = create_environment_session(
+        environment_contract,
+        render_mode="human" if record_plan.human else "rgb_array",
+    )
+    env = provider_session.env
+    fps = args.fps or _provider_fps(provider_session)
+    policy = None
+    collector_contract = None
+    if not record_plan.human:
+        if hf_policy_source is not None:
+            policy = StableBaselines3Policy(hf_policy_source, provider_session)
+            collector_contract = build_collector_contract(
+                hf_policy_source,
+                provider_session,
+                environment_contract_id=environment_artifact.contract_id,
+                inference_device=getattr(policy.model, "device", hf_policy_source.device),
+            )
+        else:
+            policy = create_agent_policy(record_plan.agent, env)
+
+    live_upload_manager = (
+        LiveEpisodeUploadManager(
+            recording_identity,
+            storage_format,
+            collector_contract=collector_contract,
+            environment_artifact=environment_artifact,
+            fps=fps,
+        )
+        if record_plan.upload_live
+        else None
+    )
+    recorder = DatasetRecorderWrapper(
+        env,
+        input_source=None if record_plan.human else AgentInputSource(policy),
+        headless=record_plan.headless,
+        collector=(
+            "human"
+            if record_plan.human
+            else hf_policy_source.collector
+            if hf_policy_source
+            else record_plan.agent
+        ),
+        storage_format=storage_format,
+        live_upload_manager=live_upload_manager,
+        initial_seed=record_plan.seed,
+        collector_contract=collector_contract,
+        provider_session=provider_session,
+        environment_artifact=environment_artifact,
+    )
+
+    progress_callback = None
+    progress_context = None
+    if not record_plan.human:
+        total_steps = [0]
+        progress_context = _episode_progress(transient=False)
+        progress = progress_context.__enter__()
+        task_id = progress.add_task("[bold]Episodes[/]", total=record_plan.max_episodes)
+
+        def progress_callback(_episode_number, steps_in_episode):
+            total_steps[0] += steps_in_episode
+            progress.update(
+                task_id,
+                advance=1,
+                description=f"[bold]Episodes[/] [dim]({total_steps[0]} steps total)[/]",
+            )
+
+    try:
+        recorded_dataset = await recorder.record(
+            fps=fps,
+            max_episodes=record_plan.max_episodes,
+            progress_callback=progress_callback,
+        )
+    finally:
+        if progress_context is not None:
+            progress_context.__exit__(None, None, None)
+
+    if recorded_dataset is None or record_plan.upload_live:
+        recorder.close()
+        return
+    save_dataset_locally(
+        recorded_dataset,
+        recording_identity,
+        metadata=recorder._env_metadata,
+        video_artifact_dir=recorder.temp_dir,
+    )
+    recorder.close()
+    _finish_recording_publication(recording_identity, dry_run=args.dry_run)
 
 
 def cli():
@@ -7962,6 +6052,9 @@ def cli():
         asyncio.run(main())
     except KeyboardInterrupt:
         console.print("\n[dim]Interrupted.[/]")
+    except (ValueError, RuntimeError) as exc:
+        console.print(f"[{STYLE_FAIL}]Error: {exc}[/]")
+        raise SystemExit(2) from exc
 
 
 if __name__ == "__main__":

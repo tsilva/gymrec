@@ -81,22 +81,6 @@ wheels = [
 ]
 
 [[package]]
-name = "ale-py"
-version = "0.12.0"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "numpy" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/96/f2/4256e8074df976edd3ba28be9b6a2f4b3fc47632134dabfead41d32b51be/ale_py-0.12.0.tar.gz", hash = "sha256:6030416b6a049d399bf95420ad2fdbf0ea8f83051b502774d27b477a06000dbc", size = 19597784, upload-time = "2026-05-30T22:37:38.922Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/f2/15/ee091176ea850ca2242420cc9d5f8f94b9e037793926e7c5e6bfecb18684/ale_py-0.12.0-cp312-cp312-macosx_13_0_arm64.whl", hash = "sha256:b0716abea9ed5e1f0d3c0fd08820226458be1b568d25e9e969b22774a993f3d3", size = 2199417, upload-time = "2026-05-30T22:37:19.222Z" },
-    { url = "https://files.pythonhosted.org/packages/49/22/fb5aeedccc24c23063edbfa6ab135f620211a9da25c2dcbeecd326ee2490/ale_py-0.12.0-cp312-cp312-macosx_26_0_arm64.whl", hash = "sha256:18ab4d89639c2c39f73cf9e15f7c14de9cde57252deee67964a91261b6ca6181", size = 2074353, upload-time = "2026-05-30T22:37:20.651Z" },
-    { url = "https://files.pythonhosted.org/packages/c2/bb/2a53135d0a4f9bc2f383204e8e076855f9fbcaee6968b898af981f79d60e/ale_py-0.12.0-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:8c9f956ba56404c47103f35cfda3333ddd703c43a36589fa95515a08034a33af", size = 2946702, upload-time = "2026-05-30T22:37:21.888Z" },
-    { url = "https://files.pythonhosted.org/packages/77/23/7cb1ea63c3694de96c3b3201dcc361c10bb8acf2d81ac8ff31beb25b9241/ale_py-0.12.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:e211044d60bed30720b71e71f003e42dabb0b7f0a6c03be6b70d3b4650de0dad", size = 3087155, upload-time = "2026-05-30T22:37:23.224Z" },
-    { url = "https://files.pythonhosted.org/packages/21/e9/7d9dc3ae2e1025b97a28c80fb381ab2c4ce216ac5a09e0268c3a5a915ab9/ale_py-0.12.0-cp312-cp312-win_amd64.whl", hash = "sha256:847f766c2712d67ab66bb90e1c9ca1fbd0a63e940258bd82c4b4d96c5d950eca", size = 1751212, upload-time = "2026-05-30T22:37:24.641Z" },
-]
-
-[[package]]
 name = "annotated-doc"
 version = "0.0.4"
 source = { registry = "https://pypi.org/simple" }
@@ -357,20 +341,15 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/e9/73/fda6a25f3beeb5e49d74330b44092b9e5a547395ccd478d1103ddcbff1fc/gymnasium-1.3.0-py3-none-any.whl", hash = "sha256:6b8c159a8540dcbcb221722d7efda24d78ebbcbc3bd2ea1c2611aa2a34471fc2", size = 953904, upload-time = "2026-04-22T13:47:12.13Z" },
 ]
 
-[package.optional-dependencies]
-atari = [
-    { name = "ale-py" },
-]
-
 [[package]]
 name = "gymrec"
 version = "0.1.1"
 source = { editable = "." }
 dependencies = [
-    { name = "ale-py" },
     { name = "datasets" },
-    { name = "gymnasium", extra = ["atari"] },
+    { name = "gymnasium" },
     { name = "huggingface-hub" },
+    { name = "jinja2" },
     { name = "numpy" },
     { name = "pillow" },
     { name = "pygame-ce" },
@@ -380,7 +359,6 @@ dependencies = [
     { name = "stable-baselines3" },
     { name = "stable-retro-turbo" },
     { name = "supermariobrosnes-turbo" },
-    { name = "vizdoom" },
 ]
 
 [package.optional-dependencies]
@@ -395,10 +373,10 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "ale-py" },
     { name = "datasets" },
-    { name = "gymnasium", extras = ["atari"] },
+    { name = "gymnasium" },
     { name = "huggingface-hub" },
+    { name = "jinja2", specifier = ">=3.1,<4" },
     { name = "minari", marker = "extra == 'minari'", specifier = ">=0.5.0" },
     { name = "numpy" },
     { name = "pillow" },
@@ -409,7 +387,6 @@ requires-dist = [
     { name = "stable-baselines3", specifier = ">=2.9.0" },
     { name = "stable-retro-turbo" },
     { name = "supermariobrosnes-turbo", specifier = ">=0.3.1" },
-    { name = "vizdoom" },
 ]
 provides-extras = ["minari"]
 
@@ -1202,23 +1179,6 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/53/0c/06f8b233b8fd13b9e5ee11424ef85419ba0d8ba0b3138bf360be2ff56953/urllib3-2.7.0.tar.gz", hash = "sha256:231e0ec3b63ceb14667c67be60f2f2c40a518cb38b03af60abc813da26505f4c", size = 433602, upload-time = "2026-05-07T16:13:18.596Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/7f/3e/5db95bcf282c52709639744ca2a8b149baccf648e39c8cc87553df9eae0c/urllib3-2.7.0-py3-none-any.whl", hash = "sha256:9fb4c81ebbb1ce9531cce37674bbc6f1360472bc18ca9a553ede278ef7276897", size = 131087, upload-time = "2026-05-07T16:13:17.151Z" },
-]
-
-[[package]]
-name = "vizdoom"
-version = "1.3.0"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "gymnasium" },
-    { name = "numpy" },
-    { name = "pygame-ce" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/1b/4c/3e8c51147f5da2f598c428d961ec916bda4fa56f9b369190d15359d390e2/vizdoom-1.3.0.tar.gz", hash = "sha256:591f58e3ad3d146c5b4a82eb51da064231a1a43a547c6255e9985eee20dbe601", size = 26687217, upload-time = "2026-02-11T13:33:58.241Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/19/8d/11cf6e63f17a912235811c554f14eba868bf776def77187dda82fd1f9788/vizdoom-1.3.0-cp312-cp312-macosx_14_0_arm64.whl", hash = "sha256:aff3a01d9de4a1742e3f8f6b334ac77a8355f5c9c1dda1bdfd869140695d8025", size = 40776388, upload-time = "2026-02-11T13:33:15.968Z" },
-    { url = "https://files.pythonhosted.org/packages/39/fd/d29eac65da0e87702589e79dc7315e5801d3a8bba215745725d8e89ad5a3/vizdoom-1.3.0-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:d27c9b20a93a9cdc4331988914e0d75d0d61f1818444ee956948562b49ab4d74", size = 38731123, upload-time = "2026-02-11T13:33:18.777Z" },
-    { url = "https://files.pythonhosted.org/packages/4c/fd/34e5f1adf4598396ea229477e8748ed0a6d7b4d075f7e47f22e64eb9d598/vizdoom-1.3.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:43ba2524779d1ef0d7dfd773fe71a97afeff2b2d0db52a4d73381a515572c046", size = 38912318, upload-time = "2026-02-11T13:33:22.866Z" },
-    { url = "https://files.pythonhosted.org/packages/c0/f2/775cccb4ec637f8c75267edce065abfbea7c05f337303f872444eaf3e068/vizdoom-1.3.0-cp312-cp312-win_amd64.whl", hash = "sha256:dde72da46a05725a4e0aa3a9d7291ae1486c8b7469a1b0a7d2fcc146bd913ae7", size = 26050543, upload-time = "2026-02-11T12:16:44.289Z" },
 ]
 
 [[package]]

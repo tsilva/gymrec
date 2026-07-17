@@ -4,11 +4,6 @@
 [display]
 # scale_factor = 2
 
-[fps_defaults]
-# atari = 60
-# vizdoom = 45
-# retro = 90
-
 [dataset]
 # repo_prefix = "gymrec__"
 # license = "mit"

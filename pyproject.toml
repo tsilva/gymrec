@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "gymrec"
 version = "0.1.1"
-description = "Record and replay gameplay from Gymnasium environments as Hugging Face datasets"
+description = "Record and replay turbo-provider gameplay as Hugging Face datasets"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [
@@ -13,12 +13,11 @@ dependencies = [
     "pillow",
     "python-dotenv",
     "pygame-ce",
-    "vizdoom",
-    "ale-py",
-    "gymnasium[atari]",
+    "gymnasium",
     "datasets",
     "rich",
     "huggingface-hub",
+    "jinja2>=3.1,<4",
     "simple-term-menu",
     "stable-retro-turbo",
     "stable-baselines3>=2.9.0",
@@ -32,7 +31,7 @@ gymrec = "main:cli"
 minari = ["minari>=0.5.0"]
 
 [tool.hatch.build.targets.wheel]
-include = ["main.py", "config.toml", "keymappings.toml"]
+include = ["main.py", "provider_contract.py", "config.toml", "keymappings.toml", "gymrec_templates/*.md.j2"]
 
 [tool.ruff]
 line-length = 100

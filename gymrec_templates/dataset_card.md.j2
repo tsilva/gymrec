@@ -1,0 +1,48 @@
+---
+{{ card_yaml }}
+---
+
+# {{ env_id }} Gameplay Dataset
+
+{{ intro }}
+captured using [gymrec](https://github.com/tsilva/gymrec).
+
+## Preview
+
+<video controls loop muted playsinline preload="metadata" src="{{ replay_url }}"></video>
+
+[Open the representative replay]({{ replay_url }})
+
+Root `{{ replay_filename }}` is a browser-safe derived preview; it is not used for trajectory replay or training.
+
+## Dataset Summary
+
+| Stat | Value |
+|------|-------|
+| Total frames | {{ frames }} |
+| Episodes | {{ episodes }} |
+| Environment | `{{ env_id }}` |
+| Provider | {{ provider_label }} |
+| Storage format | `{{ storage_format }}` |{{ summary_optional_rows }}
+
+{{ collector_contracts_block }}{{ environment_block }}## Dataset Structure
+
+Minari-compatible flat table format. Use `minari-export` for native [Minari](https://minari.farama.org/) HDF5 format.
+
+Each episode has N step rows plus one terminal observation row (N+1 pattern).
+The terminal observation is the final state after the last step - it has a null action
+and null values for rewards/terminations/truncations/infos.
+
+{{ field_lines }}
+
+## Usage
+
+```python
+from datasets import load_dataset
+ds = load_dataset("{{ repo_id }}")
+```
+
+## About
+
+Recorded with [gymrec](https://github.com/tsilva/gymrec).
+Curated by: {{ curator }}
