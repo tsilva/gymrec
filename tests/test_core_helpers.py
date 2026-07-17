@@ -1073,7 +1073,26 @@ def test_dataset_playback_episodes_preserve_episode_seeds_and_actions():
 
     assert total_steps == 2
     assert [episode["seed"] for episode in episodes] == [111, 222]
+    assert [episode["step_count"] for episode in episodes] == [1, 1]
     assert [list(episode["items"]) for episode in episodes] == [[0], [0]]
+
+
+def test_dataset_playback_episode_counts_do_not_consume_lazy_items():
+    dataset = DatasetLike(
+        {
+            "episode_id": ["ep1", "ep1", "ep1"],
+            "environment_contract_id": ["e" * 64] * 3,
+            "seed": [123, 123, 123],
+            "actions": [1, 2, None],
+        }
+    )
+
+    episodes, total_steps = main._dataset_playback_episodes(dataset)
+    group_total = sum(episode["step_count"] for episode in episodes)
+
+    assert total_steps == 2
+    assert group_total == 2
+    assert [list(episode["items"]) for episode in episodes] == [[1, 2]]
 
 
 def test_agent_recording_uses_sequential_recipe_seed_base():

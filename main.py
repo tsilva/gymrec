@@ -3912,6 +3912,7 @@ def _dataset_playback_episodes(dataset, verify=False):
             {
                 "environment_contract_id": contract_ids.pop(),
                 "seed": _episode_reset_seed(dataset, row_indices),
+                "step_count": step_count,
                 "items": _iter_playback_items(dataset, row_indices, verify=verify),
             }
         )
@@ -6166,7 +6167,7 @@ async def main():
                 provider_session=provider_session,
                 environment_artifact=artifact,
             )
-            group_total = sum(len(episode["items"]) for episode in grouped_episodes)
+            group_total = sum(episode["step_count"] for episode in grouped_episodes)
             await recorder.replay(
                 fps=fps,
                 total=group_total,
