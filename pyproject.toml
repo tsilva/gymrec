@@ -19,7 +19,7 @@ dependencies = [
     "huggingface-hub",
     "jinja2>=3.1,<4",
     "textual>=8.2.8,<9",
-    "stable-retro-turbo==1.0.1.post31",
+    "stable-retro-turbo==1.0.1.post32",
     "stable-baselines3>=2.9.0",
     "supermariobrosnes-turbo==0.3.3",
 ]
