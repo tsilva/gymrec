@@ -4,7 +4,7 @@ This file provides repository-specific guidance for coding agents.
 
 ## Project Overview
 
-gymrec records and replays the final single-environment Gymnasium contract exposed by exactly two provider packages: `stable-retro-turbo` and `supermariobrosnes-turbo`. Environment creation, preprocessing, task semantics, native action adaptation, vector-lane adaptation, ROM/state handling, and reproducibility provenance belong to those providers—not gymrec.
+gymrec records and replays the final single-environment Gymnasium contract exposed by exactly two native runtime packages: `stable-retro-turbo` and `supermariobrosnes-turbo`. Gymrec owns both internal provider adapters, single-lane adaptation, policy and human action conversion, ROM/state provenance, and the recording contract. The runtime packages know nothing about Gymrec and retain their native Gymnasium preprocessing, reward, termination, and info behavior.
 
 ## Development Setup
 
@@ -15,7 +15,7 @@ cp .env.example .env
 
 Add `HF_TOKEN` only for token-based Hub uploads. Dependencies are defined in `pyproject.toml` and include Python 3.12, Gymnasium, pygame, datasets, and the two allowlisted turbo providers. Do not add ALE, VizDoom, or generic environment constructors.
 
-Both provider packages register an allowlisted entry point under `gymrec.environment_providers`. Gymrec must interact with them only through the shared provider/session contract. Keep both native packages exempt from the global seven-day `exclude-newer` policy so their current wheels remain resolvable.
+The native packages are ordinary dependencies and must not register Gymrec entry points or ship Gymrec-specific modules. Keep both packages exempt from the global seven-day `exclude-newer` policy so their current wheels remain resolvable.
 
 ## Commands
 
@@ -25,15 +25,16 @@ CLI help (`gymrec --help` and `gymrec <command> --help`) is the authoritative op
 
 ### Provider Sessions
 
-- `provider_contract.py` validates the generic environment envelope and discovers only the two allowlisted entry points.
-- A provider session owns the environment, effective opaque configuration, policy/recording observation extraction, policy action adaptation, named-control conversion, FPS, and asset/version provenance.
-- Gymrec must not inspect provider config or branch on games, consoles, task rules, action sets, ROMs, states, or native vector layouts.
+- `provider_contract.py` validates the generic environment envelope and resolves only Gymrec's two internal providers.
+- `providers.py` owns the static registry, shared single-lane session behavior, native factories, action adaptation, named-control conversion, FPS, and asset/version provenance.
+- Runtime-specific branching is allowed only inside the internal providers where native constructors, catalogs, action spaces, or asset discovery differ.
+- Gymrec may consume legacy `config.task.action` only for mechanical policy-action conversion. It must warn and ignore all other task sections and must never shape native rewards or add success, failure, stalling, or episode-limit semantics.
 
 ### Input Sources
 
 - `HumanInputSource` maps pygame events to named controls and asks the provider session for a native action.
 - `RandomPolicy` is seeded and samples the provider environment's action space.
-- External policies use a strict evaluation environment envelope and provider-owned observation/action adaptation.
+- External policies use a strict evaluation environment envelope and Gymrec-owned observation/action adaptation.
 - Do not add built-in game-specific policies.
 
 ### DatasetRecorderWrapper
@@ -56,11 +57,11 @@ CLI help (`gymrec --help` and `gymrec <command> --help`) is the authoritative op
 - Space starts recording and Escape exits.
 - `keymappings.toml` maps keyboard events to named labels.
 - The provider advertises a compatible profile and converts active labels to its native action.
-- Never put provider-specific action construction in gymrec.
+- Keep named-control construction shared; isolate unavoidable native action-space differences inside `providers.py`.
 
 ## Key Constraints
 
-- Fake-provider contract behavior is covered in `tests/`; native emulator, rendering, Hub, and ffmpeg behavior may still require integration verification.
+- Fake-vector and internal-provider contract behavior is covered in `tests/`; native emulator, rendering, Hub, and ffmpeg behavior may still require integration verification.
 - Pygame display creation remains lazy after the first observation.
 - The main loop is asynchronous and uses `asyncio.sleep()` for pacing.
 - Hub uploads require `gymrec login` or `HF_TOKEN`; local recording and `--dry-run` do not.

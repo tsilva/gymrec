@@ -1,28 +1,22 @@
 """Environment-provider boundary used by gymrec.
 
-Provider packages own environment construction and every environment semantic.
-gymrec only validates this small envelope, records the provider's final Gymnasium
-transitions, and persists the provider's effective contract for playback.
+Gymrec owns the adapter implementations for its two native runtime dependencies,
+validates their shared envelope, records their final Gymnasium transitions, and
+persists each effective contract for playback.
 """
 
 from __future__ import annotations
 
 import copy
 import hashlib
-import importlib.metadata
 import json
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
-PROVIDER_ENTRY_POINT_GROUP = "gymrec.environment_providers"
-SUPPORTED_PROVIDER_IDS = frozenset(
-    {
-        "stable-retro-turbo",
-        "supermariobrosnes-turbo",
-    }
-)
+from providers import PROVIDERS, SUPPORTED_PROVIDER_IDS
+
 ENVIRONMENT_CONTRACT_VERSION = 1
 ENVIRONMENT_DOCUMENT_TYPE = "gymrec.environment"
 ENVIRONMENT_DOCUMENT_FORMAT_VERSION = 1
@@ -94,27 +88,13 @@ class EnvironmentContract:
         }
 
 
-def _entry_points():
-    points = importlib.metadata.entry_points()
-    if hasattr(points, "select"):
-        return tuple(points.select(group=PROVIDER_ENTRY_POINT_GROUP))
-    return tuple(points.get(PROVIDER_ENTRY_POINT_GROUP, ()))
-
-
-def discover_providers(*, entry_points=None) -> dict[str, Any]:
-    """Load the two explicitly supported providers from package entry points."""
+def discover_providers() -> dict[str, Any]:
+    """Return Gymrec's two internal native-runtime adapters."""
     discovered: dict[str, Any] = {}
-    for entry_point in _entry_points() if entry_points is None else entry_points:
-        provider_id = str(entry_point.name)
-        if provider_id not in SUPPORTED_PROVIDER_IDS:
-            continue
-        if provider_id in discovered:
-            raise RuntimeError(f"Multiple environment providers registered as {provider_id!r}")
-        provider = entry_point.load()
-        provider = provider() if isinstance(provider, type) else provider
+    for provider_id, provider in PROVIDERS.items():
         if getattr(provider, "provider_id", None) != provider_id:
             raise RuntimeError(
-                f"Environment provider entry point {provider_id!r} loaded an object with "
+                f"Internal environment provider {provider_id!r} has "
                 f"provider_id={getattr(provider, 'provider_id', None)!r}"
             )
         if getattr(provider, "contract_version", None) != ENVIRONMENT_CONTRACT_VERSION:
@@ -131,24 +111,22 @@ def discover_providers(*, entry_points=None) -> dict[str, Any]:
     return discovered
 
 
-def load_provider(provider_id: str, *, entry_points=None):
+def load_provider(provider_id: str):
     if provider_id not in SUPPORTED_PROVIDER_IDS:
         supported = ", ".join(sorted(SUPPORTED_PROVIDER_IDS))
         raise ValueError(
             f"Unsupported environment provider {provider_id!r}; supported providers: {supported}"
         )
-    provider = discover_providers(entry_points=entry_points).get(provider_id)
+    provider = discover_providers().get(provider_id)
     if provider is None:
         raise RuntimeError(
-            f"Environment provider {provider_id!r} is not installed with a "
-            f"{PROVIDER_ENTRY_POINT_GROUP!r} entry point. Install a provider release that "
-            f"implements contract version {ENVIRONMENT_CONTRACT_VERSION}."
+            f"Gymrec has no internal environment provider {provider_id!r}."
         )
     return provider
 
 
-def create_session(contract: EnvironmentContract, *, render_mode: str, entry_points=None):
-    provider = load_provider(contract.provider_id, entry_points=entry_points)
+def create_session(contract: EnvironmentContract, *, render_mode: str):
+    provider = load_provider(contract.provider_id)
     session = provider.create(
         environment_id=contract.environment_id,
         config=copy.deepcopy(contract.config),

@@ -1897,7 +1897,7 @@ COMMON_DATASET_FIELDS = (
         "string",
     ),
     DatasetField(
-        "env_id", "string", "Provider-owned logical environment identifier", "string"
+        "env_id", "string", "Native-runtime logical environment identifier", "string"
     ),
     DatasetField(
         "environment_contract_id",
@@ -2233,6 +2233,13 @@ def _session_from_environment_document(document, *, render_mode):
         label="recorded environment",
     )
     session = create_session(contract, render_mode=render_mode)
+    if _canonical_json_bytes(session.effective_config) != _canonical_json_bytes(
+        document["effective_config"]
+    ):
+        session.env.close()
+        raise ValueError(
+            "Installed provider effective config does not match the recorded environment contract"
+        )
     if _canonical_json_bytes(session.provenance) != _canonical_json_bytes(document["provenance"]):
         session.env.close()
         raise ValueError("Installed provider assets do not match the recorded environment contract")
@@ -5465,7 +5472,7 @@ def _build_dataset_card_content(
 
 
 def create_environment_session(contract, *, render_mode):
-    """Create one provider-owned environment and its immutable recording artifact."""
+    """Create one internally adapted environment and its immutable recording artifact."""
     contract = (
         contract
         if isinstance(contract, EnvironmentContract)
@@ -5718,7 +5725,7 @@ def _parse_provider_config(value):
 
 
 async def main():
-    parser = argparse.ArgumentParser(description="Record and replay provider-owned environments")
+    parser = argparse.ArgumentParser(description="Record and replay native-runtime environments")
     subparsers = parser.add_subparsers(dest="command")
 
     parser_record = subparsers.add_parser("record", help="Record gameplay")
@@ -5804,7 +5811,7 @@ async def main():
     parser_upload.add_argument("--replace", action="store_true")
 
     subparsers.add_parser("login", help="Log in to Hugging Face Hub")
-    subparsers.add_parser("list_environments", help="List provider-owned environments")
+    subparsers.add_parser("list_environments", help="List supported native environments")
 
     parser_minari = subparsers.add_parser("minari-export", help="Export to Minari")
     _add_env_id_arg(parser_minari)

@@ -31,7 +31,7 @@ gymrec = "main:cli"
 minari = ["minari>=0.5.0"]
 
 [tool.hatch.build.targets.wheel]
-include = ["main.py", "provider_contract.py", "config.toml", "keymappings.toml", "gymrec_templates/*.md.j2"]
+include = ["main.py", "provider_contract.py", "providers.py", "config.toml", "keymappings.toml", "gymrec_templates/*.md.j2"]
 
 [tool.ruff]
 line-length = 100

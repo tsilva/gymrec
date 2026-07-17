@@ -1,8 +1,8 @@
 import asyncio
+import copy
 import json
 import subprocess
 import sys
-from dataclasses import dataclass
 
 import gymnasium as gym
 import numpy as np
@@ -10,6 +10,7 @@ import pytest
 
 import main
 import provider_contract
+import providers
 
 
 class OneStepEnv(gym.Env):
@@ -32,6 +33,40 @@ class ContinuingEnv(OneStepEnv):
     def step(self, action):
         self.received_actions.append(action)
         return np.ones((2, 2, 3), dtype=np.uint8), 7.5, False, False, {"provider": True}
+
+
+class FakeVectorEnv:
+    num_envs = 1
+    single_action_space = gym.spaces.MultiBinary(3)
+    single_observation_space = gym.spaces.Box(
+        0, 255, shape=(2, 2, 3), dtype=np.uint8
+    )
+
+    def __init__(self):
+        self.received_actions = []
+
+    def reset(self, *, seed=None, options=None):
+        return np.zeros((1, 2, 2, 3), dtype=np.uint8), {
+            "seed": np.asarray([seed]),
+            "hidden": np.asarray([1]),
+            "_hidden": np.asarray([False]),
+        }
+
+    def step(self, actions):
+        self.received_actions.append(actions.copy())
+        return (
+            np.ones((1, 2, 2, 3), dtype=np.uint8),
+            np.asarray([7.5], dtype=np.float32),
+            np.asarray([True]),
+            np.asarray([False]),
+            {"native": np.asarray([3]), "_native": np.asarray([True])},
+        )
+
+    def render(self):
+        return np.full((2, 2, 3), 9, dtype=np.uint8)
+
+    def close(self):
+        return None
 
 
 class FakeSession:
@@ -85,15 +120,6 @@ class FakeProvider:
         return ("Game-Nes-v0",)
 
 
-@dataclass
-class FakeEntryPoint:
-    name: str
-    value: object
-
-    def load(self):
-        return self.value
-
-
 def contract(config=None):
     return provider_contract.EnvironmentContract.parse(
         {
@@ -113,20 +139,15 @@ def artifact_for(session, environment_contract=None):
     return main.EnvironmentArtifact(artifact_id, document)
 
 
-def test_provider_discovery_loads_only_the_two_allowlisted_ids():
-    stable = FakeProvider()
-    ignored = FakeProvider()
-    ignored.provider_id = "third-party-provider"
-    discovered = provider_contract.discover_providers(
-        entry_points=[
-            FakeEntryPoint("stable-retro-turbo", stable),
-            FakeEntryPoint("third-party-provider", ignored),
-        ]
-    )
+def test_provider_discovery_uses_only_gymrecs_two_internal_adapters():
+    discovered = provider_contract.discover_providers()
 
-    assert discovered == {"stable-retro-turbo": stable}
+    assert set(discovered) == {
+        "stable-retro-turbo",
+        "supermariobrosnes-turbo",
+    }
     with pytest.raises(ValueError, match="Unsupported environment provider"):
-        provider_contract.load_provider("third-party-provider", entry_points=[])
+        provider_contract.load_provider("third-party-provider")
 
 
 def test_provider_contract_rejects_legacy_and_extra_fields():
@@ -140,13 +161,84 @@ def test_provider_contract_rejects_legacy_and_extra_fields():
         )
 
 
-def test_session_creation_forwards_opaque_config_without_interpreting_it():
+def test_shared_single_lane_adapter_preserves_native_transition_and_reset_contract():
+    vector_env = FakeVectorEnv()
+    env = providers.SingleLaneEnv(
+        vector_env, system="Nes", buttons=("B", "A", "RIGHT")
+    )
+
+    observation, info = env.reset(seed=7)
+    assert observation.shape == (2, 2, 3)
+    assert info == {"seed": 7}
+
+    action = np.asarray([0, 0, 1], dtype=np.int8)
+    observation, reward, terminated, truncated, info = env.step(action)
+    assert observation.tolist() == np.ones((2, 2, 3), dtype=np.uint8).tolist()
+    assert reward == 7.5
+    assert terminated is True
+    assert truncated is False
+    assert info == {"native": 3}
+    assert vector_env.received_actions[0].tolist() == [[0, 0, 1]]
+    with pytest.raises(RuntimeError, match=r"reset\(\) must be called"):
+        env.step(action)
+
+
+def test_legacy_task_uses_only_action_conversion_and_warns_about_semantics():
+    config = {
+        "state": "Level1-1",
+        "task": {
+            "id": "mario",
+            "action": {"set": "simple"},
+            "reward": {"reward_mode": "score"},
+            "termination": {"success": ["level_change"]},
+        },
+    }
+
+    with pytest.warns(UserWarning, match="uses only config.task.action"):
+        declared, kwargs, policy_actions, effective = providers._prepare_config(
+            config
+        )
+
+    assert declared == config
+    assert kwargs == {"state": "Level1-1"}
+    assert policy_actions == providers.BUILTIN_ACTION_SETS["simple"]
+    assert effective == {
+        "state": "Level1-1",
+        "task": {"action": {"set": "simple"}},
+    }
+
+
+def test_shared_session_adapts_discrete_policy_actions_to_named_native_controls():
+    vector_env = FakeVectorEnv()
+    session = providers.ProviderSession(
+        provider_id="stable-retro-turbo",
+        environment_id="Game-Nes-v0",
+        declared_config={},
+        effective_config={},
+        vector_env=vector_env,
+        system="Nes",
+        buttons=("B", "A", "RIGHT"),
+        policy_actions=(("RIGHT",), ("RIGHT", "B")),
+        fps=60,
+        assets={},
+    )
+
+    assert session.adapt_policy_action(0).tolist() == [0, 0, 1]
+    assert session.adapt_policy_action(1).tolist() == [1, 0, 1]
+    assert session.recording_observation(None).tolist() == np.full(
+        (2, 2, 3), 9, dtype=np.uint8
+    ).tolist()
+
+
+def test_session_creation_uses_the_gymrec_owned_provider_registry(monkeypatch):
     provider = FakeProvider()
     config = {"task": {"id": "anything"}, "nested": [1, 2, 3]}
+    monkeypatch.setitem(
+        provider_contract.PROVIDERS, "stable-retro-turbo", provider
+    )
     session = provider_contract.create_session(
         contract(config),
         render_mode="rgb_array",
-        entry_points=[FakeEntryPoint("stable-retro-turbo", provider)],
     )
 
     assert provider.calls == [("Game-Nes-v0", config, "rgb_array")]
@@ -184,6 +276,49 @@ def test_playback_requires_the_exact_recorded_provider_version(monkeypatch):
 
     with pytest.raises(ValueError, match="requires stable-retro-turbo==test"):
         main._session_from_environment_document(artifact.document, render_mode="rgb_array")
+
+
+@pytest.mark.parametrize(
+    ("field", "change", "message"),
+    [
+        (
+            "effective_config",
+            lambda value: {**value, "drift": True},
+            "effective config does not match",
+        ),
+        (
+            "provenance",
+            lambda value: {
+                **value,
+                "assets": {**value["assets"], "rom_sha256": "changed"},
+            },
+            "assets do not match",
+        ),
+        (
+            "action_space",
+            lambda value: {**value, "n": value["n"] + 1},
+            "action space does not match",
+        ),
+        (
+            "observation_space",
+            lambda value: {**value, "shape": [1, 2, 3]},
+            "observation space does not match",
+        ),
+    ],
+)
+def test_playback_rejects_recorded_environment_drift(
+    monkeypatch, field, change, message
+):
+    artifact = artifact_for(FakeSession())
+    document = copy.deepcopy(artifact.document)
+    document[field] = change(document[field])
+    monkeypatch.setattr(main, "_installed_package_version", lambda _name: "test")
+    monkeypatch.setattr(
+        main, "create_session", lambda _contract, render_mode: FakeSession()
+    )
+
+    with pytest.raises(ValueError, match=message):
+        main._session_from_environment_document(document, render_mode="rgb_array")
 
 
 def test_human_input_maps_keys_to_labels_and_provider_owns_action(monkeypatch):
