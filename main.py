@@ -14,7 +14,6 @@ import threading
 import time
 import tomllib
 import uuid
-from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from urllib.parse import unquote, urlparse
 
@@ -41,6 +40,7 @@ from provider_contract import (
     build_environment_document,
     create_session,
     discover_providers,
+    space_contract,
     validate_environment_document,
 )
 
@@ -229,7 +229,6 @@ ENVIRONMENT_DOCUMENT_FILENAME = "environment.json"
 COLLECTION_DOCUMENT_TYPE = "gymrec.collection"
 COLLECTION_FORMAT_VERSION = 2
 DATASET_FORMAT_VERSION = 3
-PREVIEW_VIDEO_ARTIFACT_DIR = "videos"
 CANONICAL_VIDEO_SUFFIX = ".rgb.mkv.bin"
 PREVIEW_VIDEO_SUFFIX = ".preview.mp4"
 DATASET_REPLAY_FILENAME = "replay.mp4"
@@ -351,7 +350,6 @@ class _StreamingLosslessVideoWriter:
         self.ffmpeg_path = ffmpeg_path or _require_lossless_video_tools()[0]
         self.process = None
         self.shape = None
-        self.frames_written = 0
 
     def _start(self, frame):
         self.shape = tuple(frame.shape)
@@ -394,7 +392,6 @@ class _StreamingLosslessVideoWriter:
         elif tuple(frame.shape) != self.shape:
             raise ValueError(f"All video frames must have shape {self.shape}; got {frame.shape}")
         self.process.stdin.write(frame.tobytes())
-        self.frames_written += 1
 
     def close(self):
         if self.process is None:
@@ -717,13 +714,9 @@ def _environment_metadata_from_dataset(dataset):
     }
 
 
-def _canonicalize_environment_metadata(metadata):
-    return dict(metadata or {})
-
-
 def _playback_metadata(dataset, local_metadata=None):
     return {
-        **_canonicalize_environment_metadata(local_metadata),
+        **dict(local_metadata or {}),
         **_environment_metadata_from_dataset(dataset),
     }
 
@@ -888,16 +881,7 @@ def ensure_hf_login(force=False) -> bool:
 # =============================================================================
 
 
-class InputSource(ABC):
-    """Abstract base class for input sources (human or agent)."""
-
-    @abstractmethod
-    def get_action(self, observation) -> any:
-        """Return action for the current observation."""
-        pass
-
-
-class HumanInputSource(InputSource):
+class HumanInputSource:
     """Translate pressed keys through the provider's advertised control profile."""
 
     def __init__(self, provider_session, key_lock, current_keys):
@@ -926,7 +910,7 @@ class HumanInputSource(InputSource):
         return self.provider_session.action_from_labels(labels)
 
 
-class AgentInputSource(InputSource):
+class AgentInputSource:
     """Agent input via policy function."""
 
     def __init__(self, policy):
@@ -960,29 +944,11 @@ class AgentInputSource(InputSource):
 # =============================================================================
 
 
-class BasePolicy(ABC):
-    """Abstract base class for agent policies."""
-
-    def __init__(self, action_space, env=None):
-        self.action_space = action_space
-        self.env = env
-
-    def reset(self, **kwargs):
-        """Reset any episode-local policy state."""
-        pass
-
-    def observe_step(self, reward, terminated, truncated, info):
-        """Receive the result of the previously chosen action."""
-        pass
-
-    @abstractmethod
-    def __call__(self, observation):
-        """Return action for the given observation."""
-        pass
-
-
-class RandomPolicy(BasePolicy):
+class RandomPolicy:
     """Random policy that samples from the action space."""
+
+    def __init__(self, action_space):
+        self.action_space = action_space
 
     def reset(self, **kwargs):
         seed = kwargs.get("seed")
@@ -996,7 +962,6 @@ class RandomPolicy(BasePolicy):
 
 @dataclass(frozen=True)
 class HFPolicySource:
-    ref: str
     repo_id: str
     revision: str
     checkpoint_filename: str
@@ -1005,9 +970,6 @@ class HFPolicySource:
     recipe_json_path: str
     release_manifest_path: str | None
     model_document: dict
-    recipe_document: dict
-    release_manifest_document: dict | None
-    evaluation: dict
     environment: dict
     deterministic: bool = False
     device: str = "auto"
@@ -1032,14 +994,10 @@ class HFPolicySource:
     def checkpoint_sha256(self) -> str:
         return str(self.model_document["checkpoint"]["sha256"])
 
-    @property
-    def recipe_sha256(self) -> str:
-        return str(self.model_document["recipe"]["sha256"])
 
 @dataclass(frozen=True)
 class CollectorContract:
     contract_id: str
-    collector: str
     policy_mode: str
     collection_document: dict
     model_json_path: str
@@ -1066,11 +1024,10 @@ def _environment_artifact(contract, provider_session):
     return EnvironmentArtifact(contract_id=contract_id, document=document)
 
 
-class StableBaselines3Policy(BasePolicy):
+class StableBaselines3Policy:
     """Run an SB3 policy against recipe-native provider observations."""
 
     def __init__(self, source: HFPolicySource, provider_session):
-        super().__init__(provider_session.env.action_space)
         try:
             from stable_baselines3 import PPO
         except ImportError as exc:
@@ -1152,20 +1109,6 @@ def _installed_package_version(name):
         return None
 
 
-def _space_contract(space):
-    contract = {"type": type(space).__name__, "repr": str(space)}
-    shape = getattr(space, "shape", None)
-    if shape is not None:
-        contract["shape"] = [int(value) for value in shape]
-    dtype = getattr(space, "dtype", None)
-    if dtype is not None:
-        contract["dtype"] = str(dtype)
-    count = getattr(space, "n", None)
-    if count is not None:
-        contract["n"] = int(count)
-    return contract
-
-
 def build_collector_contract(
     source,
     provider_session,
@@ -1214,8 +1157,8 @@ def build_collector_contract(
             "recorded_observations": "provider-selected-rgb",
             "recorded_actions": "exact-env-step-input",
             "recorded_policy_actions": "unadapted-policy-output",
-            "action_space": _space_contract(provider_session.env.action_space),
-            "observation_space": _space_contract(provider_session.env.observation_space),
+            "action_space": space_contract(provider_session.env.action_space),
+            "observation_space": space_contract(provider_session.env.observation_space),
         },
         "runtime": {
             "inference_device": str(inference_device),
@@ -1235,7 +1178,6 @@ def build_collector_contract(
     contract_id = hashlib.sha256(_canonical_json_bytes(collection_document)).hexdigest()
     return CollectorContract(
         contract_id=contract_id,
-        collector=source.collector,
         policy_mode=mode,
         collection_document=collection_document,
         model_json_path=source.model_json_path,
@@ -1347,34 +1289,6 @@ def _metadata_value(metadata, path):
         else:
             return None
     return value
-
-
-def _metadata_int(metadata, *paths, default):
-    for path in paths:
-        value = _metadata_value(metadata, path)
-        if value is not None:
-            return int(value)
-    if default is None:
-        return None
-    return int(default)
-
-
-def _metadata_float(metadata, *paths, default):
-    for path in paths:
-        value = _metadata_value(metadata, path)
-        if value is not None:
-            return float(value)
-    if default is None:
-        return None
-    return float(default)
-
-
-def _metadata_str(metadata, *paths, default=None):
-    for path in paths:
-        value = _metadata_value(metadata, path)
-        if value:
-            return str(value)
-    return default
 
 
 def _download_huggingface_policy_file(repo_id, revision, filename):
@@ -1632,7 +1546,6 @@ def resolve_huggingface_policy_source(
     _validate_bound_file(model_path, checkpoint, label=checkpoint_filename)
 
     release_manifest_path = None
-    release_manifest_document = None
     if RLAB_RELEASE_MANIFEST_FILENAME in repo_files:
         release_manifest_path = _download_huggingface_policy_file(
             repo_id, resolved_revision, RLAB_RELEASE_MANIFEST_FILENAME
@@ -1670,7 +1583,6 @@ def resolve_huggingface_policy_source(
     )
 
     return HFPolicySource(
-        ref=ref,
         repo_id=repo_id,
         revision=resolved_revision,
         checkpoint_filename=checkpoint_filename,
@@ -1679,28 +1591,16 @@ def resolve_huggingface_policy_source(
         recipe_json_path=recipe_json_path,
         release_manifest_path=release_manifest_path,
         model_document=model_document,
-        recipe_document=recipe_document,
-        release_manifest_document=release_manifest_document,
-        evaluation=evaluation,
         environment=environment,
         deterministic=resolved_deterministic,
         device=device,
     )
 
 
-AGENT_POLICY_FACTORIES = {
-    "random": lambda env: RandomPolicy(env.action_space),
-}
-
-
 @dataclass(frozen=True)
 class LiveEpisodePackage:
     episode_id: str
     package_dir: str
-
-    @property
-    def video_root(self):
-        return self.package_dir
 
     @property
     def frame_dir(self):
@@ -1781,7 +1681,6 @@ class LiveEpisodeUploadManager:
         base_wait=1.0,
     ):
         self.identity = _coerce_recording_identity(recording_identity)
-        self.env_id = self.identity.display_ref
         self.storage_format = storage_format
         self.collector_contract = collector_contract
         self.environment_artifact = environment_artifact
@@ -1829,14 +1728,6 @@ class LiveEpisodeUploadManager:
         manifest = _load_live_upload_manifest(self.identity)
         manifest.get("episodes", {}).pop(package.episode_id, None)
         _save_live_upload_manifest(self.identity, manifest)
-
-
-def create_agent_policy(agent_type, env):
-    """Create the configured agent policy for an environment."""
-    try:
-        return AGENT_POLICY_FACTORIES[agent_type](env)
-    except KeyError:
-        raise ValueError(f"Unknown agent type: {agent_type}") from None
 
 
 @dataclass(frozen=True)
@@ -2180,46 +2071,6 @@ def _validate_collector_artifacts(dataset, root, *, label="dataset"):
     return dataset
 
 
-def _load_dataset_collector_documents(dataset, *, label="dataset"):
-    """Load and validate the immutable collector documents needed at playback time."""
-    contract_ids = sorted(
-        {value for value in dataset["collector_contract_id"] if value is not None}
-    )
-    if not contract_ids:
-        return {}
-
-    local_root = _first_dataset_value(dataset, RUNTIME_VIDEO_BASE_COLUMN)
-    hf_repo_id = _first_dataset_value(dataset, RUNTIME_HF_REPO_COLUMN)
-    documents = {}
-    for contract_id in contract_ids:
-        relative_path = f"{COLLECTOR_ARTIFACT_DIR}/{contract_id}/collection.json"
-        if local_root:
-            path = os.path.join(local_root, relative_path)
-        elif hf_repo_id:
-            path = hf_hub_download(
-                repo_id=hf_repo_id,
-                repo_type="dataset",
-                filename=relative_path,
-            )
-        else:
-            raise ValueError(f"{label} has no source for collector {contract_id}")
-        if not os.path.isfile(path):
-            raise ValueError(f"{label} is missing {relative_path}")
-        document = _load_json_document(path, label=f"collector {contract_id}/collection.json")
-        if (
-            document.get("document_type") != COLLECTION_DOCUMENT_TYPE
-            or document.get("format_version") != COLLECTION_FORMAT_VERSION
-        ):
-            raise ValueError(f"{label} has an unsupported collector contract {contract_id}")
-        actual_id = hashlib.sha256(_canonical_json_bytes(document)).hexdigest()
-        if actual_id != contract_id:
-            raise ValueError(
-                f"{label} collector contract hash mismatch: {actual_id} != {contract_id}"
-            )
-        documents[contract_id] = document
-    return documents
-
-
 def _load_dataset_environment_documents(dataset, *, label="dataset"):
     contract_ids = sorted(set(dataset["environment_contract_id"]))
     local_root = _first_dataset_value(dataset, RUNTIME_VIDEO_BASE_COLUMN)
@@ -2275,12 +2126,12 @@ def _session_from_environment_document(document, *, render_mode):
     if _canonical_json_bytes(session.provenance) != _canonical_json_bytes(document["provenance"]):
         session.env.close()
         raise ValueError("Installed provider assets do not match the recorded environment contract")
-    if _canonical_json_bytes(_space_contract(session.env.action_space)) != _canonical_json_bytes(
+    if _canonical_json_bytes(space_contract(session.env.action_space)) != _canonical_json_bytes(
         document["action_space"]
     ):
         session.env.close()
         raise ValueError("Installed provider action space does not match the recording")
-    if _canonical_json_bytes(_space_contract(session.env.observation_space)) != _canonical_json_bytes(
+    if _canonical_json_bytes(space_contract(session.env.observation_space)) != _canonical_json_bytes(
         document["observation_space"]
     ):
         session.env.close()
@@ -2293,7 +2144,9 @@ class DatasetRecorderWrapper(gym.Wrapper):
 
     def __init__(
         self,
-        env,
+        *,
+        provider_session,
+        environment_artifact,
         input_source=None,
         headless=False,
         collector="human",
@@ -2301,11 +2154,9 @@ class DatasetRecorderWrapper(gym.Wrapper):
         live_upload_manager=None,
         initial_seed=None,
         collector_contract=None,
-        provider_session=None,
-        environment_artifact=None,
     ):
         _lazy_init()
-        super().__init__(env)
+        super().__init__(provider_session.env)
 
         self.recording = False
         self.storage_format = _configured_storage_format(storage_format)
@@ -2320,8 +2171,6 @@ class DatasetRecorderWrapper(gym.Wrapper):
         self.live_upload_manager = live_upload_manager
         self.initial_seed = int(initial_seed) if initial_seed is not None else None
         self.collector_contract = collector_contract
-        if provider_session is None or environment_artifact is None:
-            raise ValueError("DatasetRecorderWrapper requires a provider session and environment artifact")
         self.provider_session = provider_session
         self.environment_artifact = environment_artifact
         self._gymrec_version = _get_gymrec_version()
@@ -2341,7 +2190,6 @@ class DatasetRecorderWrapper(gym.Wrapper):
         self.temp_dir = tempfile.mkdtemp()
         _materialize_collector_contract(self.collector_contract, self.temp_dir)
         _materialize_environment_artifact(self.environment_artifact, self.temp_dir)
-        self.video_artifact_dir = os.path.join(self.temp_dir, VIDEO_ARTIFACT_DIR)
         self._current_episode_video_frames = []
         self._current_episode_video_hashes = []
         self._live_episode = None
@@ -2485,7 +2333,7 @@ class DatasetRecorderWrapper(gym.Wrapper):
         if self._live_upload_enabled:
             if self._live_episode is None:
                 self._start_live_episode(episode_uuid)
-            video_path = os.path.join(self._live_episode.video_root, video_relpath)
+            video_path = os.path.join(self._live_episode.package_dir, video_relpath)
             if self._live_video_writer is None:
                 self._live_video_writer = _StreamingLosslessVideoWriter(
                     video_path,
@@ -2532,7 +2380,7 @@ class DatasetRecorderWrapper(gym.Wrapper):
             return
 
         video_path = os.path.join(self.temp_dir, video_relpath)
-        preview_relpath = f"{PREVIEW_VIDEO_ARTIFACT_DIR}/{episode_uuid.hex}{PREVIEW_VIDEO_SUFFIX}"
+        preview_relpath = f"{VIDEO_ARTIFACT_DIR}/{episode_uuid.hex}{PREVIEW_VIDEO_SUFFIX}"
         preview_path = os.path.join(self.temp_dir, preview_relpath)
         _encode_lossless_rgb_video(
             self._current_episode_video_frames,
@@ -2629,7 +2477,8 @@ class DatasetRecorderWrapper(gym.Wrapper):
         if not success:
             console.print(
                 f"[{STYLE_INFO}]Episode {package.episode_id} kept for retry: "
-                f"[{STYLE_CMD}]{_gymrec_cmd('upload', self.live_upload_manager.env_id)}[/]"
+                f"[{STYLE_CMD}]"
+                f"{_gymrec_cmd('upload', self.live_upload_manager.identity.display_ref)}[/]"
             )
         self._clear_recording_buffers()
         self._live_episode = None
@@ -2862,7 +2711,7 @@ class DatasetRecorderWrapper(gym.Wrapper):
     async def _play(self, fps=None):
         """
         Main loop for interactive gameplay and recording.
-        Supports both human input (pygame) and agent input via InputSource abstraction.
+        Supports both human input (pygame) and policy-backed input sources.
         """
         if fps is None:
             fps = _provider_fps(self.provider_session)
@@ -3296,7 +3145,6 @@ class RecordingIdentity:
 
 @dataclass(frozen=True)
 class RecordingPaths:
-    root: str | None
     dataset: str
     metadata: str
     uploaded: str
@@ -3338,7 +3186,6 @@ def _recording_paths(value):
         owner, repo = identity.dataset_repo_id.split("/", 1)
         root = os.path.join(local_dir, "repos", owner, repo)
         return RecordingPaths(
-            root=root,
             dataset=os.path.join(root, "dataset"),
             metadata=os.path.join(root, "metadata.json"),
             uploaded=os.path.join(root, "uploaded.json"),
@@ -3347,7 +3194,6 @@ def _recording_paths(value):
 
     encoded_env_id = _encode_env_id_for_hf(identity.env_id)
     return RecordingPaths(
-        root=None,
         dataset=os.path.join(local_dir, encoded_env_id),
         metadata=os.path.join(local_dir, f"{encoded_env_id}_metadata.json"),
         uploaded=os.path.join(local_dir, f"{encoded_env_id}_uploaded.json"),
@@ -3369,10 +3215,6 @@ def hf_repo_id_to_env_id(hf_repo_id):
 
     encoded_env_id = repo_name[len(prefix) :]
     return _decode_hf_repo_name(encoded_env_id)
-
-
-def _get_recording_root(value):
-    return _recording_paths(value).root
 
 
 def get_local_dataset_path(value):
@@ -3610,30 +3452,21 @@ def _copy_artifact_tree(src_root, dst_root, relative_dir):
     shutil.copytree(src_dir, dst_dir, dirs_exist_ok=True)
 
 
-def _copy_video_artifacts(src_root, dst_root):
-    """Copy canonical and preview video artifacts into a saved local dataset directory."""
-    for relative_dir in {
-        VIDEO_ARTIFACT_DIR,
-        PREVIEW_VIDEO_ARTIFACT_DIR,
-    }:
-        _copy_artifact_tree(src_root, dst_root, relative_dir)
-
-
 def _copy_dataset_artifacts(src_root, dst_root):
-    _copy_video_artifacts(src_root, dst_root)
+    _copy_artifact_tree(src_root, dst_root, VIDEO_ARTIFACT_DIR)
     _copy_artifact_tree(src_root, dst_root, COLLECTOR_ARTIFACT_DIR)
     _copy_artifact_tree(src_root, dst_root, ENVIRONMENT_ARTIFACT_DIR)
 
 
-def save_dataset_locally(dataset, value, metadata=None, video_artifact_dir=None):
+def save_dataset_locally(dataset, value, *, artifact_root, metadata=None):
     """Save dataset to local disk, appending to any existing data."""
     identity = _coerce_recording_identity(value)
     path = get_local_dataset_path(identity)
     metadata_path = _get_metadata_path(identity)
     dataset = _strip_runtime_columns(dataset)
     _validate_canonical_dataset_schema(dataset, label="New recording")
-    _validate_environment_artifacts(dataset, video_artifact_dir, label="New recording")
-    _validate_collector_artifacts(dataset, video_artifact_dir, label="New recording")
+    _validate_environment_artifacts(dataset, artifact_root, label="New recording")
+    _validate_collector_artifacts(dataset, artifact_root, label="New recording")
     new_storage_format = _dataset_storage_format(dataset)
     new_episode_count = (
         len(set(dataset["episode_id"])) if "episode_id" in dataset.column_names else 0
@@ -3667,7 +3500,7 @@ def save_dataset_locally(dataset, value, metadata=None, video_artifact_dir=None)
         dataset.save_to_disk(tmp_path)
         if os.path.exists(existing_video_dir):
             _copy_dataset_artifacts(existing_video_dir, tmp_path)
-        _copy_dataset_artifacts(video_artifact_dir, tmp_path)
+        _copy_dataset_artifacts(artifact_root, tmp_path)
         if os.path.exists(path):
             shutil.rmtree(path)
         os.replace(tmp_path, path)
@@ -3682,8 +3515,6 @@ def save_dataset_locally(dataset, value, metadata=None, video_artifact_dir=None)
             with open(metadata_path, "r") as f:
                 existing_metadata = json.load(f)
         # Update descriptive metadata while preserving one canonical vocabulary.
-        existing_metadata = _canonicalize_environment_metadata(existing_metadata)
-        metadata = _canonicalize_environment_metadata(metadata)
         existing_metadata.update(metadata)
         if identity.dataset_repo_id:
             existing_metadata["dataset_repo_id"] = identity.dataset_repo_id
@@ -4201,7 +4032,7 @@ REMOTE_STORAGE_FORMAT_UNSUPPORTED = "unsupported"
 
 
 def _preview_video_relpath(episode_stem):
-    return f"{PREVIEW_VIDEO_ARTIFACT_DIR}/{episode_stem}{PREVIEW_VIDEO_SUFFIX}"
+    return f"{VIDEO_ARTIFACT_DIR}/{episode_stem}{PREVIEW_VIDEO_SUFFIX}"
 
 
 def _dataset_replay_url(repo_id):
@@ -4349,7 +4180,7 @@ def _validate_remote_parquet_schema(hf_repo_id, remote_columns, storage_format):
         )
 
 
-def _collector_upload_operations(
+def _contract_upload_operations(
     dataset,
     *,
     local_root,
@@ -4357,9 +4188,18 @@ def _collector_upload_operations(
     remote_files,
     revision,
 ):
-    contract_ids = {value for value in dataset["collector_contract_id"] if value is not None}
-    operations = []
-    for contract_id in sorted(contract_ids):
+    artifacts = []
+    for contract_id in sorted(set(dataset["environment_contract_id"])):
+        repo_path = (
+            f"{ENVIRONMENT_ARTIFACT_DIR}/{contract_id}/{ENVIRONMENT_DOCUMENT_FILENAME}"
+        )
+        local_path = os.path.join(local_root, repo_path)
+        if not os.path.isfile(local_path):
+            raise FileNotFoundError(f"Missing environment contract: {local_path}")
+        artifacts.append(("environment", repo_path, local_path))
+
+    collector_ids = {value for value in dataset["collector_contract_id"] if value is not None}
+    for contract_id in sorted(collector_ids):
         relative_dir = f"{COLLECTOR_ARTIFACT_DIR}/{contract_id}"
         local_dir = os.path.join(local_root, relative_dir)
         if not os.path.isdir(local_dir):
@@ -4369,38 +4209,10 @@ def _collector_upload_operations(
             if not os.path.isfile(local_path):
                 continue
             repo_path = f"{relative_dir}/{filename}"
-            if repo_path in remote_files:
-                remote_path = hf_hub_download(
-                    repo_id=hf_repo_id,
-                    repo_type="dataset",
-                    revision=revision,
-                    filename=repo_path,
-                )
-                if _sha256_file(remote_path) != _sha256_file(local_path):
-                    raise ValueError(f"Remote collector contract conflict at {repo_path}")
-                continue
-            operations.append(
-                CommitOperationAdd(path_in_repo=repo_path, path_or_fileobj=local_path)
-            )
-    return operations
+            artifacts.append(("collector", repo_path, local_path))
 
-
-def _environment_upload_operations(
-    dataset,
-    *,
-    local_root,
-    hf_repo_id,
-    remote_files,
-    revision,
-):
     operations = []
-    for contract_id in sorted(set(dataset["environment_contract_id"])):
-        repo_path = (
-            f"{ENVIRONMENT_ARTIFACT_DIR}/{contract_id}/{ENVIRONMENT_DOCUMENT_FILENAME}"
-        )
-        local_path = os.path.join(local_root, repo_path)
-        if not os.path.isfile(local_path):
-            raise FileNotFoundError(f"Missing environment contract: {local_path}")
+    for contract_kind, repo_path, local_path in artifacts:
         if repo_path in remote_files:
             remote_path = hf_hub_download(
                 repo_id=hf_repo_id,
@@ -4409,7 +4221,7 @@ def _environment_upload_operations(
                 filename=repo_path,
             )
             if _sha256_file(remote_path) != _sha256_file(local_path):
-                raise ValueError(f"Remote environment contract conflict at {repo_path}")
+                raise ValueError(f"Remote {contract_kind} contract conflict at {repo_path}")
             continue
         operations.append(CommitOperationAdd(path_in_repo=repo_path, path_or_fileobj=local_path))
     return operations
@@ -4539,16 +4351,7 @@ def _upload_dataset_shard_to_hub(
                         CommitOperationAdd(path_in_repo=shard_name, path_or_fileobj=shard_path)
                     )
                     operations.extend(
-                        _environment_upload_operations(
-                            upload_dataset,
-                            local_root=local_root,
-                            hf_repo_id=hf_repo_id,
-                            remote_files=[] if replace else remote_files,
-                            revision=parent_commit,
-                        )
-                    )
-                    operations.extend(
-                        _collector_upload_operations(
+                        _contract_upload_operations(
                             upload_dataset,
                             local_root=local_root,
                             hf_repo_id=hf_repo_id,
@@ -5269,16 +5072,6 @@ def _current_hf_username():
     return user_info.get("name") or user_info.get("user") or user_info.get("username") or "unknown"
 
 
-def _provenance_from_metadata(metadata):
-    collectors = set()
-    versions = set()
-    if metadata and "recordings" in metadata:
-        for recording in metadata["recordings"]:
-            collectors.update(recording.get("collectors", []))
-            versions.update(recording.get("gymrec_versions", []))
-    return sorted(collectors), sorted(versions)
-
-
 def _dataset_card_intro(env_id, collectors):
     if collectors and collectors != ["human"]:
         collector_str = ", ".join(f"`{c}`" for c in collectors)
@@ -5336,8 +5129,8 @@ def render_dataset_card_content(
     curator=None,
 ):
     """Render the shared Hugging Face dataset card Markdown."""
-    metadata = _canonicalize_environment_metadata(metadata)
-    provider_id = (metadata or {}).get("provider_id")
+    metadata = dict(metadata or {})
+    provider_id = metadata.get("provider_id")
     if provider_id not in SUPPORTED_PROVIDER_IDS:
         raise ValueError("Dataset card requires a supported provider_id")
     collectors = collectors or []
@@ -5393,7 +5186,7 @@ def render_dataset_card_content(
     if storage_format == STORAGE_FORMAT_LOSSLESS_VIDEO:
         field_lines.append(
             f"- Browser-friendly `*{PREVIEW_VIDEO_SUFFIX}` files under "
-            f"`{PREVIEW_VIDEO_ARTIFACT_DIR}/` are lossy previews only and are not used "
+            f"`{VIDEO_ARTIFACT_DIR}/` are lossy previews only and are not used "
             "for trajectory replay/training"
         )
 
@@ -5469,11 +5262,11 @@ def _build_dataset_card_content(
     repo_id,
     new_frames,
     new_episodes,
+    dataset,
     existing_frames=0,
     existing_episodes=0,
     local_root=None,
     remote_files=None,
-    dataset=None,
     fps=None,
 ):
     """Build a dataset card using row-derived existing and new statistics."""
@@ -5484,20 +5277,17 @@ def _build_dataset_card_content(
     metadata = _playback_metadata(dataset, local_metadata)
     if fps is not None:
         metadata["fps"] = fps
-    if dataset is not None:
-        columns = set(getattr(dataset, "column_names", None) or [])
-        collectors = (
-            sorted({value for value in dataset["collector"] if value})
-            if "collector" in columns
-            else []
-        )
-        gymrec_versions = (
-            sorted({value for value in dataset["gymrec_version"] if value})
-            if "gymrec_version" in columns
-            else []
-        )
-    else:
-        collectors, gymrec_versions = _provenance_from_metadata(local_metadata)
+    columns = set(getattr(dataset, "column_names", None) or [])
+    collectors = (
+        sorted({value for value in dataset["collector"] if value})
+        if "collector" in columns
+        else []
+    )
+    gymrec_versions = (
+        sorted({value for value in dataset["gymrec_version"] if value})
+        if "gymrec_version" in columns
+        else []
+    )
     collector_contracts = _collector_contract_summaries(
         local_root,
         repo_id=repo_id,
@@ -5530,7 +5320,7 @@ def create_environment_session(contract, *, render_mode):
 def _provider_catalog(*, progress=None, task_id=None):
     providers = discover_providers()
     rows = []
-    for provider_id in sorted(SUPPORTED_PROVIDER_IDS):
+    for provider_id, provider in sorted(providers.items()):
         if progress is not None:
             label = PROVIDER_LABELS.get(provider_id, provider_id)
             progress.update(
@@ -5538,10 +5328,8 @@ def _provider_catalog(*, progress=None, task_id=None):
                 description=f"[bold]Scanning {label} environments[/]",
                 refresh=True,
             )
-        provider = providers.get(provider_id)
-        if provider is not None:
-            for environment_id in provider.catalog():
-                rows.append((provider_id, str(environment_id)))
+        for environment_id in provider.catalog():
+            rows.append((provider_id, str(environment_id)))
         if progress is not None:
             progress.advance(task_id)
     return rows
@@ -6162,7 +5950,6 @@ async def main():
             artifact = EnvironmentArtifact(contract_id=contract_id, document=document)
             fps = args.fps or max(int(round(float(document["fps"]))), 1)
             recorder = DatasetRecorderWrapper(
-                provider_session.env,
                 storage_format=STORAGE_FORMAT_IMAGES,
                 provider_session=provider_session,
                 environment_artifact=artifact,
@@ -6204,7 +5991,7 @@ async def main():
                 inference_device=getattr(policy.model, "device", hf_policy_source.device),
             )
         else:
-            policy = create_agent_policy(record_plan.agent, env)
+            policy = RandomPolicy(env.action_space)
 
     live_upload_manager = (
         LiveEpisodeUploadManager(
@@ -6218,7 +6005,6 @@ async def main():
         else None
     )
     recorder = DatasetRecorderWrapper(
-        env,
         input_source=None if record_plan.human else AgentInputSource(policy),
         headless=record_plan.headless,
         collector=(
@@ -6268,8 +6054,8 @@ async def main():
     save_dataset_locally(
         recorded_dataset,
         recording_identity,
+        artifact_root=recorder.temp_dir,
         metadata=recorder._env_metadata,
-        video_artifact_dir=recorder.temp_dir,
     )
     recorder.close()
     _finish_recording_publication(recording_identity, dry_run=args.dry_run)

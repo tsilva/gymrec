@@ -142,6 +142,7 @@ def artifact_for(session, environment_contract=None):
 def test_provider_discovery_uses_only_gymrecs_two_internal_adapters():
     discovered = provider_contract.discover_providers()
 
+    assert provider_contract.SUPPORTED_PROVIDER_IDS == frozenset(provider_contract.PROVIDERS)
     assert set(discovered) == {
         "stable-retro-turbo",
         "supermariobrosnes-turbo",
@@ -409,9 +410,7 @@ def test_provider_contract_rejects_legacy_and_extra_fields():
 
 def test_shared_single_lane_adapter_preserves_native_transition_and_reset_contract():
     vector_env = FakeVectorEnv()
-    env = providers.SingleLaneEnv(
-        vector_env, system="Nes", buttons=("B", "A", "RIGHT")
-    )
+    env = providers.SingleLaneEnv(vector_env)
 
     observation, info = env.reset(seed=7)
     assert observation.shape == (2, 2, 3)
@@ -441,11 +440,8 @@ def test_legacy_task_uses_only_action_conversion_and_warns_about_semantics():
     }
 
     with pytest.warns(UserWarning, match="uses only config.task.action"):
-        declared, kwargs, policy_actions, effective = providers._prepare_config(
-            config
-        )
+        kwargs, policy_actions, effective = providers._prepare_config(config)
 
-    assert declared == config
     assert kwargs == {"state": "Level1-1"}
     assert policy_actions == providers.BUILTIN_ACTION_SETS["simple"]
     assert effective == {
@@ -459,7 +455,6 @@ def test_shared_session_adapts_discrete_policy_actions_to_named_native_controls(
     session = providers.ProviderSession(
         provider_id="stable-retro-turbo",
         environment_id="Game-Nes-v0",
-        declared_config={},
         effective_config={},
         vector_env=vector_env,
         system="Nes",
@@ -514,6 +509,104 @@ def test_environment_document_rejects_schema_drift_and_nonfinite_config():
 
     with pytest.raises(ValueError, match="JSON"):
         provider_contract.canonical_json_bytes({"bad": float("nan")})
+
+
+def test_contract_upload_operations_add_environment_and_collector_artifacts(
+    tmp_path, monkeypatch
+):
+    class AddOperation:
+        def __init__(self, *, path_in_repo, path_or_fileobj):
+            self.path_in_repo = path_in_repo
+            self.path_or_fileobj = path_or_fileobj
+
+    environment_id = "e" * 64
+    collector_id = "c" * 64
+    environment_path = (
+        tmp_path / "environments" / environment_id / "environment.json"
+    )
+    collector_path = tmp_path / "collectors" / collector_id / "collection.json"
+    environment_path.parent.mkdir(parents=True)
+    collector_path.parent.mkdir(parents=True)
+    environment_path.write_text("environment")
+    collector_path.write_text("collector")
+    monkeypatch.setattr(main, "CommitOperationAdd", AddOperation, raising=False)
+
+    operations = main._contract_upload_operations(
+        {
+            "environment_contract_id": [environment_id],
+            "collector_contract_id": [collector_id],
+        },
+        local_root=str(tmp_path),
+        hf_repo_id="owner/dataset",
+        remote_files=[],
+        revision="revision",
+    )
+
+    assert [operation.path_in_repo for operation in operations] == [
+        f"environments/{environment_id}/environment.json",
+        f"collectors/{collector_id}/collection.json",
+    ]
+
+
+@pytest.mark.parametrize("contract_kind", ["environment", "collector"])
+def test_contract_upload_operations_reject_remote_contract_conflicts(
+    tmp_path, monkeypatch, contract_kind
+):
+    environment_id = "e" * 64
+    collector_id = "c" * 64
+    environment_repo_path = f"environments/{environment_id}/environment.json"
+    collector_repo_path = f"collectors/{collector_id}/collection.json"
+    environment_path = tmp_path / environment_repo_path
+    collector_path = tmp_path / collector_repo_path
+    environment_path.parent.mkdir(parents=True)
+    collector_path.parent.mkdir(parents=True)
+    environment_path.write_text("local environment")
+    collector_path.write_text("local collector")
+    remote_path = tmp_path / "remote"
+    remote_path.write_text("different remote content")
+    remote_repo_path = (
+        environment_repo_path if contract_kind == "environment" else collector_repo_path
+    )
+    monkeypatch.setattr(main, "CommitOperationAdd", lambda **kwargs: kwargs, raising=False)
+    monkeypatch.setattr(main, "hf_hub_download", lambda **_kwargs: str(remote_path), raising=False)
+
+    with pytest.raises(ValueError, match=f"Remote {contract_kind} contract conflict"):
+        main._contract_upload_operations(
+            {
+                "environment_contract_id": [environment_id],
+                "collector_contract_id": [collector_id],
+            },
+            local_root=str(tmp_path),
+            hf_repo_id="owner/dataset",
+            remote_files=[remote_repo_path],
+            revision="revision",
+        )
+
+
+@pytest.mark.parametrize("contract_kind", ["environment", "collector"])
+def test_contract_upload_operations_require_local_contract_artifacts(
+    tmp_path, contract_kind
+):
+    environment_id = "e" * 64
+    collector_id = "c" * 64
+    if contract_kind == "collector":
+        environment_path = (
+            tmp_path / "environments" / environment_id / "environment.json"
+        )
+        environment_path.parent.mkdir(parents=True)
+        environment_path.write_text("environment")
+
+    with pytest.raises(FileNotFoundError, match=f"Missing {contract_kind} contract"):
+        main._contract_upload_operations(
+            {
+                "environment_contract_id": [environment_id],
+                "collector_contract_id": [collector_id],
+            },
+            local_root=str(tmp_path),
+            hf_repo_id="owner/dataset",
+            remote_files=[],
+            revision="revision",
+        )
 
 
 def test_playback_requires_the_exact_recorded_provider_version(monkeypatch):
@@ -593,7 +686,6 @@ def test_recording_stores_exact_provider_transition(tmp_path):
     environment_contract = contract(session.effective_config)
     artifact = artifact_for(session, environment_contract)
     recorder = main.DatasetRecorderWrapper(
-        session.env,
         input_source=main.AgentInputSource(lambda _observation: 2),
         headless=True,
         storage_format=main.STORAGE_FORMAT_IMAGES,
@@ -620,7 +712,6 @@ def test_user_exit_preserves_partial_episode_without_fabricating_truncation():
     session.env = ContinuingEnv()
     artifact = artifact_for(session)
     recorder = main.DatasetRecorderWrapper(
-        session.env,
         input_source=main.AgentInputSource(lambda _observation: 2),
         headless=False,
         storage_format=main.STORAGE_FORMAT_IMAGES,
@@ -666,9 +757,12 @@ def test_removed_environment_specific_surfaces_do_not_return():
         "resolve_runtime_backend",
         "import_roms",
         "reindex_games",
+        "class inputsource",
+        "class basepolicy",
+        "agent_policy_factories",
+        "create_agent_policy",
     )
     assert [token for token in banned if token in source] == []
-    assert set(main.AGENT_POLICY_FACTORIES) == {"random"}
 
 
 @pytest.mark.parametrize(

@@ -17,9 +17,6 @@ import numpy as np
 CONTRACT_VERSION = 1
 STABLE_RETRO_PROVIDER_ID = "stable-retro-turbo"
 MARIO_TURBO_PROVIDER_ID = "supermariobrosnes-turbo"
-SUPPORTED_PROVIDER_IDS = frozenset(
-    {STABLE_RETRO_PROVIDER_ID, MARIO_TURBO_PROVIDER_ID}
-)
 BUILTIN_ACTION_SETS = {
     "simple": (
         (),
@@ -85,15 +82,13 @@ class SingleLaneEnv(gym.Env):
 
     metadata = {"render_modes": ["rgb_array"]}
 
-    def __init__(self, vector_env, *, system, buttons):
+    def __init__(self, vector_env):
         if int(vector_env.num_envs) != 1:
             raise ValueError("Gymrec providers require exactly one environment lane")
         self.vector_env = vector_env
         self.action_space = vector_env.single_action_space
         self.observation_space = vector_env.single_observation_space
         self.render_mode = "rgb_array"
-        self.system = str(system)
-        self.buttons = tuple(buttons)
         self._needs_reset = True
 
     def reset(self, *, seed=None, options=None):
@@ -213,7 +208,6 @@ def _normalize_policy_action(task):
 
 
 def _prepare_config(config):
-    declared = copy.deepcopy(dict(config))
     kwargs = copy.deepcopy(dict(config))
     task = kwargs.pop("task", None)
     policy_actions, effective_action = _normalize_policy_action(task)
@@ -222,7 +216,7 @@ def _prepare_config(config):
     effective = copy.deepcopy(kwargs)
     if effective_action is not None:
         effective["task"] = {"action": effective_action}
-    return declared, kwargs, policy_actions, effective
+    return kwargs, policy_actions, effective
 
 
 class ProviderSession:
@@ -233,7 +227,6 @@ class ProviderSession:
         *,
         provider_id,
         environment_id,
-        declared_config,
         effective_config,
         vector_env,
         system,
@@ -244,9 +237,8 @@ class ProviderSession:
     ):
         self.provider_id = provider_id
         self.environment_id = environment_id
-        self.declared_config = declared_config
         self.effective_config = effective_config
-        self.env = SingleLaneEnv(vector_env, system=system, buttons=buttons)
+        self.env = SingleLaneEnv(vector_env)
         self.control_profile = f"stable_retro.{system}"
         self.fps = max(float(fps), 1.0)
         self._buttons = tuple(
@@ -412,7 +404,7 @@ class StableRetroProvider:
         import stable_retro
         from stable_retro import data
 
-        declared, kwargs, policy_actions, effective = _prepare_config(config)
+        kwargs, policy_actions, effective = _prepare_config(config)
         state = kwargs.pop("state", stable_retro.State.DEFAULT)
         if "use_restricted_actions" in kwargs:
             kwargs["use_restricted_actions"] = _resolve_stable_enum(
@@ -470,7 +462,6 @@ class StableRetroProvider:
         return ProviderSession(
             provider_id=self.provider_id,
             environment_id=environment_id,
-            declared_config=declared,
             effective_config=effective,
             vector_env=vector_env,
             system=system,
@@ -535,7 +526,7 @@ class MarioTurboProvider:
             resolve_required_rom_path,
         )
 
-        declared, kwargs, policy_actions, effective = _prepare_config(config)
+        kwargs, policy_actions, effective = _prepare_config(config)
         state = kwargs.pop("state", "Level1-1")
         state_dir = kwargs.pop("state_dir", None)
         rom_path = resolve_required_rom_path(kwargs.get("rom_path"), environment_id)
@@ -551,7 +542,6 @@ class MarioTurboProvider:
         return ProviderSession(
             provider_id=self.provider_id,
             environment_id=environment_id,
-            declared_config=declared,
             effective_config=effective,
             vector_env=vector_env,
             system="Nes",
@@ -572,3 +562,4 @@ PROVIDERS = {
     STABLE_RETRO_PROVIDER_ID: StableRetroProvider(),
     MARIO_TURBO_PROVIDER_ID: MarioTurboProvider(),
 }
+SUPPORTED_PROVIDER_IDS = frozenset(PROVIDERS)

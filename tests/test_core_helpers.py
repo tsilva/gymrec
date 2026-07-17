@@ -20,7 +20,7 @@ TEST_ENVIRONMENT_CONTRACT_ID = "e" * 64
 def isolate_environment_artifacts(monkeypatch):
     """Legacy storage tests focus on storage mechanics; provider artifacts are tested separately."""
     monkeypatch.setattr(main, "_validate_environment_artifacts", lambda dataset, root, **kwargs: dataset)
-    monkeypatch.setattr(main, "_environment_upload_operations", lambda *args, **kwargs: [])
+    monkeypatch.setattr(main, "_contract_upload_operations", lambda *args, **kwargs: [])
 
 
 class DatasetLike:
@@ -424,6 +424,7 @@ def test_repo_recording_save_persists_identity_and_is_discoverable(temp_storage_
     main.save_dataset_locally(
         make_minimal_dataset(collector="hf://tsilva/SuperMarioBros-NES_Level1"),
         identity,
+        artifact_root=str(temp_storage_dir),
         metadata={"env_id": identity.env_id},
     )
 
@@ -819,7 +820,6 @@ def test_huggingface_policy_source_defaults_to_stochastic_actions():
         },
     }
     source = main.HFPolicySource(
-        ref="hf://tsilva/SuperMarioBros-Nes-v0_Level1-1",
         repo_id="tsilva/SuperMarioBros-Nes-v0_Level1-1",
         revision="main",
         checkpoint_filename="model.zip",
@@ -829,11 +829,7 @@ def test_huggingface_policy_source_defaults_to_stochastic_actions():
         release_manifest_path=None,
         model_document={
             "checkpoint": {"sha256": "checkpoint"},
-            "recipe": {"sha256": "recipe"},
         },
-        recipe_document={},
-        release_manifest_document=None,
-        evaluation={"action_sampling": "stochastic", "environment": environment},
         environment=environment,
     )
 
@@ -996,7 +992,6 @@ def test_resolve_huggingface_policy_validates_optional_release_manifest(tmp_path
     source = main.resolve_huggingface_policy_source("hf://tsilva/level1-1")
 
     assert source.release_manifest_path == files["release_manifest.json"]
-    assert source.release_manifest_document["document_type"] == "rlab.release_manifest"
 
 
 def test_resolve_huggingface_policy_rejects_inconsistent_release_manifest(tmp_path, monkeypatch):
@@ -1111,7 +1106,6 @@ def test_agent_recording_uses_sequential_recipe_seed_base():
             return 0
 
     recorder = main.DatasetRecorderWrapper(
-        env,
         input_source=main.AgentInputSource(SeededPolicy()),
         headless=True,
         storage_format=main.STORAGE_FORMAT_IMAGES,
@@ -1138,7 +1132,6 @@ def test_replay_resets_between_dataset_episodes():
         env = OneStepTerminalEnv()
         provider_session, environment_artifact = fake_provider_runtime(env)
         recorder = main.DatasetRecorderWrapper(
-            env,
             headless=True,
             storage_format=main.STORAGE_FORMAT_IMAGES,
             provider_session=provider_session,
@@ -1534,6 +1527,26 @@ def test_live_upload_retry_uses_manifest_fps(temp_storage_dir, monkeypatch):
     assert calls[0]["fps"] == 37
 
 
+def test_failed_live_episode_prints_retry_command_from_recording_identity(monkeypatch):
+    messages = []
+    manager = argparse.Namespace(
+        identity=main.RecordingIdentity(env_id="BreakoutNoFrameskip-v4"),
+        upload_episode=lambda _package, _dataset: False,
+    )
+    recorder = object.__new__(main.DatasetRecorderWrapper)
+    recorder.live_upload_manager = manager
+    recorder._recording_rows = [{}]
+    recorder._live_episode = main.LiveEpisodePackage("episode", "/tmp/package")
+    recorder._build_recorded_dataset = lambda: object()
+    recorder._clear_recording_buffers = lambda: None
+    monkeypatch.setattr(main.console, "print", lambda message: messages.append(message))
+
+    recorder._finish_live_episode()
+
+    assert "gymrec upload BreakoutNoFrameskip-v4" in messages[0]
+    assert recorder._live_episode is None
+
+
 def test_upload_uses_remote_episode_ids_when_local_marker_is_stale(temp_storage_dir, monkeypatch):
     episode_uuid = uuid.uuid4()
     dataset = make_minimal_dataset(episode_uuid=episode_uuid)
@@ -1830,11 +1843,13 @@ def test_save_dataset_metadata_recordings_count_only_new_batch(temp_storage_dir)
     main.save_dataset_locally(
         make_minimal_dataset(collector="random"),
         "BreakoutNoFrameskip-v4",
+        artifact_root=str(temp_storage_dir),
         metadata={"env_id": "BreakoutNoFrameskip-v4"},
     )
     main.save_dataset_locally(
         make_minimal_dataset(collector="human"),
         "BreakoutNoFrameskip-v4",
+        artifact_root=str(temp_storage_dir),
         metadata={"env_id": "BreakoutNoFrameskip-v4"},
     )
 
