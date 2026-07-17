@@ -54,6 +54,26 @@ uv run gymrec minari-export SuperMarioBros-Nes-v0
 
 Run `gymrec <command> --help` for the complete option surface. ROM importing and environment indexing belong to the provider packages; gymrec has no `--roms-path`, `import_roms`, `reindex_games`, or backend override.
 
+## Interactive selection
+
+Run `gymrec` or omit the environment from `gymrec record` to open the searchable
+environment selector. Omitting the recording from `gymrec playback` or
+`gymrec video` opens the same selector for locally available and Hugging Face
+recordings.
+
+- Start typing to fuzzy-search environment names, providers, or recording refs.
+- Press `/` to return focus to search.
+- Use Arrow keys, Page Up/Down, Home/End, or Tab to navigate.
+- Press Enter or click a result to select it; press Escape to cancel.
+
+Provider badges remain part of the selection identity. When multiple providers
+expose the same environment ID, such as `SuperMarioBros-Nes-v0`, they remain
+separate choices. Passing an explicit environment and `--provider` bypasses the
+selector entirely.
+
+Limited terminals use a compact searchable text menu that shows at most 25
+matches. Set `GYMREC_TEXT_MENU=1` to force this fallback.
+
 ## Policy environment contract
 
 Policy recording requires an explicit `recipe.eval.environment` object:

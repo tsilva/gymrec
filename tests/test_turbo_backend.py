@@ -150,6 +150,248 @@ def test_provider_discovery_uses_only_gymrecs_two_internal_adapters():
         provider_contract.load_provider("third-party-provider")
 
 
+def test_provider_catalog_reports_progress_around_each_provider(monkeypatch):
+    class CatalogProvider:
+        def __init__(self, *environment_ids):
+            self.environment_ids = environment_ids
+
+        def catalog(self):
+            return self.environment_ids
+
+    class FakeProgress:
+        def __init__(self):
+            self.descriptions = []
+            self.advances = []
+
+        def update(self, task_id, *, description, refresh):
+            self.descriptions.append((task_id, description, refresh))
+
+        def advance(self, task_id):
+            self.advances.append(task_id)
+
+    monkeypatch.setattr(
+        main,
+        "discover_providers",
+        lambda: {
+            "provider-a": CatalogProvider("GameA-v0", "GameB-v0"),
+            "provider-b": CatalogProvider("GameC-v0"),
+        },
+    )
+    monkeypatch.setattr(
+        main, "SUPPORTED_PROVIDER_IDS", frozenset({"provider-a", "provider-b"})
+    )
+    progress = FakeProgress()
+
+    rows = main._provider_catalog(progress=progress, task_id=7)
+
+    assert rows == [
+        ("provider-a", "GameA-v0"),
+        ("provider-a", "GameB-v0"),
+        ("provider-b", "GameC-v0"),
+    ]
+    assert [description for _, description, _ in progress.descriptions] == [
+        "[bold]Scanning provider-a environments[/]",
+        "[bold]Scanning provider-b environments[/]",
+    ]
+    assert progress.advances == [7, 7]
+
+
+def test_provider_catalog_progress_starts_before_lazy_initialization(monkeypatch):
+    events = []
+
+    class FakeProgress:
+        def __enter__(self):
+            events.append("enter")
+            return self
+
+        def __exit__(self, *_args):
+            events.append("exit")
+
+        def add_task(self, description, *, total):
+            events.append(("add", description, total))
+            return 3
+
+        def refresh(self):
+            events.append("refresh")
+
+        def update(self, task_id, **kwargs):
+            events.append(("update", task_id, kwargs))
+
+    progress = FakeProgress()
+    monkeypatch.setattr(main, "_episode_progress", lambda transient: progress)
+    monkeypatch.setattr(main, "_lazy_init", lambda: events.append("initialize"))
+
+    def fake_catalog(*, progress, task_id):
+        events.append(("catalog", progress, task_id))
+        return [("provider-a", "GameA-v0")]
+
+    monkeypatch.setattr(main, "_provider_catalog", fake_catalog)
+
+    assert main._load_provider_catalog_with_progress() == [
+        ("provider-a", "GameA-v0")
+    ]
+    assert events[:4] == [
+        "enter",
+        ("add", "[bold]Initializing Gymrec[/]", 3),
+        "refresh",
+        "initialize",
+    ]
+    assert events[5] == ("catalog", progress, 3)
+
+
+def test_environment_choices_keep_duplicate_ids_provider_qualified():
+    choices = main._environment_selection_choices(
+        [
+            ("stable-retro-turbo", "SuperMarioBros-Nes-v0"),
+            ("supermariobrosnes-turbo", "SuperMarioBros-Nes-v0"),
+        ]
+    )
+
+    assert [choice.key for choice in choices] == ["environment:0", "environment:1"]
+    assert [choice.exact_value for choice in choices] == [
+        "stable-retro-turbo:SuperMarioBros-Nes-v0",
+        "supermariobrosnes-turbo:SuperMarioBros-Nes-v0",
+    ]
+    assert [choice.value for choice in choices] == [
+        ("stable-retro-turbo", "SuperMarioBros-Nes-v0"),
+        ("supermariobrosnes-turbo", "SuperMarioBros-Nes-v0"),
+    ]
+
+
+def test_recording_choices_merge_local_and_hub_origins():
+    choices = main._recording_selection_choices(
+        ["SuperMarioBros-Nes-v0", "hf://owner/policy-data"],
+        ["SuperMarioBros-Nes-v0", "hf://owner/remote-only"],
+    )
+
+    by_label = {choice.label: choice for choice in choices}
+    assert by_label["SuperMarioBros-Nes-v0"].category == "Local + Hub"
+    assert by_label["hf://owner/policy-data"].category == "Local"
+    assert by_label["hf://owner/remote-only"].category == "Hub"
+
+
+def test_text_fallback_requires_provider_for_ambiguous_exact_id(monkeypatch):
+    choices = main._environment_selection_choices(
+        [
+            ("stable-retro-turbo", "SuperMarioBros-Nes-v0"),
+            ("supermariobrosnes-turbo", "SuperMarioBros-Nes-v0"),
+        ]
+    )
+    answers = iter(["SuperMarioBros-Nes-v0", "2"])
+    monkeypatch.setattr(main.sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(main.Prompt, "ask", lambda *_args, **_kwargs: next(answers))
+
+    selected = main._select_choice_text_fallback(
+        choices,
+        title="Select an environment",
+        argument_name="the environment ID and --provider",
+    )
+
+    assert selected == ("supermariobrosnes-turbo", "SuperMarioBros-Nes-v0")
+
+
+def test_text_fallback_accepts_provider_qualified_id(monkeypatch):
+    choices = main._environment_selection_choices(
+        [("stable-retro-turbo", "SonicTheHedgehog-Genesis-v0")]
+    )
+    monkeypatch.setattr(main.sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(
+        main.Prompt,
+        "ask",
+        lambda *_args, **_kwargs: "stable-retro-turbo:SonicTheHedgehog-Genesis-v0",
+    )
+
+    selected = main._select_choice_text_fallback(
+        choices,
+        title="Select an environment",
+        argument_name="the environment ID and --provider",
+    )
+
+    assert selected == ("stable-retro-turbo", "SonicTheHedgehog-Genesis-v0")
+
+
+def test_noninteractive_selector_requires_explicit_id(monkeypatch):
+    choices = main._environment_selection_choices(
+        [("stable-retro-turbo", "SonicTheHedgehog-Genesis-v0")]
+    )
+    monkeypatch.setattr(main.sys.stdin, "isatty", lambda: False)
+
+    with pytest.raises(ValueError, match="pass the environment ID and --provider explicitly"):
+        main._select_choice_text_fallback(
+            choices,
+            title="Select an environment",
+            argument_name="the environment ID and --provider",
+        )
+
+
+def test_text_fallback_turns_eof_into_an_explicit_id_error(monkeypatch):
+    choices = main._environment_selection_choices(
+        [("stable-retro-turbo", "SonicTheHedgehog-Genesis-v0")]
+    )
+    monkeypatch.setattr(main.sys.stdin, "isatty", lambda: True)
+
+    def end_input(*_args, **_kwargs):
+        raise EOFError
+
+    monkeypatch.setattr(main.Prompt, "ask", end_input)
+
+    with pytest.raises(ValueError, match="selection ended.*pass the environment ID"):
+        main._select_choice_text_fallback(
+            choices,
+            title="Select an environment",
+            argument_name="the environment ID and --provider",
+        )
+
+
+def test_text_menu_environment_variable_forces_fallback(monkeypatch):
+    monkeypatch.setenv("GYMREC_TEXT_MENU", "1")
+    monkeypatch.setenv("TERM", "xterm-256color")
+
+    assert not main._terminal_tui_supported()
+
+
+def test_async_selector_maps_opaque_tui_key_to_domain_value(monkeypatch):
+    import gymrec_tui
+
+    choices = main._environment_selection_choices(
+        [("stable-retro-turbo", "SonicTheHedgehog-Genesis-v0")]
+    )
+    monkeypatch.setattr(main, "_terminal_tui_supported", lambda: True)
+
+    async def choose(items, **_kwargs):
+        assert items == choices
+        return "environment:0"
+
+    monkeypatch.setattr(gymrec_tui, "select_item", choose)
+
+    selected = asyncio.run(
+        main._select_choice(
+            choices,
+            title="Select an environment",
+            placeholder="Search",
+            argument_name="the environment ID and --provider",
+        )
+    )
+
+    assert selected == ("stable-retro-turbo", "SonicTheHedgehog-Genesis-v0")
+
+
+def test_main_returns_normally_when_interactive_selector_is_cancelled(monkeypatch):
+    monkeypatch.setattr(main.sys, "argv", ["gymrec"])
+
+    async def cancel(_available_recordings_only=False):
+        return None
+
+    monkeypatch.setattr(main, "select_environment_interactive", cancel)
+    monkeypatch.setattr(
+        main,
+        "_lazy_init",
+        lambda: pytest.fail("cancellation must not continue initialization"),
+    )
+
+    asyncio.run(main.main())
+
+
 def test_provider_contract_rejects_legacy_and_extra_fields():
     with pytest.raises(ValueError, match="invalid envelope"):
         provider_contract.EnvironmentContract.parse(

@@ -5483,16 +5483,61 @@ def create_environment_session(contract, *, render_mode):
     return session, artifact
 
 
-def _provider_catalog():
+def _provider_catalog(*, progress=None, task_id=None):
     providers = discover_providers()
     rows = []
     for provider_id in sorted(SUPPORTED_PROVIDER_IDS):
+        if progress is not None:
+            label = PROVIDER_LABELS.get(provider_id, provider_id)
+            progress.update(
+                task_id,
+                description=f"[bold]Scanning {label} environments[/]",
+                refresh=True,
+            )
         provider = providers.get(provider_id)
-        if provider is None:
-            continue
-        for environment_id in provider.catalog():
-            rows.append((provider_id, str(environment_id)))
+        if provider is not None:
+            for environment_id in provider.catalog():
+                rows.append((provider_id, str(environment_id)))
+        if progress is not None:
+            progress.advance(task_id)
     return rows
+
+
+def _load_provider_catalog_with_progress():
+    """Initialize Gymrec and visibly discover the installed environment catalog."""
+    with _episode_progress(transient=True) as progress:
+        task_id = progress.add_task(
+            "[bold]Initializing Gymrec[/]",
+            total=1 + len(SUPPORTED_PROVIDER_IDS),
+        )
+        # Paint the initial state before imports or provider discovery can block.
+        progress.refresh()
+        _lazy_init()
+        progress.update(task_id, advance=1, refresh=True)
+        rows = _provider_catalog(progress=progress, task_id=task_id)
+        progress.update(
+            task_id,
+            description=f"[bold]Found {len(rows)} environments[/]",
+            refresh=True,
+        )
+    return rows
+
+
+def _load_recording_refs_with_progress():
+    """Discover local and Hub recordings with visible phase feedback."""
+    with _episode_progress(transient=True) as progress:
+        task_id = progress.add_task("[bold]Searching local recordings[/]", total=2)
+        progress.refresh()
+        local_refs = _get_available_recording_refs_from_local()
+        progress.update(
+            task_id,
+            advance=1,
+            description="[bold]Searching Hugging Face Hub recordings[/]",
+            refresh=True,
+        )
+        hub_refs = _get_available_recording_refs_from_hf()
+        progress.update(task_id, advance=1, refresh=True)
+    return local_refs, hub_refs
 
 
 def _manual_environment_contract(provider_id, environment_id, config=None):
@@ -5518,56 +5563,187 @@ def _manual_environment_contract(provider_id, environment_id, config=None):
     )
 
 
-def _select_numbered(options, *, title):
-    if not options:
-        raise ValueError(f"No {title.lower()} are available")
-    console.print(f"[{STYLE_INFO}]{title}[/]")
-    for index, (label, _value) in enumerate(options, start=1):
-        console.print(f"  [{STYLE_PATH}]{index:>2}[/]  {label}")
-    while True:
-        value = Prompt.ask("Select", default="1")
-        try:
-            selected = int(value)
-        except ValueError:
-            selected = 0
-        if 1 <= selected <= len(options):
-            return options[selected - 1][1]
-        console.print(f"[{STYLE_FAIL}]Enter a number from 1 to {len(options)}.[/]")
+@dataclass(frozen=True)
+class SelectionChoice:
+    """One presentation-neutral item and its domain value."""
+
+    key: str
+    category: str
+    label: str
+    search_text: str
+    exact_value: str
+    value: object
 
 
-def select_environment_interactive(available_recordings_only=False):
-    if available_recordings_only:
-        refs = _get_available_recording_refs_from_local() + _get_available_recording_refs_from_hf()
-        unique = {}
+def _environment_selection_choices(rows):
+    choices = []
+    for index, (provider_id, environment_id) in enumerate(rows):
+        category = PROVIDER_LABELS.get(provider_id, provider_id)
+        choices.append(
+            SelectionChoice(
+                key=f"environment:{index}",
+                category=category,
+                label=environment_id,
+                search_text=f"{category} {provider_id} {environment_id}",
+                exact_value=f"{provider_id}:{environment_id}",
+                value=(provider_id, environment_id),
+            )
+        )
+    return choices
+
+
+def _recording_selection_choices(local_refs, hub_refs):
+    discovered = {}
+    for origin, refs in (("Local", local_refs), ("Hub", hub_refs)):
         for ref in refs:
             identity = _coerce_recording_identity(ref)
-            unique[identity.display_ref] = identity.display_ref
-        return _select_numbered(
-            [(label, value) for label, value in sorted(unique.items())],
-            title="Available recordings",
+            entry = discovered.setdefault(
+                identity.display_ref,
+                {"value": identity.display_ref, "origins": set()},
+            )
+            entry["origins"].add(origin)
+
+    choices = []
+    for index, display_ref in enumerate(sorted(discovered)):
+        entry = discovered[display_ref]
+        origins = entry["origins"]
+        category = "Local + Hub" if len(origins) > 1 else next(iter(origins))
+        choices.append(
+            SelectionChoice(
+                key=f"recording:{index}",
+                category=category,
+                label=display_ref,
+                search_text=f"{category} {display_ref}",
+                exact_value=display_ref,
+                value=entry["value"],
+            )
         )
-    rows = _provider_catalog()
-    return _select_numbered(
-        [
-            (f"{PROVIDER_LABELS.get(provider_id, provider_id)}: {environment_id}", (provider_id, environment_id))
-            for provider_id, environment_id in rows
-        ],
-        title="Available environments",
+    return choices
+
+
+def _terminal_tui_supported():
+    if os.environ.get("GYMREC_TEXT_MENU", "").lower() in {"1", "true", "yes"}:
+        return False
+    if os.environ.get("TERM") in {None, "", "dumb"}:
+        return False
+    size = shutil.get_terminal_size(fallback=(0, 0))
+    return (
+        sys.stdin.isatty()
+        and sys.stdout.isatty()
+        and size.columns >= 60
+        and size.lines >= 16
+    )
+
+
+def _choice_label(choice):
+    return f"{choice.category}: {choice.label}"
+
+
+def _select_choice_text_fallback(choices, *, title, argument_name):
+    if not sys.stdin.isatty():
+        raise ValueError(
+            f"Interactive {title.lower()} selection requires a terminal; "
+            f"pass {argument_name} explicitly"
+        )
+
+    console.print(
+        f"[{STYLE_INFO}]{title}[/]: {len(choices)} available\n"
+        "[dim]Type part of a name to search, a provider-qualified ID, or a shown number. "
+        "Press Enter to cancel.[/]"
+    )
+    matches = list(choices[:25])
+    while True:
+        for index, choice in enumerate(matches, start=1):
+            console.print(f"  [{STYLE_PATH}]{index:>2}[/]  {_choice_label(choice)}")
+        try:
+            query = Prompt.ask("Search or select", default="").strip()
+        except EOFError as exc:
+            raise ValueError(
+                f"Interactive selection ended before a choice was made; "
+                f"pass {argument_name} explicitly"
+            ) from exc
+        if not query:
+            return None
+        if query.isdigit():
+            selected = int(query)
+            if 1 <= selected <= len(matches):
+                return matches[selected - 1].value
+
+        query_lower = query.lower()
+        qualified = [
+            choice for choice in choices if choice.exact_value.lower() == query_lower
+        ]
+        if len(qualified) == 1:
+            return qualified[0].value
+        bare = [choice for choice in choices if choice.label.lower() == query_lower]
+        if len(bare) == 1:
+            return bare[0].value
+
+        matches = [
+            choice
+            for choice in choices
+            if query_lower in choice.search_text.lower()
+        ][:25]
+        if not matches:
+            console.print(f"[{STYLE_FAIL}]No matches. Try a shorter search.[/]")
+
+
+async def _select_choice(choices, *, title, placeholder, argument_name):
+    if not choices:
+        raise ValueError(f"No choices are available for {title.lower()}")
+    if not _terminal_tui_supported():
+        return _select_choice_text_fallback(
+            choices,
+            title=title,
+            argument_name=argument_name,
+        )
+
+    from gymrec_tui import select_item
+
+    selected_key = await select_item(
+        choices,
+        title=title,
+        placeholder=placeholder,
+    )
+    if selected_key is None:
+        return None
+    values = {choice.key: choice.value for choice in choices}
+    try:
+        return values[selected_key]
+    except KeyError as exc:
+        raise RuntimeError("The interactive selector returned an unknown choice") from exc
+
+
+async def select_environment_interactive(available_recordings_only=False):
+    if available_recordings_only:
+        local_refs, hub_refs = _load_recording_refs_with_progress()
+        return await _select_choice(
+            _recording_selection_choices(local_refs, hub_refs),
+            title="Select a recording",
+            placeholder="Search local and Hub recordings",
+            argument_name="the recording ID",
+        )
+
+    rows = _load_provider_catalog_with_progress()
+    return await _select_choice(
+        _environment_selection_choices(rows),
+        title="Select an environment",
+        placeholder="Search environments or providers",
+        argument_name="the environment ID and --provider",
     )
 
 
 def list_environments():
-    _lazy_init()
-    providers = discover_providers()
+    rows = _load_provider_catalog_with_progress()
     table = Table(title="Supported Environment Providers")
     table.add_column("Provider", style=STYLE_ENV)
     table.add_column("Environment", style=STYLE_PATH)
     for provider_id in sorted(SUPPORTED_PROVIDER_IDS):
-        provider = providers.get(provider_id)
-        if provider is None:
-            table.add_row(provider_id, "[red]provider contract not installed[/]")
-            continue
-        environments = tuple(provider.catalog())
+        environments = tuple(
+            environment_id
+            for candidate_provider_id, environment_id in rows
+            if candidate_provider_id == provider_id
+        )
         if not environments:
             table.add_row(provider_id, "[dim]no environments available[/]")
         for environment_id in environments:
@@ -5824,17 +6000,18 @@ async def main():
         ensure_hf_login(force=True)
         return
     if args.command == "list_environments":
-        _lazy_init()
         list_environments()
         return
 
     selected_provider = None
     selected = getattr(args, "env_id", None)
     if selected is None:
-        _lazy_init()
-        selected = select_environment_interactive(
-            available_recordings_only=args.command in {"playback", "video"}
-        )
+        available_recordings_only = args.command in {"playback", "video"}
+        if available_recordings_only:
+            _lazy_init()
+        selected = await select_environment_interactive(available_recordings_only)
+        if selected is None:
+            return
         if isinstance(selected, tuple):
             selected_provider, selected = selected
 
