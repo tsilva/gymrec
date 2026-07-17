@@ -47,14 +47,14 @@ CLI help (`gymrec --help` and `gymrec <command> --help`) is the authoritative op
 ### Dataset Contract
 
 - Naming convention: `{username}/gymrec__{encoded_env_id}`, with reversible `_slash_`, `_dash_`, and `_underscore_` encoding.
-- Generic fields include `episode_id`, `step_index`, `seed`, `actions`, `policy_actions`, `rewards`, `terminations`, `truncations`, `infos`, `session_id`, `dataset_format_version`, `collector`, `gymrec_version`, `storage_format`, `provider_id`, `env_id`, `environment_contract_id`, `collector_contract_id`, `policy_mode`, and `policy_seed`.
+- Generic fields include `episode_id`, `step_index`, `seed`, `actions`, `policy_actions`, `rewards`, `terminations`, `truncations`, `infos`, `session_id`, `dataset_format_version`, `collector`, `gymrec_version`, `storage_format`, `provider_id`, `env_id`, `environment_contract_id`, `collector_contract_id`, `policy_mode`, `policy_seed`, and `collector_terminated`.
 - Image storage adds `observations`; video storage adds `video_path`, `frame_sha256`, `frame_width`, and `frame_height`.
 - Immutable environment documents live at `environments/<environment_contract_id>/environment.json`; standardized policy documents live at `collectors/<collector_contract_id>/`.
 - The schema is a clean break. Reject legacy datasets, legacy policy recipes, missing provider versions, altered assets, and unsupported providers instead of adding compatibility fallbacks.
 
 ## Human Controls
 
-- Space starts recording and Escape exits.
+- Space starts recording. Escape exits and preserves recorded steps as a collector-terminated trajectory segment without changing provider termination or truncation values.
 - `keymappings.toml` maps keyboard events to named labels.
 - The provider advertises a compatible profile and converts active labels to its native action.
 - Keep named-control construction shared; isolate unavoidable native action-space differences inside `providers.py`.

@@ -107,14 +107,25 @@ Each row contains generic provenance:
 - `env_id`
 - `environment_contract_id`
 - `collector_contract_id` for policy recordings
+- `collector_terminated`, which is true only on the final observation row when
+  collection stopped before the provider terminated or truncated the trajectory
 
 The immutable environment document is stored at `environments/<environment_contract_id>/environment.json`. It binds the runtime package version, declared and effective configuration, Gymrec-computed asset provenance, action and observation spaces, control profile, and FPS. Playback requires the exact recorded runtime version and asset provenance.
 
-Dataset format version 2 is a clean break. Legacy schemas and legacy policy environment shapes are rejected rather than migrated or aligned.
+Provider termination and truncation values are never rewritten. Pressing Escape
+preserves the current N+1 trajectory segment and marks its final observation with
+`collector_terminated=true`; it does not fabricate an environment truncation.
+Minari export rejects such segments because Minari cannot represent that boundary
+without changing the provider contract.
+
+Dataset format version 3 is a clean break. Legacy schemas and legacy policy environment shapes are rejected rather than migrated or aligned.
 
 ## Human controls
 
 gymrec owns keyboard event handling and the named control profiles in `keymappings.toml`. Its internal provider advertises a profile and translates the active labels into the runtime's native action. Human mode fails clearly if either side does not provide a compatible profile.
+
+Space starts recording. Escape exits and preserves any steps already collected as
+a collector-terminated trajectory segment.
 
 ## Development
 

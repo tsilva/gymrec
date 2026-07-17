@@ -219,6 +219,7 @@ def make_minimal_dataset(episode_uuid=None, collector="random"):
             "collector_contract_id": [None] * 2,
             "policy_mode": [None] * 2,
             "policy_seed": [None] * 2,
+            "collector_terminated": [False, False],
             "observations": [
                 np.zeros((1, 1, 3), dtype=np.uint8),
                 np.ones((1, 1, 3), dtype=np.uint8),
@@ -267,6 +268,33 @@ def test_canonical_schema_requires_complete_transition_rows():
     dataset = main._recording_dataset_from_dict(data, main.STORAGE_FORMAT_IMAGES)
 
     with pytest.raises(ValueError, match="null transition fields: infos"):
+        main._validate_canonical_dataset_schema(dataset)
+
+
+def test_canonical_schema_accepts_collector_terminated_trajectory():
+    data = make_minimal_dataset().to_dict()
+    data["terminations"][0] = False
+    data["collector_terminated"][-1] = True
+    dataset = main._recording_dataset_from_dict(data, main.STORAGE_FORMAT_IMAGES)
+
+    assert main._validate_canonical_dataset_schema(dataset) is dataset
+
+
+def test_canonical_schema_requires_an_explicit_trajectory_boundary():
+    data = make_minimal_dataset().to_dict()
+    data["terminations"][0] = False
+    dataset = main._recording_dataset_from_dict(data, main.STORAGE_FORMAT_IMAGES)
+
+    with pytest.raises(ValueError, match="must be true when the provider did not end"):
+        main._validate_canonical_dataset_schema(dataset)
+
+
+def test_canonical_schema_rejects_collector_flag_after_provider_boundary():
+    data = make_minimal_dataset().to_dict()
+    data["collector_terminated"][-1] = True
+    dataset = main._recording_dataset_from_dict(data, main.STORAGE_FORMAT_IMAGES)
+
+    with pytest.raises(ValueError, match="must be false after a provider"):
         main._validate_canonical_dataset_schema(dataset)
 
 
@@ -1169,6 +1197,20 @@ def test_materialize_dataset_replay_streams_image_rows(tmp_path):
     assert main._verify_browser_preview_video(output_path)["frames"] == 2
 
 
+def test_materialize_dataset_replay_accepts_collector_terminated_trajectory(tmp_path):
+    if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
+        pytest.skip("ffmpeg/ffprobe not available")
+    data = make_minimal_dataset().to_dict()
+    data["terminations"][0] = False
+    data["collector_terminated"][-1] = True
+    dataset = main._recording_dataset_from_dict(data, main.STORAGE_FORMAT_IMAGES)
+    output_path = tmp_path / main.DATASET_REPLAY_FILENAME
+
+    main._materialize_dataset_replay(dataset, str(tmp_path), str(output_path), fps=30)
+
+    assert main._verify_browser_preview_video(output_path)["frames"] == 2
+
+
 def test_materialize_dataset_replay_skips_incomplete_first_episode(tmp_path):
     if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
         pytest.skip("ffmpeg/ffprobe not available")
@@ -1532,7 +1574,7 @@ def test_first_upload_adds_replay_card_and_data_in_one_commit(tmp_path, monkeypa
     assert "/datasets/owner/repo/resolve/main/replay.mp4" in card
     assert "pipeline_tag" not in card
     assert "| Total frames | 2 |" in card
-    assert "| Episodes | 1 |" in card
+    assert "| Trajectories | 1 |" in card
 
 
 def test_append_preserves_existing_root_replay(tmp_path, monkeypatch):
@@ -1566,7 +1608,7 @@ def test_append_preserves_existing_root_replay(tmp_path, monkeypatch):
     assert main.DATASET_REPLAY_FILENAME not in commit["contents"]
     card = commit["contents"]["README.md"].decode()
     assert "| Total frames | 12 |" in card
-    assert "| Episodes | 3 |" in card
+    assert "| Trajectories | 3 |" in card
 
 
 def test_replace_regenerates_replay_and_uses_replacement_counts(tmp_path, monkeypatch):
@@ -1611,7 +1653,7 @@ def test_replace_regenerates_replay_and_uses_replacement_counts(tmp_path, monkey
     }
     card = commit["contents"]["README.md"].decode()
     assert "| Total frames | 2 |" in card
-    assert "| Episodes | 1 |" in card
+    assert "| Trajectories | 1 |" in card
     assert "| Total frames | 12 |" not in card
 
 
@@ -1790,7 +1832,7 @@ def test_save_dataset_metadata_recordings_count_only_new_batch(temp_storage_dir)
     }
 
 
-def test_recover_live_image_journal_adds_truncated_terminal_row(tmp_path):
+def test_recover_live_image_journal_adds_collector_terminal_row(tmp_path):
     main._lazy_init()
     episode_id = uuid.uuid4().hex
     session_id = uuid.uuid4().hex
@@ -1831,10 +1873,11 @@ def test_recover_live_image_journal_adds_truncated_terminal_row(tmp_path):
     assert len(dataset) == 2
     assert dataset["actions"] == [0, None]
     assert dataset["step_index"] == [0, 1]
-    assert dataset["truncations"] == [True, None]
+    assert dataset["truncations"] == [False, None]
+    assert dataset["collector_terminated"] == [False, True]
 
 
-def test_recover_live_video_journal_appends_terminal_candidate(tmp_path):
+def test_recover_live_video_journal_appends_collector_terminal_candidate(tmp_path):
     if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
         pytest.skip("ffmpeg/ffprobe not available")
     main._lazy_init()
@@ -1885,7 +1928,8 @@ def test_recover_live_video_journal_appends_terminal_candidate(tmp_path):
 
     assert len(dataset) == 2
     assert dataset["step_index"] == [0, 1]
-    assert dataset["truncations"] == [True, None]
+    assert dataset["truncations"] == [False, None]
+    assert dataset["collector_terminated"] == [False, True]
     main._verify_lossless_rgb_video_stream(
         str(video_path),
         2,

@@ -202,7 +202,7 @@ DEFAULT_CONFIG = {
 CONFIG = None
 
 PROVIDER_LABELS = {
-    "stable-retro-turbo": "Stable-Retro TurboVecEnv",
+    "stable-retro-turbo": "stable-retro-turbo",
     "supermariobrosnes-turbo": "SuperMarioBros-Nes-turbo",
 }
 
@@ -228,7 +228,7 @@ ENVIRONMENT_ARTIFACT_DIR = "environments"
 ENVIRONMENT_DOCUMENT_FILENAME = "environment.json"
 COLLECTION_DOCUMENT_TYPE = "gymrec.collection"
 COLLECTION_FORMAT_VERSION = 2
-DATASET_FORMAT_VERSION = 2
+DATASET_FORMAT_VERSION = 3
 PREVIEW_VIDEO_ARTIFACT_DIR = "videos"
 CANONICAL_VIDEO_SUFFIX = ".rgb.mkv.bin"
 PREVIEW_VIDEO_SUFFIX = ".preview.mp4"
@@ -1915,6 +1915,12 @@ COMMON_DATASET_FIELDS = (
         "policy_mode", "string or null", "Deterministic or stochastic policy mode", "string"
     ),
     DatasetField("policy_seed", "int64 or null", "Episode policy seed", "int64"),
+    DatasetField(
+        "collector_terminated",
+        "bool",
+        "True only on the final observation row when collection stopped before a provider boundary",
+        "bool",
+    ),
 )
 
 IMAGE_DATASET_FIELDS = (
@@ -2044,8 +2050,19 @@ def _validate_canonical_dataset_schema(dataset, *, label="dataset"):
                 f"{label} episode {episode_key} terminal-observation row has non-null "
                 f"transition fields: {', '.join(non_null_terminal_fields)}"
             )
+        collector_terminated = terminal_row.get("collector_terminated")
+        if not isinstance(collector_terminated, bool):
+            raise ValueError(
+                f"{label} episode {episode_key} terminal-observation row must declare "
+                "collector_terminated as a boolean"
+            )
         for row_index in row_indices[:-1]:
             row = dataset[row_index]
+            if row.get("collector_terminated") is not False:
+                raise ValueError(
+                    f"{label} episode {episode_key} step {row.get('step_index')} must set "
+                    "collector_terminated to false"
+                )
             missing_transition_fields = sorted(
                 field
                 for field in ("actions", "rewards", "terminations", "truncations", "infos")
@@ -2056,6 +2073,21 @@ def _validate_canonical_dataset_schema(dataset, *, label="dataset"):
                     f"{label} episode {episode_key} step {row.get('step_index')} has null "
                     f"transition fields: {', '.join(missing_transition_fields)}"
                 )
+        if len(row_indices) < 2:
+            raise ValueError(f"{label} episode {episode_key} has no recorded transitions")
+        final_transition = dataset[row_indices[-2]]
+        provider_ended = bool(final_transition.get("terminations")) or bool(
+            final_transition.get("truncations")
+        )
+        if collector_terminated == provider_ended:
+            expected = (
+                "false after a provider termination or truncation"
+                if provider_ended
+                else "true when the provider did not end the trajectory"
+            )
+            raise ValueError(
+                f"{label} episode {episode_key} collector_terminated must be {expected}"
+            )
     return dataset
 
 
@@ -2352,6 +2384,7 @@ class DatasetRecorderWrapper(gym.Wrapper):
             collector_contract_id=contract.contract_id if contract else None,
             policy_mode=contract.policy_mode if contract else None,
             policy_seed=self._current_policy_seed if contract else None,
+            collector_terminated=False,
         )
 
     def _build_recorded_dataset(self):
@@ -2556,7 +2589,9 @@ class DatasetRecorderWrapper(gym.Wrapper):
         )
         self._recording_rows.append(row)
 
-    def _record_terminal_observation(self, episode_uuid, step_index, frame):
+    def _record_terminal_observation(
+        self, episode_uuid, step_index, frame, *, collector_terminated=False
+    ):
         """Record a terminal observation row (Minari N+1 pattern).
 
         The N+1 observation captures the final state after the last step.
@@ -2575,6 +2610,7 @@ class DatasetRecorderWrapper(gym.Wrapper):
                 "terminations": None,
                 "truncations": None,
                 "infos": None,
+                "collector_terminated": bool(collector_terminated),
                 **self._record_observation(episode_uuid, frame),
             }
         )
@@ -2956,21 +2992,20 @@ class DatasetRecorderWrapper(gym.Wrapper):
                 step = 0
                 self._render_frame(_recording_observation(self.provider_session, obs))
 
-        # A user exit is not an environment boundary. Discard the partial episode
-        # instead of inventing a gymrec-owned truncation.
+        # A user exit is a collector boundary, not an environment boundary. Keep
+        # the useful trajectory segment without changing the provider's exact
+        # termination or truncation values.
         if (
             self.recording
             and self._recording_rows
             and self._recording_rows[-1]["actions"] is not None
         ):
-            incomplete_episode_id = str(self._current_episode_uuid)
-            self._recording_rows = [
-                row
-                for row in self._recording_rows
-                if row["episode_id"] != incomplete_episode_id
-            ]
-            self._current_episode_video_frames.clear()
-            self._current_episode_video_hashes.clear()
+            self._record_terminal_observation(
+                self._current_episode_uuid,
+                step,
+                _recording_observation(self.provider_session, obs),
+                collector_terminated=True,
+            )
 
         if self._live_episode is not None:
             if self._live_video_writer is not None:
@@ -4192,7 +4227,7 @@ def _remote_dataset_publication_needs_repair(repo_id, revision, remote_files):
 
 
 def _materialize_dataset_replay(dataset, local_root, output_path, fps):
-    """Create the root replay from the first complete episode in dataset order."""
+    """Create the root replay from the first finalized trajectory in dataset order."""
     episode_keys, rows_by_episode = _ordered_episode_rows(dataset)
     if not episode_keys:
         raise ValueError("Cannot publish replay.mp4 from an empty dataset")
@@ -4205,13 +4240,15 @@ def _materialize_dataset_replay(dataset, local_root, output_path, fps):
         if not _is_terminal_action(candidate_rows[-1].get("actions")):
             continue
         step_rows = [row for row in candidate_rows[:-1] if _is_step_row(row)]
-        if step_rows and any(
+        provider_ended = any(
             bool(row.get("terminations")) or bool(row.get("truncations")) for row in step_rows
-        ):
+        )
+        collector_ended = bool(candidate_rows[-1].get("collector_terminated"))
+        if step_rows and (provider_ended or collector_ended):
             row_indices = candidate_indices
             break
     if row_indices is None:
-        raise ValueError("Cannot publish replay.mp4 without a complete episode")
+        raise ValueError("Cannot publish replay.mp4 without a finalized trajectory")
 
     storage_format = _dataset_storage_format(dataset)
     if storage_format == STORAGE_FORMAT_LOSSLESS_VIDEO:
@@ -4797,8 +4834,6 @@ def _dataset_from_recovered_live_records(package_dir, episode_id, records):
     rows = [_row_from_live_journal_record(record) for record in records]
     storage_format = _normalize_storage_format(rows[0]["storage_format"])
     last_record = records[-1]
-    last_row = rows[-1]
-    last_row["truncations"] = bool(last_row.get("truncations") or not last_row.get("terminations"))
 
     episode_uuid = str(uuid.UUID(str(episode_id)))
     session_uuid = str(uuid.UUID(str(rows[0]["session_id"])))
@@ -4807,6 +4842,7 @@ def _dataset_from_recovered_live_records(package_dir, episode_id, records):
         row["step_index"] = int(row["step_index"])
         row["session_id"] = session_uuid
         row["storage_format"] = storage_format
+        row["collector_terminated"] = False
 
     terminal_row = _canonical_dataset_row(
         **{name: rows[0].get(name) for name in ROW_CONTEXT_FIELD_NAMES},
@@ -4817,6 +4853,7 @@ def _dataset_from_recovered_live_records(package_dir, episode_id, records):
             "step_index": len(rows),
             "session_id": session_uuid,
             "storage_format": storage_format,
+            "collector_terminated": True,
         }
     )
 
@@ -5115,6 +5152,12 @@ def minari_export(recording_identity, dataset_name=None, author=None):
         rows = [dataset[row_index] for row_index in row_indices_by_episode[episode_key]]
         if "step_index" in rows[0]:
             rows.sort(key=lambda row: row["step_index"])
+        if bool(rows[-1].get("collector_terminated")):
+            console.print(
+                f"[{STYLE_FAIL}]Episode {ep_idx} ended at a collector boundary. Minari cannot "
+                "represent it without fabricating an environment truncation.[/]"
+            )
+            return False
         observations = []
         actions = []
         rewards = []

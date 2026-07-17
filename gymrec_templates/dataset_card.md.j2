@@ -20,7 +20,7 @@ Root `{{ replay_filename }}` is a browser-safe derived preview; it is not used f
 | Stat | Value |
 |------|-------|
 | Total frames | {{ frames }} |
-| Episodes | {{ episodes }} |
+| Trajectories | {{ episodes }} |
 | Environment | `{{ env_id }}` |
 | Provider | {{ provider_label }} |
 | Storage format | `{{ storage_format }}` |{{ summary_optional_rows }}
@@ -29,9 +29,11 @@ Root `{{ replay_filename }}` is a browser-safe derived preview; it is not used f
 
 Minari-compatible flat table format. Use `minari-export` for native [Minari](https://minari.farama.org/) HDF5 format.
 
-Each episode has N step rows plus one terminal observation row (N+1 pattern).
-The terminal observation is the final state after the last step - it has a null action
-and null values for rewards/terminations/truncations/infos.
+Each trajectory has N step rows plus one final observation row (N+1 pattern).
+The final observation is the state after the last step. It has a null action and
+null values for rewards/terminations/truncations/infos. `collector_terminated=true`
+on that row means collection stopped before a provider termination or truncation;
+the provider transition values remain unchanged.
 
 {{ field_lines }}
 

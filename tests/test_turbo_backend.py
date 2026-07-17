@@ -248,6 +248,10 @@ def test_environment_choices_keep_duplicate_ids_provider_qualified():
     )
 
     assert [choice.key for choice in choices] == ["environment:0", "environment:1"]
+    assert [choice.category for choice in choices] == [
+        "stable-retro-turbo",
+        "SuperMarioBros-Nes-turbo",
+    ]
     assert [choice.exact_value for choice in choices] == [
         "stable-retro-turbo:SuperMarioBros-Nes-v0",
         "supermariobrosnes-turbo:SuperMarioBros-Nes-v0",
@@ -604,12 +608,14 @@ def test_recording_stores_exact_provider_transition(tmp_path):
     assert dataset[0]["rewards"] == 7.5
     assert dataset[0]["terminations"] is True
     assert dataset[0]["truncations"] is False
+    assert dataset[0]["collector_terminated"] is False
+    assert dataset[1]["collector_terminated"] is False
     assert json.loads(dataset[0]["infos"]) == {"provider": True}
     assert dataset[0]["provider_id"] == "stable-retro-turbo"
     assert dataset[0]["environment_contract_id"] == artifact.contract_id
 
 
-def test_user_exit_discards_partial_episode_without_fabricating_truncation():
+def test_user_exit_preserves_partial_episode_without_fabricating_truncation():
     session = FakeSession()
     session.env = ContinuingEnv()
     artifact = artifact_for(session)
@@ -629,9 +635,14 @@ def test_user_exit_discards_partial_episode_without_fabricating_truncation():
 
     dataset = asyncio.run(recorder.record(fps=1000, max_episodes=None))
 
-    assert dataset is None
     assert session.env.received_actions == [2]
-    assert recorder._recording_rows == []
+    assert len(dataset) == 2
+    assert dataset[0]["actions"] == 2
+    assert dataset[0]["terminations"] is False
+    assert dataset[0]["truncations"] is False
+    assert dataset[0]["collector_terminated"] is False
+    assert dataset[1]["actions"] is None
+    assert dataset[1]["collector_terminated"] is True
 
 
 def test_random_policy_seed_is_reproducible():
