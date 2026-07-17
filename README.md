@@ -25,13 +25,13 @@ Add your Hugging Face token to `.env` when you want to upload datasets:
 HF_TOKEN=your-api-token
 ```
 
-Set `ROMS_PATH` in the `.env` file for the directory where you run `gymrec` to make gymrec use that source for games:
+Set `ROMS_PATH` in the `.env` file for the directory where you run `gymrec` when using ALE-py or Stable-Retro:
 
 ```bash
 ROMS_PATH=/path/to/roms
 ```
 
-`ROMS_PATH` is passed to ALE-py as `ALE_ROMS_DIR` for Atari games; if `ROMS_PATH` points at a single file, ALE-py receives its parent directory. For Stable-Retro, gymrec scans and imports matching ROMs from `ROMS_PATH` before listing or launching games. For `supermariobrosnes-turbo`, it may point to the ROM file itself or a directory: gymrec selects the canonical `SuperMarioBros-Nes-v0` ROM by SHA-256 even when several `.nes` files are present. You can also pass it directly on the command line:
+`ROMS_PATH` is passed to ALE-py as `ALE_ROMS_DIR` for Atari games; if `ROMS_PATH` points at a single file, ALE-py receives its parent directory. For Stable-Retro, gymrec scans and imports matching ROMs from `ROMS_PATH` before listing or launching games. You can also pass it directly on the command line:
 
 The editable installation loads the repository `.env` as its default configuration even when `gymrec` is launched from another directory. A `.env` in the invocation directory overrides those defaults.
 
@@ -39,6 +39,8 @@ The editable installation loads the repository `.env` as its default configurati
 gymrec list_environments --roms-path ./roms
 ROMS_PATH=./roms gymrec
 ```
+
+The `supermariobrosnes-turbo` backend does not use `ROMS_PATH` or `--roms-path`. Version 0.3.1 and newer discovers `SuperMarioBros-Nes-v0` through Stable Retro automatically. If needed, set Stable Retro's `RETRO_DATA_PATH`; the expected layout is `RETRO_DATA_PATH/stable/SuperMarioBros-Nes-v0/rom.nes`.
 
 Run the CLI with the installed `gymrec` command. For local development without the tool install, use `uv run gymrec ...` or `uv run python main.py ...` from the repo root.
 
@@ -85,7 +87,7 @@ Agent recording supports `human`, `random`, `mario`, and `breakout`. `--headless
 
 For Mario bundles, gymrec creates the native vector provider declared by `recipe.eval.environment` (`supermariobrosnes-turbo` or `stable-retro-turbo`), falling back only to the standardized `model.json` training environment when the recipe intentionally omits its eval environment. Crop, grayscale, resize algorithm, layout, frame stacking, max pooling, frame skip, sticky actions, and provider flags are executed by that provider; gymrec does not recreate the preprocessing in Python. The policy receives the native policy observation while the dataset stores raw RGB renders and backend-neutral nine-button NES action vectors. The recipe's Mario reward and termination contract are applied. Action sampling follows `recipe.json` by default; use `--deterministic` or `--stochastic` only to override it. `--device cpu`, `--device mps`, or `--device cuda` overrides SB3 device selection. The checkpoint cannot be selected from the CLI.
 
-`--seed` is the base environment reset seed. `--policy-seed` is the base stochastic-policy seed and defaults to `--seed`. Omitted seeds are generated and printed. Episode `i` uses base seed `+ i`, so each episode is independently reproducible from its environment seed, policy seed, and collector contract.
+`--seed` is the base environment reset seed. `--policy-seed` is the base stochastic-policy seed and defaults to `--seed`. Omitted seeds are generated within the NumPy/SB3-compatible 32-bit range and printed. Episode `i` uses base seed `+ i`; gymrec reserves enough range for every requested episode, so each episode is independently reproducible from its environment seed, policy seed, and collector contract.
 
 Policy-recorded rows add only `collector_contract_id`, `policy_mode`, and `policy_seed`; human and built-in collectors store nulls in those columns. The immutable collector documents are stored once under `collectors/<collector_contract_id>/`: verbatim `model.json`, verbatim `recipe.json`, optional verbatim `release_manifest.json`, and gymrec's canonical `collection.json`. The latter binds the immutable model commit and hashes to the effective execution settings, declared/effective differences, inference device, runtime versions, seed protocol, and policy-adapter version. Checkpoints remain in the model repository and are not copied into the dataset.
 

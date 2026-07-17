@@ -1,5 +1,7 @@
 import asyncio
 import json
+import sys
+import types
 
 import gymnasium as gym
 import numpy as np
@@ -275,19 +277,25 @@ def test_mario_recipe_task_applies_score_reward_and_level_success():
     assert info["task_events"] == ["level_change"]
 
 
-def test_resolve_rom_directory_selects_canonical_hash_not_filename(tmp_path, monkeypatch):
-    misleading = tmp_path / "SuperMarioBros.nes"
-    canonical = tmp_path / "renamed-copy.nes"
-    misleading.write_bytes(b"wrong")
-    canonical.write_bytes(b"canonical")
+def test_turbo_backend_delegates_rom_discovery_to_package(monkeypatch):
+    constructor_kwargs = {}
 
-    monkeypatch.setattr(
-        main,
-        "_sha256_file",
-        lambda path: main.SUPERMARIOBROS_NES_ROM_SHA256 if path == str(canonical) else "0" * 64,
+    def fake_constructor(env_id, **kwargs):
+        constructor_kwargs.update(kwargs)
+        assert env_id == main.SUPERMARIOBROS_NES_ENV_ID
+        return FakeTurboVectorEnv()
+
+    fake_module = types.SimpleNamespace(
+        Actions=types.SimpleNamespace(ALL="all"),
+        SuperMarioBrosNesTurboVecEnv=fake_constructor,
     )
+    monkeypatch.setitem(sys.modules, "supermariobrosnes_turbo", fake_module)
 
-    assert main.resolve_supermariobrosnes_rom_path(tmp_path) == str(canonical)
+    env = main._create_env__supermariobrosnes_turbo(main.SUPERMARIOBROS_NES_ENV_ID)
+
+    assert "rom_path" not in constructor_kwargs
+    assert constructor_kwargs["state"] == "Level1-1"
+    env.close()
 
 
 def test_capture_backend_metadata_round_trip(temp_storage_dir):

@@ -53,6 +53,7 @@ _stableretro_roms_path_imported = set()
 
 HUMAN_RECORD_FRAMESKIP = 1
 HUMAN_RECORD_STICKY_ACTION_PROB = 0.0
+MAX_COMPATIBLE_SEED = 2**32 - 1
 
 
 def _get_gymrec_version():
@@ -1652,7 +1653,12 @@ class StableBaselines3Policy(BasePolicy):
     def reset(self, **kwargs):
         seed = kwargs.get("seed")
         if seed is not None:
-            self.model.set_random_seed(int(seed))
+            seed = int(seed)
+            if seed < 0 or seed > MAX_COMPATIBLE_SEED:
+                raise ValueError(
+                    f"Policy seed must be between 0 and {MAX_COMPATIBLE_SEED}; got {seed}."
+                )
+            self.model.set_random_seed(seed)
 
     def observe_step(self, reward, terminated, truncated, info):
         del reward, terminated, truncated, info
@@ -6075,41 +6081,6 @@ def _sha256_file(path):
     return digest.hexdigest()
 
 
-def resolve_supermariobrosnes_rom_path(roms_path=None):
-    """Resolve the canonical SMB NES ROM from a file or directory by SHA-256."""
-    source = roms_path or _get_roms_path()
-    if not source:
-        raise FileNotFoundError(
-            "SuperMarioBros-Nes-turbo requires ROMS_PATH or --roms-path to point to "
-            "the canonical Super Mario Bros NES ROM or a directory containing it."
-        )
-
-    source = os.path.abspath(os.path.expanduser(os.fspath(source)))
-    if os.path.isfile(source):
-        candidates = [source]
-    elif os.path.isdir(source):
-        candidates = [
-            os.path.join(root, filename)
-            for root, _dirs, files in os.walk(source)
-            for filename in sorted(files)
-            if filename.lower().endswith(".nes")
-        ]
-    else:
-        raise FileNotFoundError(f"ROMS_PATH does not exist: {source}")
-
-    for candidate in candidates:
-        if _sha256_file(candidate) == SUPERMARIOBROS_NES_ROM_SHA256:
-            return candidate
-
-    if os.path.isfile(source):
-        detail = "the selected file has the wrong SHA-256"
-    elif not candidates:
-        detail = "the directory contains no .nes files"
-    else:
-        detail = f"none of the {len(candidates)} .nes files match the canonical SHA-256"
-    raise ValueError(f"Could not resolve the canonical Super Mario Bros NES ROM: {detail}.")
-
-
 def _lane_zero_value(value):
     if isinstance(value, dict):
         return _vector_info_to_lane_info(value)
@@ -6482,11 +6453,9 @@ def _create_env__supermariobrosnes_turbo(env_id, state=None, env_make_kwargs=Non
 
     state = state or "Level1-1"
     optional_kwargs = dict(env_make_kwargs or {})
-    rom_path = optional_kwargs.get("rom_path") or resolve_supermariobrosnes_rom_path()
     optional_kwargs.update(
         {
             "num_envs": 1,
-            "rom_path": rom_path,
             "state": state,
         }
     )
@@ -7338,8 +7307,24 @@ def _make_record_plan(args):
         return None, "--seed must be >= 0"
     if policy_seed is not None and policy_seed < 0:
         return None, "--policy-seed must be >= 0"
+
+    effective_episodes = episodes if episodes is not None else 1
+    episode_seed_increments = effective_episodes - 1
+    max_base_seed = MAX_COMPATIBLE_SEED - episode_seed_increments
+    if max_base_seed < 0:
+        return None, f"--episodes must be <= {MAX_COMPATIBLE_SEED + 1}"
+    if seed is not None and seed > max_base_seed:
+        return None, (
+            f"--seed must be <= {max_base_seed} for {effective_episodes} episode(s) "
+            f"so every episode seed fits the supported 32-bit range"
+        )
+    if policy_seed is not None and policy_seed > max_base_seed:
+        return None, (
+            f"--policy-seed must be <= {max_base_seed} for {effective_episodes} episode(s) "
+            f"so every episode seed fits the NumPy/SB3 32-bit range"
+        )
     if seed is None:
-        seed = secrets.randbits(63)
+        seed = secrets.randbelow(max_base_seed + 1)
     if policy_seed is None:
         policy_seed = seed
 

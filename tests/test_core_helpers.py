@@ -598,6 +598,54 @@ def test_record_plan_separates_environment_and_policy_seed_bases():
     assert plan.policy_seed == 123
 
 
+def test_record_plan_generated_seed_fits_all_episode_seeds_in_sb3_range(monkeypatch):
+    requested_upper_bounds = []
+
+    def fake_randbelow(upper_bound):
+        requested_upper_bounds.append(upper_bound)
+        return upper_bound - 1
+
+    monkeypatch.setattr(main.secrets, "randbelow", fake_randbelow)
+    plan, error = main._make_record_plan(
+        argparse.Namespace(
+            agent="hf",
+            headless=False,
+            episodes=3,
+            max_steps=None,
+            upload_live=False,
+            dry_run=True,
+            seed=None,
+            policy_seed=None,
+        )
+    )
+
+    assert error is None
+    assert requested_upper_bounds == [main.MAX_COMPATIBLE_SEED - 1]
+    assert plan.seed == main.MAX_COMPATIBLE_SEED - 2
+    assert plan.policy_seed == plan.seed
+    np.random.seed(plan.policy_seed + plan.max_episodes - 1)
+
+
+@pytest.mark.parametrize("field", ["seed", "policy_seed"])
+def test_record_plan_rejects_seed_that_overflows_across_episodes(field):
+    values = {"seed": 123, "policy_seed": 456}
+    values[field] = main.MAX_COMPATIBLE_SEED
+    plan, error = main._make_record_plan(
+        argparse.Namespace(
+            agent="hf",
+            headless=False,
+            episodes=2,
+            max_steps=None,
+            upload_live=False,
+            dry_run=True,
+            **values,
+        )
+    )
+
+    assert plan is None
+    assert f"--{field.replace('_', '-')} must be <=" in error
+
+
 def test_agent_input_source_wraps_policy_only():
     source = main.AgentInputSource(lambda observation: "action")
 
