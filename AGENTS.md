@@ -13,7 +13,7 @@ uv sync
 cp .env.example .env
 ```
 
-Add `HF_TOKEN` only for token-based Hub uploads. Dependencies are defined in `pyproject.toml` and include Python 3.12, Gymnasium, pygame, datasets, and the two allowlisted turbo providers. Do not add ALE, VizDoom, or generic environment constructors.
+Add `HF_TOKEN` only for token-based Hub uploads. Dependencies are defined in `pyproject.toml` and include Python 3.14, Gymnasium, pygame, datasets, and the two allowlisted turbo providers. Do not add ALE, VizDoom, or generic environment constructors.
 
 The native packages are ordinary dependencies and must not register Gymrec entry points or ship Gymrec-specific modules. Keep both packages exempt from the global seven-day `exclude-newer` policy so their current wheels remain resolvable.
 

@@ -15,6 +15,8 @@ termination, truncation, and info returned by that environment.
 
 ## Install
 
+Requires Python 3.14.
+
 ```bash
 uv sync
 ```
