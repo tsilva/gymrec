@@ -8,15 +8,8 @@ if ! command -v uv >/dev/null 2>&1; then
   exit 1
 fi
 
-if uv tool list | grep -q "^gymrec "; then
-  echo "Existing gymrec tool detected; upgrading editable tool install."
-  uv tool install --project . . -e --upgrade --force \
-    --exclude-newer-package stable-retro-turbo=false "$@"
-else
-  echo "Installing gymrec as an editable uv tool."
-  uv tool install --project . . -e \
-    --exclude-newer-package stable-retro-turbo=false "$@"
-fi
+echo "Installing or upgrading the editable gymrec tool."
+uv tool install --project . . -e --upgrade --force "$@"
 
 tool_path="$(uv tool dir --bin)/gymrec"
 "$tool_path" --help >/dev/null

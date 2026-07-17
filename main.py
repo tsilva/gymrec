@@ -329,25 +329,27 @@ def _require_dataset_replay_tools():
     return _require_video_tools("required to publish replay.mp4")
 
 
-def _encode_lossless_rgb_video(frames, output_path, fps, ffmpeg_path=None):
-    """Encode a sequence of RGB frames to a canonical lossless RGB Matroska stream."""
-    writer = _StreamingLosslessVideoWriter(output_path, fps, ffmpeg_path=ffmpeg_path)
-    try:
-        for frame in frames:
-            writer.write(frame)
-        writer.close()
-    except Exception:
-        writer.abort()
-        raise
+class _StreamingRGBVideoWriter:
+    """Write RGB frames to ffmpeg without buffering an episode in memory."""
 
-
-class _StreamingLosslessVideoWriter:
-    """Write canonical RGB frames to ffmpeg without buffering an episode in memory."""
-
-    def __init__(self, output_path, fps, ffmpeg_path=None):
+    def __init__(
+        self,
+        output_path,
+        fps,
+        *,
+        ffmpeg_path,
+        output_args,
+        frame_dtype=None,
+        frame_label="video",
+        empty_label="video",
+    ):
         self.output_path = output_path
         self.fps = fps
-        self.ffmpeg_path = ffmpeg_path or _require_lossless_video_tools()[0]
+        self.ffmpeg_path = ffmpeg_path
+        self.output_args = tuple(output_args)
+        self.frame_dtype = frame_dtype
+        self.frame_label = frame_label
+        self.empty_label = empty_label
         self.process = None
         self.shape = None
 
@@ -371,6 +373,50 @@ class _StreamingLosslessVideoWriter:
             "-i",
             "-",
             "-an",
+            *self.output_args,
+            self.output_path,
+        ]
+        self.process = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    def write(self, frame):
+        frame = np.ascontiguousarray(frame, dtype=self.frame_dtype)
+        if self.process is None:
+            self._start(frame)
+        elif tuple(frame.shape) != self.shape:
+            raise ValueError(
+                f"All {self.frame_label} frames must have shape {self.shape}; got {frame.shape}"
+            )
+        self.process.stdin.write(frame.tobytes())
+
+    def close(self):
+        if self.process is None:
+            raise ValueError(f"Cannot encode an empty {self.empty_label}")
+        try:
+            self.process.stdin.close()
+            stderr = self.process.stderr.read().decode("utf-8", errors="replace").strip()
+            return_code = self.process.wait()
+            if return_code != 0:
+                raise RuntimeError(stderr or f"ffmpeg exited with status {return_code}")
+        finally:
+            if self.process.stderr is not None:
+                self.process.stderr.close()
+
+    def abort(self):
+        if self.process is None:
+            return
+        if self.process.stdin is not None and not self.process.stdin.closed:
+            self.process.stdin.close()
+        self.process.wait()
+        if self.process.stderr is not None:
+            self.process.stderr.close()
+
+
+def _lossless_video_writer(output_path, fps, ffmpeg_path=None):
+    return _StreamingRGBVideoWriter(
+        output_path,
+        fps,
+        ffmpeg_path=ffmpeg_path or _require_lossless_video_tools()[0],
+        output_args=(
             "-c:v",
             "libx264rgb",
             "-crf",
@@ -381,71 +427,16 @@ class _StreamingLosslessVideoWriter:
             "rgb24",
             "-f",
             "matroska",
-            self.output_path,
-        ]
-        self.process = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
-
-    def write(self, frame):
-        frame = np.ascontiguousarray(frame)
-        if self.process is None:
-            self._start(frame)
-        elif tuple(frame.shape) != self.shape:
-            raise ValueError(f"All video frames must have shape {self.shape}; got {frame.shape}")
-        self.process.stdin.write(frame.tobytes())
-
-    def close(self):
-        if self.process is None:
-            raise ValueError("Cannot encode an empty video")
-        try:
-            self.process.stdin.close()
-            stderr = self.process.stderr.read().decode("utf-8", errors="replace").strip()
-            return_code = self.process.wait()
-            if return_code != 0:
-                raise RuntimeError(stderr or f"ffmpeg exited with status {return_code}")
-        finally:
-            if self.process.stderr is not None:
-                self.process.stderr.close()
-
-    def abort(self):
-        if self.process is None:
-            return
-        if self.process.stdin is not None and not self.process.stdin.closed:
-            self.process.stdin.close()
-        self.process.wait()
-        if self.process.stderr is not None:
-            self.process.stderr.close()
+        ),
+    )
 
 
-class _StreamingBrowserPreviewWriter:
-    """Write a browser-safe H.264 MP4 without buffering an episode in memory."""
-
-    def __init__(self, output_path, fps, ffmpeg_path=None):
-        self.output_path = output_path
-        self.fps = fps
-        self.ffmpeg_path = ffmpeg_path or _require_dataset_replay_tools()[0]
-        self.process = None
-        self.shape = None
-
-    def _start(self, frame):
-        self.shape = tuple(frame.shape)
-        height, width = frame.shape[:2]
-        os.makedirs(os.path.dirname(self.output_path), exist_ok=True)
-        cmd = [
-            self.ffmpeg_path,
-            "-y",
-            "-loglevel",
-            "error",
-            "-f",
-            "rawvideo",
-            "-pix_fmt",
-            "rgb24",
-            "-s",
-            f"{width}x{height}",
-            "-r",
-            str(max(int(round(float(self.fps))), 1)),
-            "-i",
-            "-",
-            "-an",
+def _browser_preview_writer(output_path, fps, ffmpeg_path=None):
+    return _StreamingRGBVideoWriter(
+        output_path,
+        fps,
+        ffmpeg_path=ffmpeg_path or _require_dataset_replay_tools()[0],
+        output_args=(
             "-c:v",
             "libx264",
             "-tag:v",
@@ -456,44 +447,14 @@ class _StreamingBrowserPreviewWriter:
             "yuv420p",
             "-movflags",
             "+faststart",
-            self.output_path,
-        ]
-        self.process = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
-
-    def write(self, frame):
-        frame = np.ascontiguousarray(frame, dtype=np.uint8)
-        if self.process is None:
-            self._start(frame)
-        elif tuple(frame.shape) != self.shape:
-            raise ValueError(f"All preview frames must have shape {self.shape}; got {frame.shape}")
-        self.process.stdin.write(frame.tobytes())
-
-    def close(self):
-        if self.process is None:
-            raise ValueError("Cannot encode an empty preview video")
-        try:
-            self.process.stdin.close()
-            stderr = self.process.stderr.read().decode("utf-8", errors="replace").strip()
-            return_code = self.process.wait()
-            if return_code != 0:
-                raise RuntimeError(stderr or f"ffmpeg exited with status {return_code}")
-        finally:
-            if self.process.stderr is not None:
-                self.process.stderr.close()
-
-    def abort(self):
-        if self.process is None:
-            return
-        if self.process.stdin is not None and not self.process.stdin.closed:
-            self.process.stdin.close()
-        self.process.wait()
-        if self.process.stderr is not None:
-            self.process.stderr.close()
+        ),
+        frame_dtype=np.uint8,
+        frame_label="preview",
+        empty_label="preview video",
+    )
 
 
-def _encode_browser_preview_video(frames, output_path, fps, ffmpeg_path=None):
-    """Encode a lossy browser-safe preview MP4. This is never canonical data."""
-    writer = _StreamingBrowserPreviewWriter(output_path, fps, ffmpeg_path=ffmpeg_path)
+def _encode_video_frames(frames, writer):
     try:
         for frame in frames:
             writer.write(frame)
@@ -501,6 +462,18 @@ def _encode_browser_preview_video(frames, output_path, fps, ffmpeg_path=None):
     except Exception:
         writer.abort()
         raise
+
+
+def _encode_lossless_rgb_video(frames, output_path, fps, ffmpeg_path=None):
+    """Encode a sequence of RGB frames to a canonical lossless RGB Matroska stream."""
+    writer = _lossless_video_writer(output_path, fps, ffmpeg_path=ffmpeg_path)
+    _encode_video_frames(frames, writer)
+
+
+def _encode_browser_preview_video(frames, output_path, fps, ffmpeg_path=None):
+    """Encode a lossy browser-safe preview MP4. This is never canonical data."""
+    writer = _browser_preview_writer(output_path, fps, ffmpeg_path=ffmpeg_path)
+    _encode_video_frames(frames, writer)
 
 
 def _transcode_browser_preview_video(input_path, output_path, ffmpeg_path=None):
@@ -919,10 +892,7 @@ class AgentInputSource:
     def reset(self, **kwargs):
         """Reset any episode-local policy state."""
         if hasattr(self.policy, "reset"):
-            try:
-                self.policy.reset(**kwargs)
-            except TypeError:
-                self.policy.reset()
+            self.policy.reset(**kwargs)
 
     def get_action(self, observation):
         """Get action from policy."""
@@ -932,12 +902,6 @@ class AgentInputSource:
     def policy_action(self):
         """Return the policy-space action selected before any environment adapter."""
         return getattr(self.policy, "last_policy_action", None)
-
-    def observe_step(self, reward, terminated, truncated, info):
-        """Forward step results to the policy when it needs feedback."""
-        if hasattr(self.policy, "observe_step"):
-            self.policy.observe_step(reward, terminated, truncated, info)
-
 
 # =============================================================================
 # Policies
@@ -1071,9 +1035,6 @@ class StableBaselines3Policy:
                 )
             self.model.set_random_seed(seed)
 
-    def observe_step(self, reward, terminated, truncated, info):
-        del reward, terminated, truncated, info
-
     def __call__(self, observation):
         policy_observation = self.provider_session.policy_observation(observation)
         action, _ = self.model.predict(
@@ -1186,6 +1147,17 @@ def build_collector_contract(
     )
 
 
+def _write_immutable_json_document(path, document, *, conflict_message):
+    payload = _canonical_json_bytes(document) + b"\n"
+    if not os.path.exists(path):
+        with open(path, "wb") as stream:
+            stream.write(payload)
+        return
+    with open(path, "rb") as stream:
+        if stream.read() != payload:
+            raise ValueError(conflict_message)
+
+
 def _materialize_collector_contract(contract, root):
     if contract is None:
         return None
@@ -1207,16 +1179,11 @@ def _materialize_collector_contract(contract, root):
         else:
             shutil.copy2(source_path, destination_path)
     collection_path = os.path.join(destination, "collection.json")
-    collection_bytes = _canonical_json_bytes(contract.collection_document) + b"\n"
-    if os.path.exists(collection_path):
-        with open(collection_path, "rb") as file_obj:
-            if file_obj.read() != collection_bytes:
-                raise ValueError(
-                    f"Collector contract conflict for {contract.contract_id}/collection.json"
-                )
-    else:
-        with open(collection_path, "wb") as file_obj:
-            file_obj.write(collection_bytes)
+    _write_immutable_json_document(
+        collection_path,
+        contract.collection_document,
+        conflict_message=f"Collector contract conflict for {contract.contract_id}/collection.json",
+    )
     return destination
 
 
@@ -1226,14 +1193,11 @@ def _materialize_environment_artifact(artifact, root):
     destination = os.path.join(root, artifact.relative_dir)
     os.makedirs(destination, exist_ok=True)
     document_path = os.path.join(destination, ENVIRONMENT_DOCUMENT_FILENAME)
-    payload = _canonical_json_bytes(artifact.document) + b"\n"
-    if os.path.exists(document_path):
-        with open(document_path, "rb") as stream:
-            if stream.read() != payload:
-                raise ValueError(f"Environment contract conflict for {artifact.contract_id}")
-    else:
-        with open(document_path, "wb") as stream:
-            stream.write(payload)
+    _write_immutable_json_document(
+        document_path,
+        artifact.document,
+        conflict_message=f"Environment contract conflict for {artifact.contract_id}",
+    )
     return destination
 
 
@@ -1687,7 +1651,7 @@ class LiveEpisodeUploadManager:
         self.fps = fps
         self.max_retries = max_retries
         self.base_wait = base_wait
-        self.queue_dir = _get_live_upload_queue_dir(self.identity)
+        self.queue_dir = _recording_paths(self.identity).live_queue
 
     def begin_episode(self, episode_uuid):
         episode_id = str(episode_uuid)
@@ -2335,7 +2299,7 @@ class DatasetRecorderWrapper(gym.Wrapper):
                 self._start_live_episode(episode_uuid)
             video_path = os.path.join(self._live_episode.package_dir, video_relpath)
             if self._live_video_writer is None:
-                self._live_video_writer = _StreamingLosslessVideoWriter(
+                self._live_video_writer = _lossless_video_writer(
                     video_path,
                     self._fps or _provider_fps(self.provider_session),
                     ffmpeg_path=self._ffmpeg_path,
@@ -2779,8 +2743,6 @@ class DatasetRecorderWrapper(gym.Wrapper):
                 policy_action=policy_action,
             )
             obs, reward, terminated, truncated, info = self.env.step(action)
-            if hasattr(self.input_source, "observe_step"):
-                self.input_source.observe_step(reward, terminated, truncated, info)
             self._cumulative_reward += float(reward)
             if self.recording:
                 self._recording_rows[-1].update(
@@ -3290,19 +3252,9 @@ def _get_available_recording_refs_from_hf():
     return sorted(set(available))
 
 
-def _get_metadata_path(value):
-    """Return the recording metadata sidecar path."""
-    return _recording_paths(value).metadata
-
-
-def _get_uploaded_episodes_path(value):
-    """Return the uploaded-episode tracking path for a recording identity."""
-    return _recording_paths(value).uploaded
-
-
 def _load_uploaded_episode_ids(value):
     """Load the set of already-uploaded episode IDs from local tracking file."""
-    path = _get_uploaded_episodes_path(value)
+    path = _recording_paths(value).uploaded
     if not os.path.exists(path):
         return set()
     with open(path) as f:
@@ -3311,7 +3263,7 @@ def _load_uploaded_episode_ids(value):
 
 def _save_uploaded_episode_ids(value, episode_ids: set):
     """Save the set of uploaded episode IDs to local tracking file."""
-    path = _get_uploaded_episodes_path(value)
+    path = _recording_paths(value).uploaded
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w") as f:
         json.dump(list(episode_ids), f)
@@ -3371,13 +3323,8 @@ def _remote_dataset_state(
         return None
 
 
-def _get_live_upload_queue_dir(value):
-    """Return the local resumable live-upload queue directory."""
-    return _recording_paths(value).live_queue
-
-
 def _get_live_upload_manifest_path(env_id):
-    return os.path.join(_get_live_upload_queue_dir(env_id), "manifest.json")
+    return os.path.join(_recording_paths(env_id).live_queue, "manifest.json")
 
 
 def _load_live_upload_manifest(env_id):
@@ -3462,7 +3409,7 @@ def save_dataset_locally(dataset, value, *, artifact_root, metadata=None):
     """Save dataset to local disk, appending to any existing data."""
     identity = _coerce_recording_identity(value)
     path = get_local_dataset_path(identity)
-    metadata_path = _get_metadata_path(identity)
+    metadata_path = _recording_paths(identity).metadata
     dataset = _strip_runtime_columns(dataset)
     _validate_canonical_dataset_schema(dataset, label="New recording")
     _validate_environment_artifacts(dataset, artifact_root, label="New recording")
@@ -3538,7 +3485,7 @@ def save_dataset_locally(dataset, value, *, artifact_root, metadata=None):
 
 def load_local_metadata(value):
     """Load metadata from local disk. Returns None if not found."""
-    metadata_path = _get_metadata_path(value)
+    metadata_path = _recording_paths(value).metadata
     if not os.path.exists(metadata_path):
         return None
     with open(metadata_path, "r") as f:
@@ -4101,7 +4048,7 @@ def _materialize_dataset_replay(dataset, local_root, output_path, fps):
         else:
             _transcode_browser_preview_video(canonical_path, output_path)
     else:
-        writer = _StreamingBrowserPreviewWriter(output_path, fps)
+        writer = _browser_preview_writer(output_path, fps)
         try:
             for row_index in row_indices:
                 frame = _observation_to_rgb_array(_get_row_observation(dataset[row_index]))

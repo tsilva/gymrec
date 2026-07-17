@@ -399,20 +399,17 @@ def test_repo_recording_identities_isolate_same_environment_local_state(temp_sto
         temp_storage_dir / "repos" / "tsilva" / "SuperMarioBros-NES_Level1" / "dataset"
     )
     assert main.get_local_dataset_path(level1) != main.get_local_dataset_path(level4)
-    assert main._get_metadata_path(level1).endswith(
+    paths = main._recording_paths(level1)
+    assert paths.metadata.endswith(
         "repos/tsilva/SuperMarioBros-NES_Level1/metadata.json"
     )
-    assert main._get_uploaded_episodes_path(level1).endswith(
+    assert paths.uploaded.endswith(
         "repos/tsilva/SuperMarioBros-NES_Level1/uploaded.json"
     )
-    assert main._get_live_upload_queue_dir(level1).endswith(
+    assert paths.live_queue.endswith(
         "repos/tsilva/SuperMarioBros-NES_Level1/live_pending"
     )
-    paths = main._recording_paths(level1)
     assert paths.dataset == main.get_local_dataset_path(level1)
-    assert paths.metadata == main._get_metadata_path(level1)
-    assert paths.uploaded == main._get_uploaded_episodes_path(level1)
-    assert paths.live_queue == main._get_live_upload_queue_dir(level1)
 
 
 def test_repo_recording_save_persists_identity_and_is_discoverable(temp_storage_dir):
@@ -1853,7 +1850,7 @@ def test_save_dataset_metadata_recordings_count_only_new_batch(temp_storage_dir)
         metadata={"env_id": "BreakoutNoFrameskip-v4"},
     )
 
-    with open(main._get_metadata_path("BreakoutNoFrameskip-v4")) as f:
+    with open(main._recording_paths("BreakoutNoFrameskip-v4").metadata) as f:
         metadata = json.load(f)
 
     assert [entry["episodes"] for entry in metadata["recordings"]] == [1, 1]
