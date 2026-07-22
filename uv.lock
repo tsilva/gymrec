@@ -13,7 +13,7 @@ exclude-newer-span = "P7D"
 
 [options.exclude-newer-package]
 supermariobrosnes-turbo = false
-breakout-turbo-env = "2026-07-15T10:58:00Z"
+breakout-turbo-env = "2026-07-20T16:11:00Z"
 stable-retro-turbo = false
 
 [manifest]
@@ -397,7 +397,7 @@ wheels = [
 
 [[package]]
 name = "gymrec"
-version = "0.1.1"
+version = "0.1.2"
 source = { editable = "." }
 dependencies = [
     { name = "datasets" },
@@ -438,8 +438,8 @@ requires-dist = [
     { name = "python-dotenv" },
     { name = "rich" },
     { name = "stable-baselines3", specifier = ">=2.9.0" },
-    { name = "stable-retro-turbo", specifier = "==1.0.1.post32" },
-    { name = "supermariobrosnes-turbo", specifier = "==0.3.3" },
+    { name = "stable-retro-turbo", specifier = "==1.0.1.post33" },
+    { name = "supermariobrosnes-turbo", specifier = ">=0.4.1" },
     { name = "textual", specifier = ">=8.2.8,<9" },
 ]
 provides-extras = ["minari"]
@@ -1233,7 +1233,7 @@ wheels = [
 
 [[package]]
 name = "stable-retro-turbo"
-version = "1.0.1.post32"
+version = "1.0.1.post33"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "farama-notifications" },
@@ -1241,26 +1241,26 @@ dependencies = [
     { name = "pyglet" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/02/6f/99472ccd9fd8ac951a91e9cd55681a69b5fbd4d4af9d0e604c0111f45e5c/stable_retro_turbo-1.0.1.post32-cp314-cp314-macosx_14_0_arm64.whl", hash = "sha256:4491874babd7d3b8bc13e842d9b4b3cd7b2287622768b0ea910281c6ee9821fc", size = 85882905, upload-time = "2026-07-17T19:09:38.031Z" },
-    { url = "https://files.pythonhosted.org/packages/c7/03/2880c310ba6d683afe93915f55fde9495689bebf4ad0df5f7cd897a006e9/stable_retro_turbo-1.0.1.post32-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:2c3892d68370ff3be2e0b43739b2d45cf33db4b3502fd713ac7c1895c0d60bdb", size = 91554823, upload-time = "2026-07-17T19:09:43.539Z" },
+    { url = "https://files.pythonhosted.org/packages/a4/f0/8416081abf0bd4691a75edc0138c3329be80e40244ddcd646bb57c08177e/stable_retro_turbo-1.0.1.post33-cp314-cp314-macosx_14_0_arm64.whl", hash = "sha256:51ac704ba29d0124234a18d5db07414d6f99840674a3750ccefa3f8c940daf7d", size = 85899146, upload-time = "2026-07-20T15:21:21.14Z" },
+    { url = "https://files.pythonhosted.org/packages/5f/51/907f144f7ee94c17ddc37672b524e450eb46add348f28a360ef247b5dd8f/stable_retro_turbo-1.0.1.post33-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:337745072e86e3b3ca77db7e20c651abcd390cd3da2608bf17668c94b4b2ecd8", size = 91574205, upload-time = "2026-07-20T15:21:26.271Z" },
 ]
 
 [[package]]
 name = "supermariobrosnes-turbo"
-version = "0.3.3"
+version = "0.4.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "gymnasium" },
     { name = "numpy" },
     { name = "textual" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/6b/d7/972b6162f59237abbebfbf95ec14f789917c7f8ac11ba3244d5950b29b17/supermariobrosnes_turbo-0.3.3.tar.gz", hash = "sha256:672505c1677a0345871ad20bb393ed789f12a9c889f1ddc3f7448d49184828ff", size = 17983959, upload-time = "2026-07-17T14:59:39.493Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/e2/b2/59dc63005937202053cd6b696f2286317747634365f485d87ad46319c1e9/supermariobrosnes_turbo-0.4.1.tar.gz", hash = "sha256:d11331a96f246abe8303e707abdeee221509ea934362ff28495f34f2b4cf7a12", size = 18187383, upload-time = "2026-07-21T07:12:47.792Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/65/fa/1b8d15598143ff050e22e702b9d635a750f05380c3ec1385cbb06a21b6e0/supermariobrosnes_turbo-0.3.3-cp39-abi3-macosx_13_0_x86_64.whl", hash = "sha256:337c598b2b143e6f803ed78638331625fc2e593d4633b6c619d0c208ab7ca1d0", size = 500375, upload-time = "2026-07-17T14:59:32.645Z" },
-    { url = "https://files.pythonhosted.org/packages/9a/e2/4e87314e985c6b420926f065e8d40cb70b241f8da0765678da9f2cf6641e/supermariobrosnes_turbo-0.3.3-cp39-abi3-macosx_14_0_arm64.whl", hash = "sha256:afaeb942c8e226a547b668149fb3c491b364aa6545706876e1083e294ef5fc68", size = 474934, upload-time = "2026-07-17T14:59:34.245Z" },
-    { url = "https://files.pythonhosted.org/packages/13/bf/c6fdd30a2b2d62d024c94fe26467376ce210c292bbbb9c6b1d9b885804e8/supermariobrosnes_turbo-0.3.3-cp39-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:98cc0ac98127910f426c46af9f33a774e6c0c8fe01558c482c0b74e2bc0171f9", size = 499815, upload-time = "2026-07-17T14:59:35.623Z" },
-    { url = "https://files.pythonhosted.org/packages/44/59/4fbf38b68dcb119359697fa8934a63cdff93bc5862712182e1d7bb4450ee/supermariobrosnes_turbo-0.3.3-cp39-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:7ca0030cd626014b74ec85298dd1d91fbea7df49355ff971f111cd80ff33c153", size = 519698, upload-time = "2026-07-17T14:59:36.913Z" },
-    { url = "https://files.pythonhosted.org/packages/b4/4b/03121d3b47a0bc8632000b2c3a85b9b3d6944b387481112dd7e91d66bcfb/supermariobrosnes_turbo-0.3.3-cp39-abi3-win_amd64.whl", hash = "sha256:09bb6ea118ccfd07b6e85714e21d3dffed3c9d440787d1b4750e10f15dd37af7", size = 421528, upload-time = "2026-07-17T14:59:38.124Z" },
+    { url = "https://files.pythonhosted.org/packages/4f/e5/d3551dda7124efd6126e589b3fd98b18cb5d8235f494edc60744e49e503c/supermariobrosnes_turbo-0.4.1-cp39-abi3-macosx_13_0_x86_64.whl", hash = "sha256:61003b86ca15cc70eb7eaead072f492561e89cc00420286d49ad45caee84bd20", size = 534642, upload-time = "2026-07-21T07:12:39.457Z" },
+    { url = "https://files.pythonhosted.org/packages/5d/16/39dc25742074a34b831f4192af2bdb90b4dab293321b25fa696fd247c325/supermariobrosnes_turbo-0.4.1-cp39-abi3-macosx_14_0_arm64.whl", hash = "sha256:0f8673db1f34b8eed0105746eda43be126963de014aa40a4f4039e60806ae46f", size = 508706, upload-time = "2026-07-21T07:12:41.009Z" },
+    { url = "https://files.pythonhosted.org/packages/f7/ac/a8a0d41ad726b6d7cc1893c50821300a42fe457bc0b1d06edd24f77cd681/supermariobrosnes_turbo-0.4.1-cp39-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:ff4a13b6c83c5e003f81f3c9085c3c99438f1c25747b587cc05ad1f5248e179b", size = 535222, upload-time = "2026-07-21T07:12:42.397Z" },
+    { url = "https://files.pythonhosted.org/packages/17/97/384de8980120a9ad7d358250bd96de37486db905efa99404faa0c719d5e8/supermariobrosnes_turbo-0.4.1-cp39-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:7f57142423ae69a0626f4744e4d4f58ef4dd48bead4eae1ffdefdbd20f2bbdd0", size = 555057, upload-time = "2026-07-21T07:12:44.073Z" },
+    { url = "https://files.pythonhosted.org/packages/f0/de/b164bd9f112949381400c0189c93c44e07085a24e231ad76d29b24e0ac43/supermariobrosnes_turbo-0.4.1-cp39-abi3-win_amd64.whl", hash = "sha256:33c6cb8931c0930823584a58b7d1025f3c4fd9912333773bce7c6473f57406c5", size = 456017, upload-time = "2026-07-21T07:12:45.556Z" },
 ]
 
 [[package]]

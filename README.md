@@ -1,5 +1,15 @@
 # gymrec
 
+> [!WARNING]
+> **Deprecated:** Gymrec has been integrated into [Rlab](https://github.com/tsilva/rlab).
+> This repository is no longer maintained and will be archived. Please use Rlab for all future
+> development and recording workflows.
+
+> Gymrec 0.1.2 is the migration release. Current Gymrec v3 recording workflows now live in
+> Rlab under `rlab dataset`; Gymrec remains available as the migration and rollback tool while
+> pending packages are finalized and adopted. Original data is never deleted by the migration
+> commands.
+
 Record and replay gameplay from native Gymnasium environments as Hugging Face datasets.
 
 gymrec intentionally supports exactly two environment providers:
@@ -25,6 +35,21 @@ The two runtime packages are ordinary dependencies. They do not register or
 implement anything specifically for Gymrec.
 
 ## Commands
+
+Finalize current-v3 pending packages without authentication or source mutation, then adopt each
+reported group in Rlab:
+
+```bash
+gymrec finalize-pending [recording-ref] --output /absent/path/gymrec-finalized
+# Stop all writers first for recording/journal-only packages:
+gymrec finalize-pending [recording-ref] --output /absent/path/gymrec-finalized --assume-stopped
+
+rlab dataset adopt /absent/path/gymrec-finalized/<group-digest> <rlab-reference>
+```
+
+`report.json` records every discovered UUID as recovered or deferred. The bridge accepts only
+current v3 packages, treats direct UUID directories as authoritative, rejects unsafe paths and
+symlinks, and verifies that all Gymrec source hashes remain unchanged.
 
 ```bash
 uv run gymrec list_environments

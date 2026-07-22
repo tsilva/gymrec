@@ -15,6 +15,7 @@ import time
 import tomllib
 import uuid
 from dataclasses import dataclass
+from pathlib import Path
 from urllib.parse import unquote, urlparse
 
 import gymnasium as gym
@@ -5773,7 +5774,28 @@ async def main():
     parser_minari.add_argument("--name", default=None)
     parser_minari.add_argument("--author", default=None)
 
+    parser_finalize = subparsers.add_parser(
+        "finalize-pending",
+        help="Offline, non-destructively finalize current-v3 pending packages",
+    )
+    parser_finalize.add_argument("recording_ref", nargs="?", default=None)
+    parser_finalize.add_argument("--output", type=Path, required=True)
+    parser_finalize.add_argument("--assume-stopped", action="store_true")
+
     args = _parse_cli_args(parser)
+    if args.command == "finalize-pending":
+        from finalize_pending import finalize_pending
+
+        report = finalize_pending(
+            args.recording_ref,
+            args.output,
+            assume_stopped=args.assume_stopped,
+        )
+        console.print(
+            f"[{STYLE_INFO}]Finalized {len(report['groups'])} migration group(s) into "
+            f"{args.output}[/]"
+        )
+        return
     if args.command == "login":
         _lazy_init()
         ensure_hf_login(force=True)
