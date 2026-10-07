@@ -1,4 +1,10 @@
-# gymrec
+<p align="center">
+  <img src="https://raw.githubusercontent.com/tsilva/gymrec/main/logo.png" alt="gymrec logo" width="420" />
+  <br />
+  <!-- repo-tagline:start -->
+  <strong>🎮 Record and replay Gymnasium gameplay as Hugging Face datasets 📊</strong>
+  <!-- repo-tagline:end -->
+</p>
 
 > [!WARNING]
 > **Deprecated:** Gymrec has been integrated into [Rlab](https://github.com/tsilva/rlab).
